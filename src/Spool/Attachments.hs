@@ -1,6 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# OPTIONS_GHC -Wall -Werror #-}
 
 -- | The attachment boundary for the file-backed spool.
 --
@@ -9,7 +8,7 @@
 -- declarations are strict, copies are staged before they become visible, and
 -- received bytes are verified before they are renamed into a worker's fresh
 -- directory.
-module SpoolAttachments
+module Spool.Attachments
   ( Attachment (..)
   , parseAttachment
   , validateAttachments
@@ -32,12 +31,10 @@ import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Aeson.Types as AT
-import qualified Data.ByteArray.Encoding as BAE
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
 import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
 import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive,
                          removeFile, renameDirectory, renameFile)
 import System.FilePath ((</>))
@@ -296,9 +293,10 @@ verifyDigest attachment context size =
          then Left "attachment size does not match declaration"
          else Right ()
 
+-- | A digest shows as its lower-case hexadecimal, which is the form a
+-- declaration carries.
 renderDigest :: Digest SHA256 -> T.Text
-renderDigest digest =
-  TE.decodeUtf8 (BAE.convertToBase BAE.Base16 digest)
+renderDigest = T.pack . show
 
 -- | Delete a task's spool-owned attachment directory.  The operation is
 -- idempotent; callers that need crash recovery should perform their durable

@@ -10,61 +10,82 @@ license:            AGPL-3.0-or-later
 license-file:       LICENSES/AGPL-3.0-or-later.txt
 copyright:          Spool contributors
 
+flag werror
+  description: Treat warnings as errors. The flake and CI turn it on.
+  default:     False
+  manual:      True
+
+common shared
+  default-language: Haskell2010
+  build-depends:    base >=4.18 && <5
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wmissing-export-lists
+    -Wpartial-fields
+    -Wredundant-constraints
+    -Wunused-packages
+  if flag(werror)
+    ghc-options:    -Werror
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:
+      Spool
+    , Spool.Access
+    , Spool.Attachments
+    , Spool.Cli
+    , Spool.Failure
+    , Spool.Files
+    , Spool.Grants
+    , Spool.Input
+    , Spool.Store
+    , Spool.Wire
+    , Spool.Worker.Config
+    , Spool.Worker.Run
+  build-depends:
+      aeson      >=2.2    && <2.4
+    , bytestring >=0.11   && <0.13
+    , crypton    >=1.0    && <2.2
+    , directory  >=1.3.8  && <1.4
+    , filepath   >=1.4    && <1.6
+    , memory     >=0.18   && <0.19
+    , process    >=1.6.17 && <1.7
+    , text       >=2.0    && <2.2
+    , time       >=1.12   && <1.16
+    , unix       >=2.8    && <2.9
+
 executable spool
-  main-is:          Spool.hs
-  other-modules:
-      SpoolAttachments
-    , SpoolAccess
-  hs-source-dirs:   .
-  build-depends:
-      aeson
-    , base >=4.18 && <5
-    , bytestring
-    , crypton
-    , directory
-    , filepath
-    , memory
-    , process
-    , text
-    , time
-    , unix
-  default-language: Haskell2010
-  ghc-options:      -Wall -Werror -threaded
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:    spool
+  ghc-options:      -threaded
 
-test-suite remote-parser-test
+test-suite spool-test
+  import:           shared
   type:             exitcode-stdio-1.0
-  main-is:          RemoteParserTest.hs
+  hs-source-dirs:   test
+  main-is:          Main.hs
   other-modules:
-      SpoolAccess
-  hs-source-dirs:   .
+      Test.Access
+    , Test.Attachments
+    , Test.Cli
+    , Test.Wire
+    , Test.WorkerConfig
   build-depends:
-      aeson
-    , base >=4.18 && <5
+      spool
+    , aeson
     , bytestring
     , directory
     , filepath
-    , memory
-    , text
-    , time
-  default-language: Haskell2010
-  ghc-options:      -Wall -Werror
-
-test-suite attachment-cleanup-test
-  type:             exitcode-stdio-1.0
-  main-is:          AttachmentCleanupTest.hs
-  other-modules:
-      SpoolAttachments
-  hs-source-dirs:   .
-  build-depends:
-      aeson
-    , base >=4.18 && <5
-    , bytestring
-    , crypton
-    , directory
-    , filepath
-    , memory
     , process
+    , tasty            >=1.4  && <1.6
+    , tasty-hunit      >=0.10 && <0.11
+    , tasty-quickcheck >=0.10 && <0.12
     , text
     , unix
-  default-language: Haskell2010
-  ghc-options:      -Wall -Werror -threaded
+  ghc-options:      -threaded

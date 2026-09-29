@@ -41,9 +41,12 @@ use revocable or expiring grants whose forced command exposes only worker
 operations and fixes the worker identity. Attachments are declared by digest,
 verified when staged and received, and deleted when their task resolves.
 
-The Nix flake builds a static binary. The integration suite exercises the local
-and forced-command paths; the real-machine validation exercises the full SSH,
-attachment, worker-death, reclaim, and stale-ack path.
+The implementation is a library with a thin executable over it. The Nix flake
+builds a static binary. Unit and property tests cover the grammars, the
+envelopes, and the canonical encoding; the integration suite exercises the
+local and forced-command paths against a built binary; the real-machine
+validation exercises the full SSH, attachment, worker-death, reclaim, and
+stale-ack path.
 
 ## The words
 
@@ -66,12 +69,17 @@ docs/invariants.md     what must always hold
 docs/decisions/        why each decision was made
 docs/open-questions.md what is deliberately not decided yet
 docs/real-machine-gate.md authorized cross-machine validation and evidence
+src/                   the reference implementation, a library
+app/                   the spool executable
+test/                  unit and property tests
+test.sh                the integration suite, run against a built binary
 ```
 
 ## Contributing
 
 Read [AGENTS.md](AGENTS.md); it applies to people too. Run `make check` and
-`nix flake check -L`. Sign off each commit (`git commit -s`) to certify it under
+`nix flake check -L`. `nix develop` opens a shell with the compiler and Cabal,
+where `cabal test` runs the unit tests alone. Sign off each commit (`git commit -s`) to certify it under
 the [Developer Certificate of Origin](https://developercertificate.org).
 
 ## Licence

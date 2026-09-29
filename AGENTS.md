@@ -30,7 +30,10 @@ document is linked from somewhere, every decision record is indexed, cited
 invariants exist and cite a decision, the protocol's version matches
 `spec/VERSION`, and every file has a licence in `REUSE.toml`.
 
-`nix flake check -L` builds the static binary and runs the parser and integration
-tests. Changes to grants, remote dispatch, attachment lifecycle, reclaim, or
+`nix flake check -L` builds the static binary with warnings as errors and runs
+the unit tests in `test/` and the integration suite in `test.sh`. CI runs the
+same on Linux and macOS, and builds against Hackage with each supported
+compiler. A test goes in `test/` when it needs a pure function or a failure at
+one exact moment, and in `test.sh` when it needs the binary. Changes to grants, remote dispatch, attachment lifecycle, reclaim, or
 lease fencing also run the authorized three-role procedure in the
 [real-machine validation runbook](docs/real-machine-gate.md).

@@ -18,7 +18,8 @@ if [[ -z ${SPOOL:-} ]]; then
     ghc_flags+=(-package-env "$SPOOL_GHC_PACKAGE_ENV")
   fi
   mkdir "$work/hs"
-  ghc "${ghc_flags[@]}" -outputdir "$work/hs" -o "$spool_binary" "$here/Spool.hs" >/dev/null
+  ghc "${ghc_flags[@]}" -i"$here/src" -outputdir "$work/hs" -o "$spool_binary" \
+    "$here/app/Main.hs" >/dev/null
 fi
 test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
 test "$($spool_binary --version)" = "spool 0.0.1"; check
@@ -1062,7 +1063,7 @@ printf '%s\n' "$remote_attachment_ack" | remote_primary 'ack' >/dev/null
 
 # The remote command is an exact byte grammar.  Shell metacharacters,
 # whitespace variants, local-only operations, options, and non-canonical
-# counts never reach a handler.  The Cabal parser test covers NUL; these
+# counts never reach a handler.  The Cabal test suite covers NUL; these
 # environment values cover the bytes a shell can carry.
 remote_reject() {
   local requested=$1
