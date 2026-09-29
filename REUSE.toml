@@ -10,6 +10,16 @@ SPDX-FileCopyrightText = "The Spool contributors"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
+path = [".gitignore", "flake.nix", "flake.lock"]
+SPDX-FileCopyrightText = "The Spool contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ["*.hs", "*.cabal", "test.sh"]
+SPDX-FileCopyrightText = "The Spool contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
 path = ["*.md", "docs/**", "spec/**"]
 SPDX-FileCopyrightText = "The Spool contributors"
 SPDX-License-Identifier = "CC0-1.0"

@@ -1,0 +1,27 @@
+cabal-version:      3.0
+name:               spool
+version:            0.0.1
+build-type:         Simple
+synopsis:           A standalone file-backed JSONL task spool
+description:        Builds spool as a native executable with no runtime compiler or source-tree dependency.
+category:           Development
+maintainer:         space-panda-dev
+license:            AGPL-3.0-or-later
+license-file:       LICENSES/AGPL-3.0-or-later.txt
+copyright:          Spool contributors
+
+executable spool
+  main-is:          Spool.hs
+  hs-source-dirs:   .
+  build-depends:
+      aeson
+    , base >=4.18 && <5
+    , bytestring
+    , directory
+    , filepath
+    , process
+    , text
+    , time
+    , unix
+  default-language: Haskell2010
+  ghc-options:      -Wall -Werror -threaded

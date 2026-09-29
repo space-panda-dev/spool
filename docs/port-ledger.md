@@ -45,6 +45,7 @@ when the port is complete.
 | Return-to-pending helper shared by fail and reclaim | Keep the mechanism | Equal recreation is idempotent and conflicting recreation fails, preserving [INV-7](invariants.md). |
 | Failure listing and chronological ordering | Translate | `failures` is documented and failed coordination history is a retry ledger ([commands](../spec/protocol.md#commands), [ADR 0001](decisions/0001-pull-protocol.md)). |
 | Result listing and chronological ordering | Rewrite | Preserve listing, but read records produced by result-bearing `ack` and keep results opaque ([states](../spec/protocol.md#states), [INV-1](invariants.md)). |
+| Failure and result record validators | Rewrite | Validate every durable shape produced by the port and fail closed on missing, unknown, or mistyped fields ([protocol](../spec/protocol.md#commands)). |
 | Reclaim scan and transition | Rewrite | Keep age calculation and fencing, but unreadable renewal state and removal failures must fail loudly; the command is specified even though its driver is open ([states](../spec/protocol.md#states)). |
 | Status counters and JSON/text encoders | Translate | Preserve the documented `status [--json]` command while naming only Spool state ([commands](../spec/protocol.md#commands)). |
 | Work configuration parser, defaults, and `--show` | Keep the mechanism | Executable, arguments, timeout, payload, concurrency, renewal, and complete environment are specified in [Workers](../spec/protocol.md#workers). |
@@ -123,6 +124,7 @@ when the port is complete.
 | No pending task makes `work` exit 0 | Keep the mechanism | A non-daemon invocation drains available work and returns ([ADR 0001](decisions/0001-pull-protocol.md)). |
 | Stale `fail` is exit 4 | Rewrite | Add the missing fenced-operation case so every stale transition is tested ([INV-6](invariants.md)). |
 | Permission/refusal branches for existence, rename, sidecar, and cleanup | Rewrite | Add missing tests so refused I/O cannot masquerade as absence, a race, or successful cleanup ([AGENTS.md](../AGENTS.md#how-to-work)). |
+| Real-writer corruption fixtures | Rewrite | Corrupt records and sidecars produced by public commands so validators are tested against the shapes the implementation actually writes ([protocol](../spec/protocol.md#commands)). |
 | CLI registry-to-handler reachability | Rewrite | Add an enumerated dispatch test so every declared command reaches its handler ([AGENTS.md](../AGENTS.md#checks)). |
 | Grant, remote-command, and attachment tests | Defer | Their interfaces are open questions and cannot be encoded yet ([open questions](open-questions.md)). |
 

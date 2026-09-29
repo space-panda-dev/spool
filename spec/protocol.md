@@ -35,7 +35,8 @@ A task is **pending**, **leased**, **done**, or **failed**.
 - `ack` with that lease ID moves it to done, carrying the task's result: any
   JSON value, `{"task_id", "lease_id", "result"}`. The result is kept with the
   done task until whoever put the task reads it; how long after that is open.
-  Repeating an equal ack is a no-op.
+  Repeating an equal ack is a no-op. Repeating the task and lease with a
+  different result is a stale-lease error and cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
   or, with `--no-retry`, moves it to failed.
@@ -63,6 +64,25 @@ spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
 spool work --config FILE --show
 ```
 
+`results` emits one JSON object per acknowledged task, oldest first:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","capability":"classify@1","worker":"worker-one","finished_at":"2026-09-29T12:00:00Z","result":{"anything":"opaque"}}
+```
+
+The `result` value is exactly the value carried by `ack`. Spool does not
+interpret it.
+
+`failures` emits one JSON object per reported failure, oldest first:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","capability":"classify@1","worker":"worker-one","failed_at":"2026-09-29T12:00:00Z","reason":"exit 3: failed","retried":true}
+```
+
+Both record envelopes are validated when read. A missing field, an unknown
+field, or a field of the wrong type is corrupt durable state, not an empty
+result.
+
 `grant`, `revoke`, and the remote command used over SSH are provisional
 ([ADR 0003](../docs/decisions/0003-ssh-first.md)).
 
@@ -75,6 +95,7 @@ spool work --config FILE --show
 | 2 | malformed input |
 | 3 | task conflict |
 | 4 | stale or unknown lease |
+| 70 | corrupt durable state |
 | 75 | retryable filesystem failure |
 
 ## Workers
