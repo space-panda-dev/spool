@@ -120,8 +120,35 @@ and size before writing the raw bytes to stdout. Diagnostics use stderr. The
 receiver verifies digest and size again before exposing the file. Ranges,
 resumption, paths, and multiple requests in one invocation are unsupported.
 
-`grant`, `revoke`, and the remote command used over SSH are provisional
-([ADR 0003](../docs/decisions/0003-ssh-first.md)).
+### Grants (proposed)
+
+The draft defined by
+[ADR 0006](../docs/decisions/0006-grants-are-account-records.md) adds:
+
+```sh
+spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--expires-at RFC3339]
+spool --dir DIR revoke --grant GRANT_ID
+```
+
+`grant` creates this exact record beneath the dedicated account's
+`$HOME/.spool/grants/` directory:
+
+```json
+{"grant_id":"grant_0123456789abcdef0123456789abcdef","peer":"peer-one","worker":"worker-one","spool":"/absolute/spool","public_key":"ssh-ed25519 AAAA...","expires_at":"2026-10-01T00:00:00Z"}
+```
+
+`expires_at` is either a UTC RFC3339 timestamp or null. A grant is expired when
+the spool host's `now >= expires_at`. The remote command reads and validates
+the record on every request. Grant records contain no execution or disclosure
+limits.
+
+`grant` writes one generated `restrict,command="..."` line to the dedicated
+account's `$HOME/.ssh/authorized_keys`; `revoke` removes that exact managed
+line and preserves unrelated lines. A managed key and worker are unique per
+spool. Revocation first disables the record, then removes the line, then
+reclaims that worker's live leases. Repeating revoke changes nothing.
+
+The exact forced command and request grammar remain proposed below.
 
 ## Exit codes
 
@@ -132,6 +159,7 @@ resumption, paths, and multiple requests in one invocation are unsupported.
 | 2 | malformed input |
 | 3 | task conflict |
 | 4 | stale or unknown lease |
+| 5 | grant missing, revoked, or expired |
 | 70 | corrupt durable state |
 | 75 | retryable filesystem failure |
 
