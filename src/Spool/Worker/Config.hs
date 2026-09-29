@@ -18,6 +18,7 @@ import Data.Aeson ((.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.Int (Int64)
@@ -54,7 +55,7 @@ loadWorkConfig :: FilePath -> IO WorkConfig
 loadWorkConfig configPath = do
   exists <- fileExists configPath
   unless exists (throwIO (malformed ("config file not found: " <> configPath)))
-  bytes <- BL.readFile configPath
+  bytes <- BL.fromStrict <$> BS.readFile configPath
   config <- orThrow malformed (parseWorkConfig bytes)
   orThrow malformed =<< checkExecutables config
   pure config

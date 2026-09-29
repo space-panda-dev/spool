@@ -49,6 +49,7 @@ library
     , Spool.Worker.Run
   build-depends:
       aeson      >=2.2    && <2.4
+    , async      >=2.2    && <2.3
     , bytestring >=0.11   && <0.13
     , containers >=0.6    && <0.9
     , crypton    >=1.0    && <2.2
@@ -56,6 +57,7 @@ library
     , filepath   >=1.4    && <1.6
     , memory     >=0.18   && <0.19
     , process    >=1.6.17 && <1.7
+    , stm        >=2.5    && <2.6
     , text       >=2.0    && <2.2
     , time       >=1.12   && <1.16
     , unix       >=2.8    && <2.9

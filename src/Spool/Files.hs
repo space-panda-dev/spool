@@ -1,9 +1,18 @@
 -- | The spool's directories, its lock, and the atomic file operations every
 -- transition is built from.
 module Spool.Files
-  ( Paths (..)
+  ( Paths
+  , rootDir
+  , pendingDir
+  , leasedDir
+  , doneDir
+  , failedDir
+  , resultsDir
+  , attachmentsDir
+  , attachmentCleanupDir
+  , lockPath
+  , openSpool
   , withLock
-  , makePaths
   , initialise
   , pendingPath
   , leasedPath
@@ -33,7 +42,6 @@ import System.IO (IOMode (AppendMode), hClose, openBinaryTempFile, openFile)
 import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus)
-import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.Text as T
 import Spool.Types (LeaseId, TaskId, leaseIdText, taskIdText)
 
@@ -47,32 +55,38 @@ data Paths = Paths
   , attachmentsDir :: FilePath
   , attachmentCleanupDir :: FilePath
   , lockPath :: FilePath
+  , processLock :: MVar ()
+    -- ^ Keeps this process's own threads from the lock file at once. See
+    -- 'withLock'.
   }
-
--- | The "work" command's concurrent tasks each take the store lock for
--- their own transition, from separate green threads in this one process.
--- GHC's file lock (flock(2) under the hood) is scoped to the OS process, so
--- two threads in the same process racing to open and lock the same path is
--- not the cross-process case it was designed for, and observably (macOS,
--- GHC 9.14) a losing "openFile" can raise "resource busy" instead of
--- blocking. An in-process mutex serialises those threads before any of
--- them touches the file, leaving the file lock doing only what it always
--- did: keeping a second "spool" process out.
-{-# NOINLINE inProcessLock #-}
-inProcessLock :: MVar ()
-inProcessLock = unsafePerformIO (newMVar ())
 
 -- | Acquire the store's exclusive lock for exactly one transition. The
 -- "work" command takes this per lease/renew/ack/fail rather than once for
 -- the whole command, so an executable never runs while the lock is held.
+--
+-- The "work" command's concurrent tasks each take the lock for their own
+-- transition, from separate green threads in this one process. GHC's file
+-- lock (flock(2) under the hood) is scoped to the OS process, so two threads
+-- in the same process racing to open and lock the same path is not the
+-- cross-process case it was designed for, and observably (macOS, GHC 9.14) a
+-- losing "openFile" can raise "resource busy" instead of blocking. The
+-- spool's own mutex serialises those threads before any of them touches the
+-- file, leaving the file lock doing only what it always did: keeping a
+-- second "spool" process out.
 withLock :: Paths -> IO a -> IO a
-withLock paths action = withMVar inProcessLock $ \() ->
+withLock paths action = withMVar (processLock paths) $ \() ->
   bracket (openFile (lockPath paths) AppendMode) hClose $ \handle -> do
     hLock handle ExclusiveLock
     action
 
-makePaths :: FilePath -> Paths
-makePaths directory = Paths
+-- | The spool in a directory. A process opens its spool once and passes it
+-- on: the mutex that keeps its threads apart is made here, so two openings
+-- of one directory would not keep each other's threads apart.
+openSpool :: FilePath -> IO Paths
+openSpool directory = spoolAt directory <$> newMVar ()
+
+spoolAt :: FilePath -> MVar () -> Paths
+spoolAt directory lock = Paths
   { rootDir = directory
   , pendingDir = directory </> "pending"
   , leasedDir = directory </> "leased"
@@ -82,6 +96,7 @@ makePaths directory = Paths
   , attachmentsDir = directory </> "attachments"
   , attachmentCleanupDir = directory </> ".attachment-cleanup"
   , lockPath = directory </> ".spool.lock"
+  , processLock = lock
   }
 
 -- A pending task is filed under its own identifier. Everything that follows
