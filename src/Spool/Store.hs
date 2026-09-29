@@ -21,19 +21,19 @@ module Spool.Store
   , leaseTasks
   , leaseUpTo
   , ackTasks
-  , ackLines
+  , ackAll
   , ackOne
   , renewTasks
-  , renewLines
+  , renewAll
   , renewOne
   , failTasks
-  , failLines
+  , failAll
   , failLease
   , returnToPending
   , failuresCommand
   , resultsCommand
   , fetchAttachment
-  , fetchAttachmentBytes
+  , fetchFor
   , reclaimTasks
   , statusTasks
   ) where
@@ -41,7 +41,6 @@ module Spool.Store
 import Control.Exception (IOException, displayException, throwIO, try)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import qualified Data.Aeson as A
-import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
@@ -49,7 +48,7 @@ import Data.List (sortOn)
 import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
+import Data.Time (getCurrentTime)
 import System.Directory (listDirectory, removeDirectoryRecursive, removeFile,
                          removePathForcibly, renameDirectory, renameFile)
 import System.FilePath (takeBaseName, (</>))
@@ -105,25 +104,27 @@ import Spool.Types
   , newLeaseId
   , storedWorkerName
   , taskIdText
+  , timestamp
   , workerNameText
   )
 import Spool.Wire
-  ( AckStatus (..)
+  ( Ack (..)
+  , AckStatus (..)
+  , Counts (..)
+  , FailRequest (..)
+  , FailureRecord (..)
+  , FetchRequest (..)
   , Lease (..)
+  , LeaseRef (..)
   , PutStatus (..)
+  , ResultRecord (..)
   , Task (..)
-  , canonical
+  , encode
   , encodeAckResult
   , encodeFailResult
-  , encodeFailedRecord
-  , encodeLease
   , encodePutResult
   , encodeReclaimResult
   , encodeRenewResult
-  , encodeResultRecord
-  , encodeStatus
-  , encodeTask
-  , extractTextField
   , parseFailureRecord
   , parseFetchRequest
   , parseResultRecord
@@ -183,7 +184,7 @@ putOne paths sourceDirectory task = do
     Just OtherTask -> throwIO different
     Nothing -> do
       stageTaskAttachments paths sourceDirectory task
-      created <- atomicCreate (pendingPath paths (taskId task)) (encodeTask task)
+      created <- atomicCreate (pendingPath paths (taskId task)) (encode task)
       case created of
         Created -> pure PutInserted
         AlreadyThere -> do
@@ -248,7 +249,7 @@ readTaskFile path = do
       ("corrupt task file " <> path <> ": " <> message))
     Right task -> pure task
 
-readFailureRecordFile :: FilePath -> IO A.Value
+readFailureRecordFile :: FilePath -> IO FailureRecord
 readFailureRecordFile path = do
   bytes <- BL.readFile path
   case parseFailureRecord bytes of
@@ -256,7 +257,7 @@ readFailureRecordFile path = do
       ("corrupt failure record " <> path <> ": " <> message))
     Right value -> pure value
 
-readResultRecordFile :: FilePath -> IO (A.Value, A.Value)
+readResultRecordFile :: FilePath -> IO ResultRecord
 readResultRecordFile path = do
   bytes <- BL.readFile path
   case parseResultRecord bytes of
@@ -320,7 +321,7 @@ leaseTasks :: Paths -> WorkerName -> Int -> IO ()
 leaseTasks paths worker count = do
   leased <- leaseUpTo paths worker count
   when (null leased) (throwIO NothingPending)
-  forM_ leased (BLC.putStrLn . encodeLease)
+  forM_ leased (BLC.putStrLn . encode)
 
 -- | Lease up to `count` pending tasks for `worker`. Used by both the CLI
 -- `lease` command and the `work` loop (with count 1). Returns fewer than
@@ -341,8 +342,7 @@ leaseUpTo paths worker count = do
           now <- getCurrentTime
           micros <- epochMicros
           leaseIdent <- uniqueLeaseId paths micros (taskId task)
-          let lease = Lease task leaseIdent worker
-                (T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now))
+          let lease = Lease task leaseIdent worker (timestamp now)
           moved <- try (renameFile path (leasedPath paths leaseIdent))
             :: IO (Either IOException ())
           case moved of
@@ -377,31 +377,39 @@ nextLeaseSerial paths = do
       atomicReplace path (BLC.pack (show next <> "\n"))
       pure next
 
--- | Apply one transition to each line. A lease that is stale is reported and
--- the lines after it still run; the command then ends as stale. Anything
--- else that goes wrong ends the command where it happens.
-forEachLine :: (BL.ByteString -> IO (Either SpoolError BL.ByteString))
-            -> [BL.ByteString] -> IO ()
-forEachLine step linesIn = do
-  refused <- foldM one False linesIn
+-- | Apply one transition to each of these, in order. A lease that is stale
+-- is reported and the ones after it still run; the command then ends as
+-- stale. Anything else that goes wrong ends the command where it happens.
+forEach :: (a -> IO (Either SpoolError BL.ByteString)) -> [a] -> IO ()
+forEach step items = do
+  refused <- foldM one False items
   when refused (throwIO (stale "one or more leases were stale or unknown"))
   where
-    one hadRefusal line = do
-      result <- step line
+    one hadRefusal item = do
+      result <- step item
       case result of
         Left failure -> report failure >> pure True
         Right reply -> BLC.putStrLn reply >> pure hadRefusal
 
+-- A command reads its lines one at a time, so a line is applied before the
+-- next is read, and a malformed line stops the command with the lines
+-- before it already applied. The remote command reads every line before it
+-- applies any, because it checks who owns each lease first; it uses the
+-- forms that take what it has already read.
+
 ackTasks :: Paths -> IO ()
-ackTasks paths = inputLines >>= ackLines paths
+ackTasks paths = inputLines >>= forEach (\line -> parseAckLine line >>= ackStep paths)
 
-ackLines :: Paths -> [BL.ByteString] -> IO ()
-ackLines paths = forEachLine $ \line -> do
-  (ident, leaseIdent, output) <- parseAckLine line
-  fmap (encodeAckResult ident) <$> ackOne paths ident leaseIdent output
+ackAll :: Paths -> [Ack] -> IO ()
+ackAll paths = forEach (ackStep paths)
 
-ackOne :: Paths -> TaskId -> LeaseId -> A.Value -> IO (Either SpoolError AckStatus)
-ackOne paths ident leaseIdent output = do
+ackStep :: Paths -> Ack -> IO (Either SpoolError BL.ByteString)
+ackStep paths ack =
+  fmap (encodeAckResult (refTask (ackRef ack)))
+    <$> ackOne paths (ackRef ack) (ackResult ack)
+
+ackOne :: Paths -> LeaseRef -> A.Value -> IO (Either SpoolError AckStatus)
+ackOne paths (LeaseRef ident leaseIdent) output = do
   let source = leasedPath paths leaseIdent
   sourceExists <- fileExists source
   if sourceExists
@@ -456,8 +464,8 @@ completedResultMatches paths leaseIdent output = do
   present <- fileExists path
   unless present (throwIO (retryable
     ("completed lease has no result: " <> showLease leaseIdent)))
-  (_, stored) <- readResultRecordFile path
-  pure (stored == output)
+  stored <- readResultRecordFile path
+  pure (resultValue stored == output)
 
 findDoneLease :: Paths -> TaskId -> LeaseId -> IO (Maybe DoneUnder)
 findDoneLease paths ident leaseIdent = do
@@ -471,15 +479,18 @@ findDoneLease paths ident leaseIdent = do
   pure (listToMaybe [found | Just found <- matches])
 
 renewTasks :: Paths -> IO ()
-renewTasks paths = inputLines >>= renewLines paths
+renewTasks paths =
+  inputLines >>= forEach (\line -> parseLeaseRefLine line >>= renewStep paths)
 
-renewLines :: Paths -> [BL.ByteString] -> IO ()
-renewLines paths = forEachLine $ \line -> do
-  (ident, leaseIdent) <- parseLeaseRefLine line
-  fmap (const (encodeRenewResult ident)) <$> renewOne paths ident leaseIdent
+renewAll :: Paths -> [LeaseRef] -> IO ()
+renewAll paths = forEach (renewStep paths)
 
-renewOne :: Paths -> TaskId -> LeaseId -> IO (Either SpoolError ())
-renewOne paths ident leaseIdent = do
+renewStep :: Paths -> LeaseRef -> IO (Either SpoolError BL.ByteString)
+renewStep paths reference =
+  fmap (const (encodeRenewResult (refTask reference))) <$> renewOne paths reference
+
+renewOne :: Paths -> LeaseRef -> IO (Either SpoolError ())
+renewOne paths (LeaseRef ident leaseIdent) = do
   let source = leasedPath paths leaseIdent
   exists <- fileExists source
   if not exists
@@ -494,19 +505,22 @@ renewOne paths ident leaseIdent = do
           pure (Right ())
 
 failTasks :: Retry -> Paths -> IO ()
-failTasks retry paths = inputLines >>= failLines retry paths
+failTasks retry paths =
+  inputLines >>= forEach (\line -> parseFailLine line >>= failStep retry paths)
 
-failLines :: Retry -> Paths -> [BL.ByteString] -> IO ()
-failLines retry paths = forEachLine $ \line -> do
-  (ident, leaseIdent, reason) <- parseFailLine line
-  fmap (const (encodeFailResult ident retry))
-    <$> failLease paths ident leaseIdent reason retry
+failAll :: Retry -> Paths -> [FailRequest] -> IO ()
+failAll retry paths = forEach (failStep retry paths)
+
+failStep :: Retry -> Paths -> FailRequest -> IO (Either SpoolError BL.ByteString)
+failStep retry paths request =
+  fmap (const (encodeFailResult (refTask (failRef request)) retry))
+    <$> failLease paths (failRef request) (failReason request) retry
 
 -- | Move a leased task to failed/, recording why, and (with retry) put an
 -- identical task back in pending/. Shared by the CLI `fail` command and the
 -- `work` loop's failure paths.
-failLease :: Paths -> TaskId -> LeaseId -> T.Text -> Retry -> IO (Either SpoolError ())
-failLease paths ident leaseIdent reason retry = do
+failLease :: Paths -> LeaseRef -> T.Text -> Retry -> IO (Either SpoolError ())
+failLease paths (LeaseRef ident leaseIdent) reason retry = do
   let source = leasedPath paths leaseIdent
   exists <- fileExists source
   if not exists
@@ -536,23 +550,25 @@ writeFailureRecord
   -> IO (Either SpoolError ())
 writeFailureRecord paths task leaseIdent worker reason retry = do
   now <- getCurrentTime
-  let failedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
-      record = encodeFailedRecord task leaseIdent worker failedAt reason retry
+  let record = FailureRecord
+        { failureTask = taskId task
+        , failureLease = leaseIdent
+        , failureCapability = taskCapability task
+        , failureWorker = worker
+        , failureFailedAt = timestamp now
+        , failureReason = reason
+        , failureRetried = retry
+        }
       path = failedPath paths leaseIdent
-  created <- atomicCreate path record
+  created <- atomicCreate path (encode record)
   case created of
     Created -> pure (Right ())
     AlreadyThere -> do
       existing <- readFailureRecordFile path
-      pure $ if recordsThisFailure existing
+      pure $ if failureReason existing == reason && failureRetried existing == retry
         then Right ()
         else Left (stale
           "fail differs from the failure already recorded for this lease")
-  where
-    recordsThisFailure (A.Object object) =
-      KM.lookup "reason" object == Just (A.String reason)
-        && KM.lookup "retried" object == Just (A.Bool (retry == Retry))
-    recordsThisFailure _ = False
 
 -- | Recreate a task in pending/, exactly as reclaim does: idempotent if an
 -- equal task is already there, a hard failure if a conflicting one is.
@@ -566,7 +582,7 @@ returnToPending paths task = do
       unless same (throwIO (conflict
         ("pending task conflicts with returned lease for " <> showTask (taskId task))))
     else do
-      created <- atomicCreate path (encodeTask task)
+      created <- atomicCreate path (encode task)
       when (created == AlreadyThere) $ do
         same <- equalTaskFile path task
         unless same (throwIO (conflict
@@ -576,20 +592,21 @@ failuresCommand :: Paths -> IO ()
 failuresCommand paths = do
   files <- jsonFiles (failedDir paths)
   records <- mapM readFailureRecordFile files
-  mapM_ (BLC.putStrLn . canonical) (oldestFirst "failed_at" records)
+  mapM_ (BLC.putStrLn . encode) (sortOn failureFailedAt records)
 
 resultsCommand :: Paths -> IO ()
 resultsCommand paths = do
   files <- jsonFiles (resultsDir paths)
-  records <- mapM (fmap fst . readResultRecordFile) files
-  mapM_ (BLC.putStrLn . canonical) (oldestFirst "finished_at" records)
+  records <- mapM readResultRecordFile files
+  mapM_ (BLC.putStrLn . encode) (sortOn resultFinishedAt records)
 
 fetchAttachment :: Paths -> IO ()
-fetchAttachment paths = BL.getContents >>= fetchAttachmentBytes paths
+fetchAttachment paths =
+  BL.getContents >>= orThrow malformed . parseFetchRequest >>= fetchFor paths
 
-fetchAttachmentBytes :: Paths -> BL.ByteString -> IO ()
-fetchAttachmentBytes paths bytes = do
-  (ident, leaseIdent, digest) <- orThrow malformed (parseFetchRequest bytes)
+-- | Write one verified attachment to stdout, for a request already read.
+fetchFor :: Paths -> FetchRequest -> IO ()
+fetchFor paths (FetchRequest (LeaseRef ident leaseIdent) digest) = do
   let leasePath = leasedPath paths leaseIdent
   present <- fileExists leasePath
   unless present (throwIO (stale "lease is unknown or stale"))
@@ -608,16 +625,19 @@ fetchAttachmentBytes paths bytes = do
       ("corrupt attachment for " <> showTask ident <> ": " <> message))
     Right () -> BL.readFile path >>= BL.putStr
 
-oldestFirst :: T.Text -> [A.Value] -> [A.Value]
-oldestFirst key records = map snd (sortOn fst [(extractTextField key record, record) | record <- records])
-
 writeResultRecord
   :: Paths -> Task -> LeaseId -> WorkerName -> A.Value -> IO (Either SpoolError ())
 writeResultRecord paths task leaseIdent worker output = do
   now <- getCurrentTime
-  let finishedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
-      record = encodeResultRecord task leaseIdent worker finishedAt output
-  created <- atomicCreate (resultPath paths leaseIdent) record
+  let record = ResultRecord
+        { resultTask = taskId task
+        , resultLease = leaseIdent
+        , resultCapability = taskCapability task
+        , resultWorker = worker
+        , resultFinishedAt = timestamp now
+        , resultValue = output
+        }
+  created <- atomicCreate (resultPath paths leaseIdent) (encode record)
   case created of
     Created -> pure (Right ())
     AlreadyThere -> do
@@ -650,14 +670,20 @@ reclaimOne paths leasedFile leaseIdent = do
 
 statusTasks :: Paths -> StatusFormat -> IO ()
 statusTasks paths format = do
-  pending <- length <$> jsonFiles (pendingDir paths)
-  leased <- length <$> jsonFiles (leasedDir paths)
-  done <- length <$> jsonFiles (doneDir paths)
-  failed <- length <$> jsonFiles (failedDir paths)
+  counts <- Counts
+    <$> count (pendingDir paths)
+    <*> count (leasedDir paths)
+    <*> count (doneDir paths)
+    <*> count (failedDir paths)
   case format of
-    StatusJson -> BLC.putStrLn (encodeStatus pending leased done failed)
-    StatusText -> putStrLn ("pending=" <> show pending <> " leased=" <> show leased
-      <> " done=" <> show done <> " failed=" <> show failed)
+    StatusJson -> BLC.putStrLn (encode counts)
+    StatusText -> putStrLn
+      ("pending=" <> show (countPending counts)
+        <> " leased=" <> show (countLeased counts)
+        <> " done=" <> show (countDone counts)
+        <> " failed=" <> show (countFailed counts))
+  where
+    count directory = length <$> jsonFiles directory
 
 showTask :: TaskId -> String
 showTask = T.unpack . taskIdText

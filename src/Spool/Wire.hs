@@ -1,42 +1,54 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The envelopes and records of the protocol: their shapes, their grammars,
 -- and the one canonical encoding. Everything here is pure.
+--
+-- Each shape is a type, read by one function that checks every field and
+-- refuses any it does not define.  What has been read is never looked into
+-- as JSON again.
 module Spool.Wire
-  ( Object
-  , Task (..)
+  ( -- * A task and its lease
+    Task (..)
   , Lease (..)
-  , PutStatus (..)
-  , AckStatus (..)
   , parseTask
+    -- * What a worker sends
+  , LeaseRef (..)
+  , Ack (..)
+  , FailRequest (..)
+  , FetchRequest (..)
+  , parseLeaseRef
   , parseAck
   , parseFail
   , parseFetchRequest
-  , rejectUnknown
-  , encodeTask
+    -- * What the spool keeps
+  , ResultRecord (..)
+  , FailureRecord (..)
+  , parseResultRecord
+  , parseFailureRecord
+    -- * What the spool answers
+  , PutStatus (..)
+  , AckStatus (..)
+  , Counts (..)
   , encodePutResult
-  , encodeLease
   , encodeAckResult
   , encodeRenewResult
   , encodeFailResult
   , encodeReclaimResult
-  , encodeFailedRecord
-  , encodeResultRecord
-  , encodeStatus
+    -- * Encoding
+  , encode
   , canonical
-  , parseLeaseRef
-  , parseFailureRecord
-  , parseResultRecord
-  , extractTextField
+    -- * For other parsers of strict objects
+  , Object
+  , rejectUnknown
   , readInteger
   ) where
 
-import Data.Aeson ((.=))
+import Data.Aeson (ToJSON (..), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
+import Data.Foldable (toList)
 import Data.List (sortOn)
 import qualified Data.Text as T
 import qualified Spool.Attachments as SA
@@ -45,11 +57,14 @@ import Spool.Types
   , LeaseId
   , Retry (..)
   , TaskId
+  , Timestamp
   , WorkerName
   , mkCapability
   , mkLeaseId
   , mkTaskId
   , retryFlag
+  , storedTimestamp
+  , storedWorkerName
   )
 
 type Object = KM.KeyMap A.Value
@@ -61,83 +76,234 @@ data Task = Task
   , taskAttachments :: [SA.Attachment]
   } deriving (Eq, Show)
 
+instance ToJSON Task where
+  toJSON task = A.object
+    [ "task_id" .= taskId task
+    , "capability" .= taskCapability task
+    , "payload" .= taskPayload task
+    , "attachments" .= taskAttachments task
+    ]
+
 data Lease = Lease
   { leaseTask :: Task
   , leaseId :: LeaseId
   , leaseWorker :: WorkerName
-  , leaseTime :: T.Text
+  , leaseTime :: Timestamp
   } deriving (Eq, Show)
+
+instance ToJSON Lease where
+  toJSON lease = A.object
+    [ "task_id" .= taskId (leaseTask lease)
+    , "capability" .= taskCapability (leaseTask lease)
+    , "lease_id" .= leaseId lease
+    , "worker" .= leaseWorker lease
+    , "leased_at" .= leaseTime lease
+    , "payload" .= taskPayload (leaseTask lease)
+    , "attachments" .= taskAttachments (leaseTask lease)
+    ]
+
+-- | A task and the lease a worker claims to hold on it.  Every request a
+-- worker sends names one.
+data LeaseRef = LeaseRef
+  { refTask :: TaskId
+  , refLease :: LeaseId
+  } deriving (Eq, Show)
+
+data Ack = Ack
+  { ackRef :: LeaseRef
+  , ackResult :: A.Value
+  } deriving (Eq, Show)
+
+data FailRequest = FailRequest
+  { failRef :: LeaseRef
+  , failReason :: T.Text
+  } deriving (Eq, Show)
+
+data FetchRequest = FetchRequest
+  { fetchRef :: LeaseRef
+  , fetchDigest :: SA.Sha256
+  } deriving (Eq, Show)
+
+-- | The record of an acknowledged task, kept until whoever put the task
+-- reads it.
+data ResultRecord = ResultRecord
+  { resultTask :: TaskId
+  , resultLease :: LeaseId
+  , resultCapability :: Capability
+  , resultWorker :: WorkerName
+  , resultFinishedAt :: Timestamp
+  , resultValue :: A.Value
+  } deriving (Eq, Show)
+
+instance ToJSON ResultRecord where
+  toJSON record = A.object
+    [ "task_id" .= resultTask record
+    , "lease_id" .= resultLease record
+    , "capability" .= resultCapability record
+    , "worker" .= resultWorker record
+    , "finished_at" .= resultFinishedAt record
+    , "result" .= resultValue record
+    ]
+
+-- | The record of one reported failure, whether or not the task went back
+-- to pending.
+data FailureRecord = FailureRecord
+  { failureTask :: TaskId
+  , failureLease :: LeaseId
+  , failureCapability :: Capability
+  , failureWorker :: WorkerName
+  , failureFailedAt :: Timestamp
+  , failureReason :: T.Text
+  , failureRetried :: Retry
+  } deriving (Eq, Show)
+
+instance ToJSON FailureRecord where
+  toJSON record = A.object
+    [ "task_id" .= failureTask record
+    , "lease_id" .= failureLease record
+    , "capability" .= failureCapability record
+    , "worker" .= failureWorker record
+    , "failed_at" .= failureFailedAt record
+    , "reason" .= failureReason record
+    , "retried" .= retryFlag (failureRetried record)
+    ]
 
 data PutStatus = PutInserted | PutExisting deriving (Eq, Show)
 
 data AckStatus = Acked | AlreadyDone deriving (Eq, Show)
 
-objectKeys :: Object -> [T.Text]
-objectKeys = map K.toText . KM.keys
+-- | What @status@ counts: task files in three places, and failure records.
+data Counts = Counts
+  { countPending :: Int
+  , countLeased :: Int
+  , countDone :: Int
+  , countFailed :: Int
+  } deriving (Eq, Show)
+
+instance ToJSON Counts where
+  toJSON counts = A.object
+    [ "pending" .= countPending counts
+    , "leased" .= countLeased counts
+    , "done" .= countDone counts
+    , "failed" .= countFailed counts
+    ]
+
+-- | Read one JSON object that defines exactly these fields.  The name is
+-- what the refusal calls the thing when it is not an object at all.
+strictObject
+  :: String -> [T.Text] -> (Object -> Either String a)
+  -> BL.ByteString -> Either String a
+strictObject name fields body bytes = do
+  value <- A.eitherDecode bytes
+  case value of
+    A.Object object -> rejectUnknown fields object >> body object
+    _ -> Left (name <> " must be a JSON object")
 
 parseTask :: BL.ByteString -> Either String Task
-parseTask bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown ["task_id", "capability", "payload", "attachments"] object
-      ident <- mkTaskId =<< requiredText "task_id" object
-      capability <- mkCapability =<< requiredText "capability" object
-      payload <- case KM.lookup "payload" object of
-        Nothing -> Left "task is missing payload"
-        Just value' -> Right value'
-      attachments <- case KM.lookup "attachments" object of
-        Nothing -> Right []
-        Just value' -> case A.fromJSON value' of
-          A.Error message -> Left message
-          A.Success declarations -> SA.validateAttachments declarations
-      pure (Task ident capability payload attachments)
-    _ -> Left "task must be a JSON object"
+parseTask = strictObject "task"
+  ["task_id", "capability", "payload", "attachments"] $ \object -> do
+    ident <- mkTaskId =<< requiredText "task_id" object
+    capability <- mkCapability =<< requiredText "capability" object
+    payload <- required "task is missing payload" "payload" object
+    attachments <- case KM.lookup "attachments" object of
+      Nothing -> Right []
+      Just value -> case A.fromJSON value of
+        A.Error message -> Left message
+        A.Success declarations -> SA.validateAttachments declarations
+    pure (Task ident capability payload attachments)
 
-parseAck :: BL.ByteString -> Either String (TaskId, LeaseId, A.Value)
-parseAck bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown ["task_id", "lease_id", "result"] object
-      identText <- requiredText "task_id" object
-      leaseText <- requiredText "lease_id" object
-      result <- case KM.lookup "result" object of
-        Nothing -> Left "ack is missing result"
-        Just value' -> Right value'
-      ident <- mkTaskId identText
-      lease <- mkLeaseId leaseText
-      pure (ident, lease, result)
-    _ -> Left "ack must be a JSON object"
+parseLeaseRef :: BL.ByteString -> Either String LeaseRef
+parseLeaseRef = strictObject "lease reference" ["task_id", "lease_id"] $ \object -> do
+  identText <- requiredText "task_id" object
+  leaseText <- requiredText "lease_id" object
+  leaseRef identText leaseText
 
-parseFail :: BL.ByteString -> Either String (TaskId, LeaseId, T.Text)
-parseFail bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown ["task_id", "lease_id", "reason"] object
-      identText <- requiredText "task_id" object
-      leaseText <- requiredText "lease_id" object
-      reason <- requiredText "reason" object
-      ident <- mkTaskId identText
-      lease <- mkLeaseId leaseText
-      pure (ident, lease, reason)
-    _ -> Left "fail must be a JSON object"
+parseAck :: BL.ByteString -> Either String Ack
+parseAck = strictObject "ack" ["task_id", "lease_id", "result"] $ \object -> do
+  identText <- requiredText "task_id" object
+  leaseText <- requiredText "lease_id" object
+  result <- required "ack is missing result" "result" object
+  reference <- leaseRef identText leaseText
+  pure (Ack reference result)
 
-parseFetchRequest :: BL.ByteString -> Either String (TaskId, LeaseId, SA.Sha256)
-parseFetchRequest bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown ["task_id", "lease_id", "sha256"] object
-      identText <- requiredText "task_id" object
-      leaseText <- requiredText "lease_id" object
-      digestText <- requiredText "sha256" object
-      ident <- mkTaskId identText
-      lease <- mkLeaseId leaseText
-      digest <- SA.mkSha256 digestText
-      pure (ident, lease, digest)
-    _ -> Left "fetch request must be a JSON object"
+parseFail :: BL.ByteString -> Either String FailRequest
+parseFail = strictObject "fail" ["task_id", "lease_id", "reason"] $ \object -> do
+  identText <- requiredText "task_id" object
+  leaseText <- requiredText "lease_id" object
+  reason <- requiredText "reason" object
+  reference <- leaseRef identText leaseText
+  pure (FailRequest reference reason)
+
+parseFetchRequest :: BL.ByteString -> Either String FetchRequest
+parseFetchRequest = strictObject "fetch request"
+  ["task_id", "lease_id", "sha256"] $ \object -> do
+    identText <- requiredText "task_id" object
+    leaseText <- requiredText "lease_id" object
+    digestText <- requiredText "sha256" object
+    reference <- leaseRef identText leaseText
+    digest <- SA.mkSha256 digestText
+    pure (FetchRequest reference digest)
+
+-- | The two identifiers of a request, checked only once every field of the
+-- request is known to be there, so that a missing field is what is reported
+-- when a field is missing.
+leaseRef :: T.Text -> T.Text -> Either String LeaseRef
+leaseRef identText leaseText = LeaseRef <$> mkTaskId identText <*> mkLeaseId leaseText
+
+parseResultRecord :: BL.ByteString -> Either String ResultRecord
+parseResultRecord = strictObject "result record"
+  ["task_id", "lease_id", "capability", "worker", "finished_at", "result"] $
+  \object -> do
+    (ident, lease, capability, worker) <- recordIdentity object
+    finishedAt <- requiredText "finished_at" object
+    result <- required "missing result" "result" object
+    pure ResultRecord
+      { resultTask = ident
+      , resultLease = lease
+      , resultCapability = capability
+      , resultWorker = worker
+      , resultFinishedAt = storedTimestamp finishedAt
+      , resultValue = result
+      }
+
+parseFailureRecord :: BL.ByteString -> Either String FailureRecord
+parseFailureRecord = strictObject "failure record"
+  [ "task_id", "lease_id", "capability", "worker", "failed_at", "reason"
+  , "retried" ] $
+  \object -> do
+    (ident, lease, capability, worker) <- recordIdentity object
+    failedAt <- requiredText "failed_at" object
+    reason <- requiredText "reason" object
+    retried <- case KM.lookup "retried" object of
+      Just (A.Bool True) -> Right Retry
+      Just (A.Bool False) -> Right NoRetry
+      Just _ -> Left "retried must be a boolean"
+      Nothing -> Left "missing retried"
+    pure FailureRecord
+      { failureTask = ident
+      , failureLease = lease
+      , failureCapability = capability
+      , failureWorker = worker
+      , failureFailedAt = storedTimestamp failedAt
+      , failureReason = reason
+      , failureRetried = retried
+      }
+
+-- | What a result record and a failure record have in common.
+recordIdentity :: Object -> Either String (TaskId, LeaseId, Capability, WorkerName)
+recordIdentity object = do
+  identText <- requiredText "task_id" object
+  leaseText <- requiredText "lease_id" object
+  capabilityText <- requiredText "capability" object
+  worker <- requiredText "worker" object
+  ident <- mkTaskId identText
+  lease <- mkLeaseId leaseText
+  capability <- mkCapability capabilityText
+  pure (ident, lease, capability, storedWorkerName worker)
+
+-- | A field that must be there and may hold any value, null included.
+required :: String -> K.Key -> Object -> Either String A.Value
+required refusal key object = maybe (Left refusal) Right (KM.lookup key object)
 
 requiredText :: T.Text -> Object -> Either String T.Text
 requiredText key object = case KM.lookup (K.fromText key) object of
@@ -149,94 +315,41 @@ requiredText key object = case KM.lookup (K.fromText key) object of
 
 rejectUnknown :: [T.Text] -> Object -> Either String ()
 rejectUnknown allowed object =
-  case filter (`notElem` allowed) (objectKeys object) of
+  case filter (`notElem` allowed) (map K.toText (KM.keys object)) of
     [] -> Right ()
     extras -> Left ("unknown fields: " <> T.unpack (T.intercalate ", " extras))
 
-encodeTask :: Task -> BL.ByteString
-encodeTask task = canonical (A.object
-  [ "task_id" .= taskId task
-  , "capability" .= taskCapability task
-  , "payload" .= taskPayload task
-  , "attachments" .= taskAttachments task
-  ])
-
 encodePutResult :: Task -> PutStatus -> BL.ByteString
-encodePutResult task result = canonical (A.object
-  [ "task_id" .= taskId task
-  , "status" .= case result of
-      PutInserted -> ("inserted" :: T.Text)
-      PutExisting -> "existing"
-  ])
-
-encodeLease :: Lease -> BL.ByteString
-encodeLease lease = canonical (A.object
-  [ "task_id" .= taskId (leaseTask lease)
-  , "capability" .= taskCapability (leaseTask lease)
-  , "lease_id" .= leaseId lease
-  , "worker" .= leaseWorker lease
-  , "leased_at" .= leaseTime lease
-  , "payload" .= taskPayload (leaseTask lease)
-  , "attachments" .= taskAttachments (leaseTask lease)
-  ])
+encodePutResult task result = reply (taskId task) $ case result of
+  PutInserted -> "inserted"
+  PutExisting -> "existing"
 
 encodeAckResult :: TaskId -> AckStatus -> BL.ByteString
-encodeAckResult ident result = canonical (A.object
-  [ "task_id" .= ident
-  , "status" .= case result of
-      Acked -> ("acked" :: T.Text)
-      AlreadyDone -> "already_done"
-  ])
+encodeAckResult ident result = reply ident $ case result of
+  Acked -> "acked"
+  AlreadyDone -> "already_done"
 
 encodeRenewResult :: TaskId -> BL.ByteString
-encodeRenewResult ident = canonical (A.object
-  [ "task_id" .= ident
-  , "status" .= ("renewed" :: T.Text)
-  ])
+encodeRenewResult ident = reply ident "renewed"
 
 encodeFailResult :: TaskId -> Retry -> BL.ByteString
-encodeFailResult ident retry = canonical (A.object
-  [ "task_id" .= ident
-  , "status" .= case retry of
-      Retry -> ("failed_retry" :: T.Text)
-      NoRetry -> "failed"
-  ])
+encodeFailResult ident retry = reply ident $ case retry of
+  Retry -> "failed_retry"
+  NoRetry -> "failed"
 
 encodeReclaimResult :: TaskId -> BL.ByteString
-encodeReclaimResult ident = canonical (A.object
-  [ "task_id" .= ident
-  , "status" .= ("reclaimed" :: T.Text)
-  ])
+encodeReclaimResult ident = reply ident "reclaimed"
 
-encodeFailedRecord :: Task -> LeaseId -> WorkerName -> T.Text -> T.Text -> Retry -> BL.ByteString
-encodeFailedRecord task leaseIdent worker failedAt reason retry = canonical (A.object
-  [ "task_id" .= taskId task
-  , "lease_id" .= leaseIdent
-  , "capability" .= taskCapability task
-  , "worker" .= worker
-  , "failed_at" .= failedAt
-  , "reason" .= reason
-  , "retried" .= retryFlag retry
-  ])
+-- | What a transition answers: the task, and what became of it.
+reply :: TaskId -> T.Text -> BL.ByteString
+reply ident status = canonical (A.object ["task_id" .= ident, "status" .= status])
 
-encodeResultRecord :: Task -> LeaseId -> WorkerName -> T.Text -> A.Value -> BL.ByteString
-encodeResultRecord task leaseIdent worker finishedAt output = canonical (A.object
-  [ "task_id" .= taskId task
-  , "lease_id" .= leaseIdent
-  , "capability" .= taskCapability task
-  , "worker" .= worker
-  , "finished_at" .= finishedAt
-  , "result" .= output
-  ])
+-- | The canonical bytes of anything the protocol writes.
+encode :: ToJSON a => a -> BL.ByteString
+encode = canonical . toJSON
 
-encodeStatus :: Int -> Int -> Int -> Int -> BL.ByteString
-encodeStatus pending leased done failed = canonical (A.object
-  [ "pending" .= pending
-  , "leased" .= leased
-  , "done" .= done
-  , "failed" .= failed
-  ])
-
+-- | One line, no spaces, and the keys of every object in order, so that
+-- equal values are equal bytes.
 canonical :: A.Value -> BL.ByteString
 canonical value = case value of
   A.Null -> "null"
@@ -244,7 +357,7 @@ canonical value = case value of
   A.Bool False -> "false"
   A.Number number -> A.encode number
   A.String text -> A.encode text
-  A.Array values -> "[" <> joinComma (map canonical (foldr (:) [] values)) <> "]"
+  A.Array values -> "[" <> joinComma (map canonical (toList values)) <> "]"
   A.Object object -> "{" <> joinComma (map encodePair ordered) <> "}"
     where
       ordered = sortOn (K.toText . fst) (KM.toList object)
@@ -253,71 +366,6 @@ canonical value = case value of
 joinComma :: [BL.ByteString] -> BL.ByteString
 joinComma [] = ""
 joinComma (firstValue : rest) = firstValue <> foldMap ("," <>) rest
-
-parseLeaseRef :: BL.ByteString -> Either String (TaskId, LeaseId)
-parseLeaseRef bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown ["task_id", "lease_id"] object
-      identText <- requiredText "task_id" object
-      leaseText <- requiredText "lease_id" object
-      ident <- mkTaskId identText
-      lease <- mkLeaseId leaseText
-      pure (ident, lease)
-    _ -> Left "lease reference must be a JSON object"
-
-parseFailureRecord :: BL.ByteString -> Either String A.Value
-parseFailureRecord bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown
-        [ "task_id", "lease_id", "capability", "worker", "failed_at"
-        , "reason", "retried"
-        ] object
-      validateRecordIdentity object
-      _ <- requiredText "failed_at" object
-      _ <- requiredText "reason" object
-      case KM.lookup "retried" object of
-        Just (A.Bool _) -> Right value
-        Just _ -> Left "retried must be a boolean"
-        Nothing -> Left "missing retried"
-    _ -> Left "failure record must be a JSON object"
-
-parseResultRecord :: BL.ByteString -> Either String (A.Value, A.Value)
-parseResultRecord bytes = do
-  value <- A.eitherDecode bytes
-  case value of
-    A.Object object -> do
-      rejectUnknown
-        [ "task_id", "lease_id", "capability", "worker", "finished_at"
-        , "result"
-        ] object
-      validateRecordIdentity object
-      _ <- requiredText "finished_at" object
-      result <- case KM.lookup "result" object of
-        Just resultValue -> Right resultValue
-        Nothing -> Left "missing result"
-      pure (value, result)
-    _ -> Left "result record must be a JSON object"
-
-validateRecordIdentity :: Object -> Either String ()
-validateRecordIdentity object = do
-  ident <- requiredText "task_id" object
-  lease <- requiredText "lease_id" object
-  capability <- requiredText "capability" object
-  _ <- requiredText "worker" object
-  _ <- mkTaskId ident
-  _ <- mkLeaseId lease
-  _ <- mkCapability capability
-  pure ()
-
-extractTextField :: T.Text -> A.Value -> T.Text
-extractTextField key (A.Object object) = case KM.lookup (K.fromText key) object of
-  Just (A.String value) -> value
-  _ -> ""
-extractTextField _ _ = ""
 
 readInteger :: T.Text -> Maybe Integer
 readInteger value = case reads (T.unpack value) of

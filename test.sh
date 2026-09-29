@@ -375,6 +375,36 @@ spoolf failures | jq -s --arg lease "$interrupted_lease" -e \
   'length == 1 and .[0].lease_id == $lease and .[0].reason == "first reason"
    and .[0].retried == true' >/dev/null; check
 
+# results and failures are listed oldest first, by when each was recorded.
+# The leases are resolved in the reverse of the order they were taken, so the
+# order of the files is not the order of the times and cannot pass for it.
+spoolo() { "$spool_binary" --dir "$work/ordered" "$@"; }
+spoolo init
+printf '%s\n' \
+  '{"task_id":"order-a","capability":"validate@1","payload":{}}' \
+  '{"task_id":"order-b","capability":"validate@1","payload":{}}' \
+  '{"task_id":"order-c","capability":"validate@1","payload":{}}' \
+  '{"task_id":"order-d","capability":"validate@1","payload":{}}' \
+  | spoolo put >/dev/null
+spoolo lease --worker orderly --count 4 > "$work/order-leases.jsonl"
+test "$(jq -r '.task_id' "$work/order-leases.jsonl" | tr '\n' ' ')" \
+  = "order-a order-b order-c order-d "; check
+order_line() {
+  # order_line TASK FIELD VALUE
+  jq -c --arg task "$1" --arg field "$2" --argjson value "$3" \
+    'select(.task_id == $task) | {task_id, lease_id, ($field): $value}' \
+    "$work/order-leases.jsonl"
+}
+order_line order-b result '{}' | spoolo ack >/dev/null
+order_line order-d reason '"later"' | spoolo fail --no-retry >/dev/null
+sleep 1.1
+order_line order-a result '{}' | spoolo ack >/dev/null
+order_line order-c reason '"latest"' | spoolo fail --no-retry >/dev/null
+test "$(ls "$work/ordered/results" | tr '\n' ' ' | sed 's/lease_[0-9]*_[0-9]*_//g')" \
+  = "order-a.json order-b.json "; check
+test "$(spoolo results | jq -r '.task_id' | tr '\n' ' ')" = "order-b order-a "; check
+test "$(spoolo failures | jq -r '.task_id' | tr '\n' ' ')" = "order-d order-c "; check
+
 spools() { "$spool_binary" --dir "$work/corrupt-sidecars" "$@"; }
 spools init
 printf '%s\n' '{"task_id":"bad-renewal","capability":"validate@1","payload":{}}' \
@@ -1056,6 +1086,33 @@ printf '%s\n' "$other_worker_ref" | remote_primary 'renew' >/dev/null 2>&1
 wrong_worker_exit=$?
 set -e
 test "$wrong_worker_exit" -eq 4; check
+
+# Every lease a remote request names is checked before any line is applied.
+# One line for another worker's lease refuses the whole request, and the
+# grant's own lease, named first in the same request, is left as it was.
+printf '%s\n' '{"task_id":"remote-batch","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_primary 'lease' > "$work/remote-batch-lease.jsonl"
+jq -e '.task_id == "remote-batch"' "$work/remote-batch-lease.jsonl" >/dev/null; check
+remote_batch_lease=$(jq -r '.lease_id' "$work/remote-batch-lease.jsonl")
+own_batch_ack=$(jq -nc --arg lease "$remote_batch_lease" \
+  '{task_id:"remote-batch",lease_id:$lease,result:{own:true}}')
+foreign_batch_ack=$(jq -nc --arg lease "$other_worker_lease" \
+  '{task_id:"other-worker",lease_id:$lease,result:{foreign:true}}')
+test "$own_batch_ack" != "$foreign_batch_ack"; check
+set +e
+printf '%s\n%s\n' "$own_batch_ack" "$foreign_batch_ack" \
+  | remote_primary 'ack' > "$work/remote-batch.out" 2>/dev/null
+remote_batch_exit=$?
+set -e
+test "$remote_batch_exit" -eq 4; check
+test ! -s "$work/remote-batch.out"; check
+spoolg results | jq -s -e \
+  'map(select(.task_id == "remote-batch" or .task_id == "other-worker")) | length == 0' \
+  >/dev/null; check
+test -f "$work/grant-spool/leased/$remote_batch_lease.json"; check
+printf '%s\n' "$own_batch_ack" | remote_primary 'ack' \
+  | jq -e '.status == "acked"' >/dev/null; check
 
 # Remote fetch emits only the verified bytes and uses the grant-bound worker.
 remote_attachment=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \

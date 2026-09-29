@@ -25,11 +25,16 @@ module Spool.Types
   , Retry (..)
   , retryFlag
   , StatusFormat (..)
+  , Timestamp
+  , timestamp
+  , storedTimestamp
+  , timestampText
   ) where
 
 import Data.Aeson (ToJSON (..), ToJSONKey (..))
 import Data.Aeson.Types (toJSONKeyText)
 import qualified Data.Text as T
+import Data.Time (UTCTime, defaultTimeLocale, formatTime)
 
 -- | ASCII letters, digits, @.@, @_@, and @-@; @--@ is reserved.
 newtype TaskId = TaskId T.Text
@@ -158,6 +163,24 @@ retryFlag NoRetry = False
 -- | How @status@ prints its counters.
 data StatusFormat = StatusText | StatusJson
   deriving (Eq, Show)
+
+-- | When something happened, as a record carries it: UTC to the second,
+-- written so that the order of the text is the order of the times.
+newtype Timestamp = Timestamp T.Text
+  deriving (Eq, Ord, Show)
+
+timestamp :: UTCTime -> Timestamp
+timestamp = Timestamp . T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
+-- | A time read back from the spool's own files, taken as it was written.
+storedTimestamp :: T.Text -> Timestamp
+storedTimestamp = Timestamp
+
+timestampText :: Timestamp -> T.Text
+timestampText (Timestamp value) = value
+
+instance ToJSON Timestamp where
+  toJSON = toJSON . timestampText
 
 tokenChar :: Char -> Bool
 tokenChar character = asciiAlphaNum character || character `elem` ("._-" :: String)
