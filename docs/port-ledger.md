@@ -159,19 +159,13 @@ evidence for an answer.
 
 ## Document gaps found during inventory
 
-These are not answered by the port:
-
-1. The predecessor uses exit 70 for corrupt durable records, but the
-   [protocol exit-code table](../spec/protocol.md#exit-codes) specifies no
-   non-retryable internal-corruption code. Phase 2 must not carry that code
-   over without a protocol change and decision record.
-2. The protocol calls `pending`, `leased`, `done`, and `failed` task states,
-   while retrying `fail` both records a file in `failed/` and returns the task
-   to pending. [ADR 0001](decisions/0001-pull-protocol.md) calls `done` and
-   `failed` directories a retry ledger. Status semantics need one explicit
-   reading before tests claim its `failed` count counts tasks in an exclusive
-   state.
-3. Equal repeated `ack` is specified as a no-op, but the protocol does not say
-   which exit code or response applies when the same task and lease are
-   repeated with a different result. Result-bearing idempotency needs that
-   distinction before the rewritten acknowledgement is complete.
+1. Phase 2 added exit 70 for corrupt durable state to the
+   [protocol exit-code table](../spec/protocol.md#exit-codes) and tests it with
+   records made by the real writers.
+2. The meaning of `status.failed` is now explicit in proposed
+   [ADR 0009](decisions/0009-status-counts-coordination-records.md). The
+   proposal documents the ported behaviour but remains unaccepted as protocol
+   authority until the proposal gate is resolved.
+3. Phase 2 specifies and tests that an equal repeated `ack` is a no-op while a
+   different result under the resolved lease is exit 4 and cannot replace the
+   stored result.

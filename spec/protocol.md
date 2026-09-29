@@ -106,6 +106,26 @@ Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
 
+### `status` counters (proposed clarification)
+
+Under
+[ADR 0009](../docs/decisions/0009-status-counts-coordination-records.md),
+`status` counts durable coordination records:
+
+```text
+pending=1 leased=0 done=3 failed=2
+```
+
+```json
+{"pending":1,"leased":0,"done":3,"failed":2}
+```
+
+`pending`, `leased`, and `done` count task files in those locations. `failed`
+counts every failure record, including retrying failures. These counters are
+not an exclusive partition of task IDs. A retrying failure can contribute one
+pending task and one or more failed records; its `retried` field distinguishes
+that history from terminal failure.
+
 ### `fetch` (proposed)
 
 `fetch` accepts exactly one JSON object:

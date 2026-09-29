@@ -14,3 +14,4 @@ change one, add a record that supersedes it. Undecided matters belong in
 | [0006](0006-grants-are-account-records.md) | Grants are account records with expiry in the record (proposed) |
 | [0007](0007-remote-command-is-an-exact-byte-grammar.md) | The remote command is an exact byte grammar (proposed) |
 | [0008](0008-reclaim-is-caller-driven.md) | Reclaim is caller-driven (proposed) |
+| [0009](0009-status-counts-coordination-records.md) | Status counts coordination records, not an exclusive partition (proposed) |
