@@ -45,6 +45,10 @@ The temporary [port ledger](docs/port-ledger.md) records the disposition and
 authority for every unit examined during the port. Delete it when the port is
 complete.
 
+The final three-host procedure and evidence contract are in the
+[real-machine gate runbook](docs/real-machine-gate.md). Run its script only on
+machines and paths the operator has explicitly authorized.
+
 ## Checks
 
 `make check` validates the repository's structure: links resolve, every
