@@ -107,6 +107,13 @@ Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
 
+`reclaim` emits one JSON object per task it returned to pending, and nothing
+when no lease was old enough:
+
+```json
+{"task_id":"task-one","status":"reclaimed"}
+```
+
 ### `status` counters
 
 Under
@@ -257,6 +264,12 @@ group. Exit 0 with JSON on stdout is a result; anything else is a failure,
 retried unless the capability was unknown or the payload too large. `work`
 acknowledges with that result.
 
+Every number in the configuration is a whole number of at least 1. The
+concurrency limit and the byte limits may be as large as the host's integers
+allow; `renew_seconds` and `timeout_seconds` may be at most 9223372036854. A
+number outside its range is malformed input and exit 2; it is never rounded,
+wrapped, or clamped.
+
 These are the limits Spool itself enforces on a run: wall-clock time,
 concurrent runs, payload bytes accepted, and stdout/stderr bytes captured
 (each stream capped independently; past its cap the run is killed and failed,
@@ -266,6 +279,10 @@ namespace or container boundary. A capability owner who needs that wraps
 their executable themselves; Spool only guarantees that killing a run reaches
 its whole process group, not just the process it exec'd, because a timed-out
 or overrun capability may have spawned children of its own.
+
+Killing a run sends its process group SIGTERM. A program may ignore that, so
+a run still going 5 seconds later is sent SIGKILL. The limit on wall-clock
+time is therefore enforced within `timeout_seconds` plus 5 seconds.
 
 With attachments, `work` fetches and verifies every
 declared attachment into `attachments/SHA256` below the fresh working
