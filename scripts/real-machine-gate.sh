@@ -50,9 +50,31 @@ for path in "$a_bin" "$a_dir" "$b_key" "$c_key" "$b_dir" "$c_dir"; do
   }
 done
 
-for command in ssh scp jq cmp wc; do
+for command in ssh scp jq cmp wc awk date mktemp; do
   command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 2; }
 done
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  echo "missing SHA-256 command: sha256sum or shasum" >&2
+  exit 2
+fi
+
+control_ssh() { ssh -o BatchMode=yes "$@"; }
+control_scp() { scp -o BatchMode=yes "$@"; }
+require_remote_tools() {
+  control_ssh "$1" \
+    'set -eu; command -v awk >/dev/null; command -v wc >/dev/null; command -v mkdir >/dev/null; command -v rm >/dev/null; command -v rmdir >/dev/null; command -v cat >/dev/null; if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then exit 127; fi'
+}
+
+for target in "$a_admin" "$b_admin" "$c_admin"; do
+  require_remote_tools "$target" || {
+    echo "missing required remote tool on $target" >&2
+    exit 2
+  }
+done
+control_ssh "$b_admin" 'set -eu; command -v sleep >/dev/null; command -v kill >/dev/null' || {
+  echo "missing worker-process tool on $b_admin" >&2
+  exit 2
+}
 
 run_id="gate_$(date -u +%Y%m%dT%H%M%SZ)_$$"
 task_one="${run_id}_one"
@@ -71,15 +93,15 @@ else
 fi
 size=$(wc -c < "$local_tmp/body" | tr -d ' ')
 
-a_spool() { ssh "$a_admin" "$a_bin --dir $a_dir $*"; }
-worker_b() { ssh "$b_admin" "ssh -i $b_key -o BatchMode=yes $a_worker $1"; }
-worker_c() { ssh "$c_admin" "ssh -i $c_key -o BatchMode=yes $a_worker $1"; }
+a_spool() { control_ssh "$a_admin" "$a_bin --dir $a_dir $*"; }
+worker_b() { control_ssh "$b_admin" "ssh -i $b_key -o BatchMode=yes $a_worker $1"; }
+worker_c() { control_ssh "$c_admin" "ssh -i $c_key -o BatchMode=yes $a_worker $1"; }
 verify_remote_file() {
-  ssh "$1" "actual=\$(if command -v sha256sum >/dev/null 2>&1; then sha256sum $2 | awk '{print \$1}'; else shasum -a 256 $2 | awk '{print \$1}'; fi); test \"\$actual\" = $digest; test \$(wc -c < $2) -eq $size"
+  control_ssh "$1" "set -eu; actual=\$(if command -v sha256sum >/dev/null 2>&1; then sha256sum $2 | awk '{print \$1}'; else shasum -a 256 $2 | awk '{print \$1}'; fi); test \"\$actual\" = $digest; test \$(wc -c < $2) -eq $size"
 }
 
-ssh "$a_admin" "mkdir -m 700 $a_stage"
-scp -q "$local_tmp/body" "$a_admin:$a_stage/$digest"
+control_ssh "$a_admin" "mkdir -m 700 $a_stage"
+control_scp -q "$local_tmp/body" "$a_admin:$a_stage/$digest"
 a_spool init
 
 task_json() {
@@ -94,8 +116,8 @@ b_lease_one=$(jq -r --arg task "$task_one" 'select(.task_id == $task).lease_id' 
 [[ -n $b_lease_one && $b_lease_one != null ]] || { echo "B did not lease task one" >&2; exit 1; }
 fetch_one=$(jq -nc --arg task "$task_one" --arg lease "$b_lease_one" --arg digest "$digest" \
   '{task_id:$task,lease_id:$lease,sha256:$digest}')
-ssh "$b_admin" "mkdir -m 700 $b_dir"
-printf '%s\n' "$fetch_one" | ssh "$b_admin" \
+control_ssh "$b_admin" "mkdir -m 700 $b_dir"
+printf '%s\n' "$fetch_one" | control_ssh "$b_admin" \
   "ssh -i $b_key -o BatchMode=yes $a_worker fetch > $b_dir/$digest"
 verify_remote_file "$b_admin" "$b_dir/$digest"
 renew_one=$(jq -nc --arg task "$task_one" --arg lease "$b_lease_one" \
@@ -109,7 +131,7 @@ a_spool results > "$evidence/results-after-b.jsonl"
 jq -e --arg task "$task_one" --arg digest "$digest" \
   'select(.task_id == $task and .result.host == "B" and .result.sha256 == $digest)' \
   "$evidence/results-after-b.jsonl" >/dev/null
-ssh "$a_admin" "test ! -e $a_dir/attachments/task-$task_one"
+control_ssh "$a_admin" "test ! -e $a_dir/attachments/task-$task_one"
 
 # B is killed while holding the second lease. A explicitly reclaims it; C
 # completes it; B's fenced late acknowledgement must be exit 4.
@@ -119,15 +141,15 @@ b_lease_two=$(jq -r --arg task "$task_two" 'select(.task_id == $task).lease_id' 
 [[ -n $b_lease_two && $b_lease_two != null ]] || { echo "B did not lease task two" >&2; exit 1; }
 fetch_two=$(jq -nc --arg task "$task_two" --arg lease "$b_lease_two" --arg digest "$digest" \
   '{task_id:$task,lease_id:$lease,sha256:$digest}')
-printf '%s\n' "$fetch_two" | ssh "$b_admin" \
+printf '%s\n' "$fetch_two" | control_ssh "$b_admin" \
   "ssh -i $b_key -o BatchMode=yes $a_worker fetch > $b_dir/$digest"
-ssh "$b_admin" "sh -c 'echo \$\$ > $b_dir/running.pid; exec sleep 300'" &
+control_ssh "$b_admin" "sh -c 'echo \$\$ > $b_dir/running.pid; exec sleep 300'" &
 b_session=$!
 for _ in {1..50}; do
-  ssh "$b_admin" "test -s $b_dir/running.pid" >/dev/null 2>&1 && break
+  control_ssh "$b_admin" "test -s $b_dir/running.pid" >/dev/null 2>&1 && break
   sleep 0.1
 done
-ssh "$b_admin" "kill -9 \$(cat $b_dir/running.pid)"
+control_ssh "$b_admin" "kill -9 \$(cat $b_dir/running.pid)"
 set +e
 wait "$b_session"
 set -e
@@ -139,8 +161,8 @@ c_lease=$(jq -r --arg task "$task_two" 'select(.task_id == $task).lease_id' "$ev
 }
 fetch_c=$(jq -nc --arg task "$task_two" --arg lease "$c_lease" --arg digest "$digest" \
   '{task_id:$task,lease_id:$lease,sha256:$digest}')
-ssh "$c_admin" "mkdir -m 700 $c_dir"
-printf '%s\n' "$fetch_c" | ssh "$c_admin" \
+control_ssh "$c_admin" "mkdir -m 700 $c_dir"
+printf '%s\n' "$fetch_c" | control_ssh "$c_admin" \
   "ssh -i $c_key -o BatchMode=yes $a_worker fetch > $c_dir/$digest"
 verify_remote_file "$c_admin" "$c_dir/$digest"
 ack_c=$(jq -nc --arg task "$task_two" --arg lease "$c_lease" \
@@ -158,9 +180,9 @@ a_spool results > "$evidence/results-final.jsonl"
 jq -e --arg task "$task_two" \
   'select(.task_id == $task and .result.host == "C" and (.result.late // false) == false)' \
   "$evidence/results-final.jsonl" >/dev/null
-ssh "$a_admin" "test ! -e $a_dir/attachments/task-$task_two"
+control_ssh "$a_admin" "test ! -e $a_dir/attachments/task-$task_two"
 
-ssh "$a_admin" "rm $a_stage/$digest && rmdir $a_stage"
-ssh "$b_admin" "rm -f $b_dir/$digest $b_dir/running.pid && rmdir $b_dir"
-ssh "$c_admin" "rm $c_dir/$digest && rmdir $c_dir"
+control_ssh "$a_admin" "rm $a_stage/$digest && rmdir $a_stage"
+control_ssh "$b_admin" "rm -f $b_dir/$digest $b_dir/running.pid && rmdir $b_dir"
+control_ssh "$c_admin" "rm $c_dir/$digest && rmdir $c_dir"
 printf 'PASS %s evidence=%s\n' "$run_id" "$evidence"
