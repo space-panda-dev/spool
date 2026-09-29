@@ -65,7 +65,7 @@ when the port is complete.
 |---|---|---|
 | `init` | Translate | Initialize the explicit spool directory using the protocol command name ([commands](../spec/protocol.md#commands)). |
 | `put` | Keep the mechanism | Full-envelope equality is a no-op and unequal reuse is a conflict ([INV-7](invariants.md)). |
-| `lease` | Rewrite | Keep local pull and count with explicit I/O failures; remote identity fixing is deferred to the grant design ([INV-2](invariants.md), [open questions](open-questions.md#access)). |
+| `lease` | Rewrite | Keep local pull and count with explicit I/O failures; remote leasing fixes the worker from its accepted grant ([ADR 0006](decisions/0006-grants-are-account-records.md), [INV-2](invariants.md), [INV-5](invariants.md)). |
 | `ack` | Rewrite | Input now includes the opaque result and persistence belongs to the transition ([states](../spec/protocol.md#states)). |
 | `renew` | Keep the mechanism | Only the current fenced lease may refresh its reclaim time ([INV-6](invariants.md)). |
 | `fail` | Rewrite | Preserve retry and `--no-retry`, but make record/state changes robust and fenced ([states](../spec/protocol.md#states)). |

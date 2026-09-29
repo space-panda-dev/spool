@@ -700,6 +700,17 @@ spoola work --worker attachment-worker --config "$work/attachment-config.json" -
 spoola results | jq -e 'select(.task_id == "attachment-work" and .result == {attachment:true})' >/dev/null; check
 test ! -e "$work/attachment-spool/attachments/task-attachment-work"; check
 
+# Terminal failure resolves the task and removes its spool-owned attachment.
+terminal_attachment=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"attachment-terminal",capability:"attachment@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$terminal_attachment" | spoola put --attachments "$attachment_source" >/dev/null
+spoola lease --worker attachment-worker > "$work/attachment-terminal-lease.jsonl"
+terminal_attachment_lease=$(jq -r '.lease_id' "$work/attachment-terminal-lease.jsonl")
+terminal_attachment_fail=$(jq -nc --arg lease "$terminal_attachment_lease" \
+  '{task_id:"attachment-terminal",lease_id:$lease,reason:"terminal"}')
+printf '%s\n' "$terminal_attachment_fail" | spoola fail --no-retry >/dev/null
+test ! -e "$work/attachment-spool/attachments/task-attachment-terminal"; check
+
 # A stored-byte mismatch is corrupt durable state and emits no partial body.
 corrupt_task=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
   '{task_id:"attachment-corrupt",capability:"attachment@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
@@ -726,4 +737,254 @@ spoola lease --worker compatibility > "$work/old-task-lease.jsonl"
 jq -e '.task_id == "old-task-shape" and .attachments == []' \
   "$work/old-task-lease.jsonl" >/dev/null; check
 
-printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, configured executor lifecycle, resource/concurrency limits (%d checks)\n' "$checks"
+#############################################################################
+# Grants and the SSH boundary: the account record supplies both spool and
+# worker, every remote word reaches only its named handler, and revoke fences.
+#############################################################################
+
+grant_home="$work/grant-home"
+mkdir -p "$grant_home/.ssh"
+printf '# unrelated key material\n' > "$grant_home/.ssh/authorized_keys"
+primary_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+secondary_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB'
+printf '%s\n' "$primary_key" > "$work/primary.pub"
+printf '%s\n' "$secondary_key" > "$work/secondary.pub"
+spoolg() { HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" "$@"; }
+remote_primary() {
+  local requested=$1
+  HOME="$grant_home" SSH_ORIGINAL_COMMAND="$requested" \
+    "$spool_binary" remote --grant "$grant_id"
+}
+spoolg init
+HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+  --peer peer-one --worker granted-worker --key "$work/primary.pub" \
+  > "$work/grant.json"
+grant_id=$(jq -r '.grant_id' "$work/grant.json")
+jq -e --arg key "$primary_key" \
+  'keys == ["expires_at","grant_id","peer","public_key","spool","worker"]
+   and (.grant_id | test("^grant_[0-9a-f]{32}$"))
+   and .peer == "peer-one" and .worker == "granted-worker"
+   and .public_key == $key and .expires_at == null' "$work/grant.json" >/dev/null; check
+test -f "$grant_home/.spool/grants/$grant_id.json"; check
+grep -F "restrict,command=\"" "$grant_home/.ssh/authorized_keys" \
+  | grep -F " remote --grant $grant_id\" $primary_key spool-grant:$grant_id" >/dev/null; check
+test "$(head -n 1 "$grant_home/.ssh/authorized_keys")" = '# unrelated key material'; check
+
+# Duplicate active key or worker is a task-style conflict, not a second grant.
+expect_exit 3 env HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+  --peer duplicate --worker another-worker --key "$work/primary.pub"
+expect_exit 3 env HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+  --peer duplicate --worker granted-worker --key "$work/secondary.pub"
+
+remote_task='{"task_id":"remote-one","capability":"remote@1","payload":{}}'
+printf '%s\n' "$remote_task" | spoolg put >/dev/null
+remote_primary 'lease' > "$work/remote-lease.jsonl"
+remote_lease=$(jq -r '.lease_id' "$work/remote-lease.jsonl")
+jq -e '.task_id == "remote-one" and .worker == "granted-worker"' \
+  "$work/remote-lease.jsonl" >/dev/null; check
+remote_renew=$(jq -nc --arg lease "$remote_lease" \
+  '{task_id:"remote-one",lease_id:$lease}')
+printf '%s\n' "$remote_renew" | remote_primary 'renew' \
+  | jq -e '.status == "renewed"' >/dev/null; check
+remote_ack=$(jq -nc --arg lease "$remote_lease" \
+  '{task_id:"remote-one",lease_id:$lease,result:{remote:true}}')
+printf '%s\n' "$remote_ack" | remote_primary 'ack' \
+  | jq -e '.status == "acked"' >/dev/null; check
+printf '%s\n' "$remote_ack" | remote_primary 'ack' \
+  | jq -e '.status == "already_done"' >/dev/null; check
+spoolg results | jq -e 'select(.task_id == "remote-one" and .result == {remote:true})' >/dev/null; check
+
+# The counted lease form and both fail modes reach their concrete handlers.
+printf '%s\n%s\n' \
+  '{"task_id":"remote-count-a","capability":"remote@1","payload":{}}' \
+  '{"task_id":"remote-count-b","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_primary 'lease --count 2' > "$work/remote-count.jsonl"
+test "$(wc -l < "$work/remote-count.jsonl" | tr -d ' ')" = 2; check
+jq -c '{task_id,lease_id,result:{counted:true}}' "$work/remote-count.jsonl" \
+  | remote_primary 'ack' >/dev/null
+printf '%s\n' '{"task_id":"remote-fail","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_primary 'lease' > "$work/remote-fail-lease.jsonl"
+remote_fail_lease=$(jq -r '.lease_id' "$work/remote-fail-lease.jsonl")
+remote_fail=$(jq -nc --arg lease "$remote_fail_lease" \
+  '{task_id:"remote-fail",lease_id:$lease,reason:"retry"}')
+printf '%s\n' "$remote_fail" | remote_primary 'fail' \
+  | jq -e '.status == "failed_retry"' >/dev/null; check
+remote_primary 'lease' > "$work/remote-terminal-lease.jsonl"
+remote_terminal_lease=$(jq -r '.lease_id' "$work/remote-terminal-lease.jsonl")
+remote_terminal_fail=$(jq -nc --arg lease "$remote_terminal_lease" \
+  '{task_id:"remote-fail",lease_id:$lease,reason:"terminal"}')
+printf '%s\n' "$remote_terminal_fail" | remote_primary 'fail --no-retry' \
+  | jq -e '.status == "failed"' >/dev/null; check
+
+# A remote grant cannot act on another worker's lease.
+printf '%s\n' '{"task_id":"other-worker","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+spoolg lease --worker other-worker > "$work/other-worker-lease.jsonl"
+other_worker_lease=$(jq -r '.lease_id' "$work/other-worker-lease.jsonl")
+other_worker_ref=$(jq -nc --arg lease "$other_worker_lease" \
+  '{task_id:"other-worker",lease_id:$lease}')
+set +e
+printf '%s\n' "$other_worker_ref" | remote_primary 'renew' >/dev/null 2>&1
+wrong_worker_exit=$?
+set -e
+test "$wrong_worker_exit" -eq 4; check
+
+# Remote fetch emits only the verified bytes and uses the grant-bound worker.
+remote_attachment=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"remote-attachment",capability:"remote@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$remote_attachment" | spoolg put --attachments "$attachment_source" >/dev/null
+remote_primary 'lease' > "$work/remote-attachment-lease.jsonl"
+remote_attachment_lease=$(jq -r '.lease_id' "$work/remote-attachment-lease.jsonl")
+remote_attachment_fetch=$(jq -nc --arg digest "$attachment_digest" --arg lease "$remote_attachment_lease" \
+  '{task_id:"remote-attachment",lease_id:$lease,sha256:$digest}')
+printf '%s\n' "$remote_attachment_fetch" | remote_primary 'fetch' \
+  > "$work/remote-attachment-body"
+cmp "$work/attachment-body" "$work/remote-attachment-body"; check
+remote_attachment_ack=$(jq -nc --arg lease "$remote_attachment_lease" \
+  '{task_id:"remote-attachment",lease_id:$lease,result:{fetched:true}}')
+printf '%s\n' "$remote_attachment_ack" | remote_primary 'ack' >/dev/null
+
+# The remote command is an exact byte grammar.  Shell metacharacters,
+# whitespace variants, local-only operations, options, and non-canonical
+# counts never reach a handler.  The Cabal parser test covers NUL; these
+# environment values cover the bytes a shell can carry.
+remote_reject() {
+  local requested=$1
+  expect_exit 2 remote_primary "$requested"
+}
+remote_reject ''
+remote_reject ' lease'
+remote_reject 'lease '
+remote_reject 'lease  --count 1'
+remote_reject $'lease\t--count\t1'
+remote_reject $'lease\n'
+remote_reject "'lease'"
+remote_reject 'lease\\'
+remote_reject 'lease;status'
+remote_reject 'lease && status'
+remote_reject 'lease | status'
+remote_reject '$(status)'
+remote_reject 'lease*'
+remote_reject 'lease --worker other-worker'
+remote_reject 'lease --count'
+remote_reject 'lease --count 0'
+remote_reject 'lease --count 01'
+remote_reject 'lease --count +1'
+remote_reject 'lease --count -1'
+remote_reject 'lease --count 1.0'
+remote_reject $'lease --count 1\n'
+remote_reject 'lease --count 9223372036854775808'
+remote_reject 'lease --count 111111111111111111111'
+remote_reject 'lease extra'
+remote_reject '--count 1'
+remote_reject 'put'
+remote_reject 'results'
+remote_reject 'failures'
+remote_reject 'status'
+remote_reject 'reclaim --older-than 0'
+remote_reject 'grant --worker other'
+remote_reject 'revoke --grant grant_deadbeef'
+long_remote_command=$(printf 'x%.0s' {1..65})
+remote_reject "$long_remote_command"
+
+# The grant identifier is trusted only after its fixed grammar check; path
+# traversal or option-like values cannot select a different account record.
+expect_exit 2 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
+  "$spool_binary" remote --grant ../escape
+expect_exit 2 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
+  "$spool_binary" remote --grant "$grant_id/../escape"
+expect_exit 2 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
+  "$spool_binary" remote --grant --dir
+
+# JSONL is stdin data, not command words.  Unknown fields and path-like
+# task IDs/digests are rejected before any transition or file lookup.
+bad_remote_ack=$(jq -nc --arg lease "$remote_lease" \
+  '{task_id:"remote-one",lease_id:$lease,result:{remote:true},extra:true}')
+set +e
+printf '%s\n' "$bad_remote_ack" | remote_primary 'ack' >/dev/null 2>&1
+bad_remote_ack_exit=$?
+set -e
+test "$bad_remote_ack_exit" -eq 2; check
+bad_remote_renew=$(jq -nc --arg lease "$remote_lease" \
+  '{task_id:"remote-one",lease_id:$lease,extra:true}')
+set +e
+printf '%s\n' "$bad_remote_renew" | remote_primary 'renew' >/dev/null 2>&1
+bad_remote_renew_exit=$?
+set -e
+test "$bad_remote_renew_exit" -eq 2; check
+bad_remote_fail=$(jq -nc --arg lease "$remote_lease" \
+  '{task_id:"remote-one",lease_id:$lease,reason:"nope",extra:true}')
+set +e
+printf '%s\n' "$bad_remote_fail" | remote_primary 'fail' >/dev/null 2>&1
+bad_remote_fail_exit=$?
+set -e
+test "$bad_remote_fail_exit" -eq 2; check
+bad_remote_fetch=$(jq -nc --arg lease "$remote_attachment_lease" \
+  --arg digest "$attachment_digest" \
+  '{task_id:"remote-attachment",lease_id:$lease,sha256:$digest,extra:true}')
+set +e
+printf '%s\n' "$bad_remote_fetch" | remote_primary 'fetch' >/dev/null 2>&1
+bad_remote_fetch_exit=$?
+set -e
+test "$bad_remote_fetch_exit" -eq 2; check
+path_task_ack=$(jq -nc --arg lease "$remote_lease" \
+  '{task_id:"../escape",lease_id:$lease,result:{bad:true}}')
+set +e
+printf '%s\n' "$path_task_ack" | remote_primary 'ack' >/dev/null 2>&1
+path_task_ack_exit=$?
+set -e
+test "$path_task_ack_exit" -eq 2; check
+path_digest_fetch=$(jq -nc --arg lease "$remote_attachment_lease" \
+  '{task_id:"remote-attachment",lease_id:$lease,sha256:"../../etc/passwd"}')
+set +e
+printf '%s\n' "$path_digest_fetch" | remote_primary 'fetch' >/dev/null 2>&1
+path_digest_fetch_exit=$?
+set -e
+test "$path_digest_fetch_exit" -eq 2; check
+
+# A grant-bound remote command cannot select another worker.  This is distinct
+# from parser rejection: the command dispatches, then the ownership fence
+# returns exit 4.
+wrong_worker_fail=$(jq -nc --arg lease "$other_worker_lease" \
+  '{task_id:"other-worker",lease_id:$lease,reason:"late"}')
+set +e
+printf '%s\n' "$wrong_worker_fail" | remote_primary 'fail' >/dev/null 2>&1
+wrong_worker_fail_exit=$?
+set -e
+test "$wrong_worker_fail_exit" -eq 4; check
+
+# Expiry is checked from the record on every invocation.
+HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+  --peer expired-peer --worker expired-worker --key "$work/secondary.pub" \
+  --expires-at 1970-01-01T00:00:00Z > "$work/expired-grant.json"
+expired_grant_id=$(jq -r '.grant_id' "$work/expired-grant.json")
+expect_exit 5 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
+  "$spool_binary" remote --grant "$expired_grant_id"
+
+# Revoke disables access, removes only its managed line, and reclaims leases
+# for the fixed worker. The old lease remains fenced after return to pending.
+printf '%s\n' '{"task_id":"remote-revoke","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_primary 'lease' > "$work/revoke-lease.jsonl"
+revoke_lease=$(jq -r '.lease_id' "$work/revoke-lease.jsonl")
+HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$grant_id" \
+  | jq -e --arg grant "$grant_id" '.grant_id == $grant and .status == "revoked"' >/dev/null; check
+test ! -e "$grant_home/.spool/grants/$grant_id.json"; check
+! grep -F "spool-grant:$grant_id" "$grant_home/.ssh/authorized_keys" >/dev/null; check
+test "$(head -n 1 "$grant_home/.ssh/authorized_keys")" = '# unrelated key material'; check
+spoolg status --json | jq -e '.pending >= 1' >/dev/null; check
+expect_exit 5 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
+  "$spool_binary" remote --grant "$grant_id"
+late_revoke_ack=$(jq -nc --arg lease "$revoke_lease" \
+  '{task_id:"remote-revoke",lease_id:$lease,result:{late:true}}')
+set +e
+printf '%s\n' "$late_revoke_ack" | spoolg ack >/dev/null 2>&1
+late_revoke_exit=$?
+set -e
+test "$late_revoke_exit" -eq 4; check
+HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$grant_id" \
+  | jq -e '.status == "revoked"' >/dev/null; check
+
+printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits (%d checks)\n' "$checks"

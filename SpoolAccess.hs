@@ -1,0 +1,334 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -Wall -Werror #-}
+
+-- | Pure validation and rendering for the SSH access boundary.
+--
+-- This module deliberately does not read the environment, open files, or
+-- execute commands.  The executable wires these values into its filesystem
+-- transitions; keeping the byte grammar and record shapes here makes the
+-- trust boundary testable without an SSH server.
+module SpoolAccess
+  ( Grant (..)
+  , RemoteCommand (..)
+  , grantKeys
+  , grantRecordPath
+  , grantToJSON
+  , filterManagedGrantLine
+  , filterExactManagedLine
+  , isCanonicalSpoolPath
+  , isManagedGrantLine
+  , managedGrantMarker
+  , parseGrantJSON
+  , parseRemoteCommand
+  , renderGrant
+  , renderManagedAuthorizedKeyLine
+  , validateGrant
+  , validateGrantId
+  , validateGrantPeer
+  , validateGrantSpool
+  , validateGrantWorker
+  , validatePublicKey
+  ) where
+
+import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.=))
+import qualified Data.Aeson as A
+import qualified Data.Aeson.Key as K
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BSC
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteArray.Encoding as BAE
+import Data.List (isSuffixOf, sort)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Time (UTCTime, defaultTimeLocale, formatTime, parseTimeM)
+import System.FilePath (isAbsolute, normalise, splitDirectories, (</>))
+
+-- | A grant is the complete, trusted input to the forced command.  The
+-- 'expiresAt' field is 'Nothing' for a grant that does not expire.
+data Grant = Grant
+  { grantId :: T.Text
+  , grantPeer :: T.Text
+  , grantWorker :: T.Text
+  , grantSpool :: FilePath
+  , grantPublicKey :: T.Text
+  , grantExpiresAt :: Maybe UTCTime
+  } deriving (Eq, Show)
+
+-- | The only operations accepted through a managed SSH key.
+data RemoteCommand
+  = RemoteLease (Maybe Integer)
+  | RemoteAck
+  | RemoteRenew
+  | RemoteFail Bool
+  | RemoteFetch
+  deriving (Eq, Show)
+
+grantKeys :: [T.Text]
+grantKeys = sort
+  [ "grant_id"
+  , "peer"
+  , "worker"
+  , "spool"
+  , "public_key"
+  , "expires_at"
+  ]
+
+grantToJSON :: Grant -> BL.ByteString
+grantToJSON = A.encode
+
+-- | Alias used by callers that want a strict ByteString for an atomic file.
+renderGrant :: Grant -> BS.ByteString
+renderGrant = BL.toStrict . grantToJSON
+
+instance ToJSON Grant where
+  toJSON grant = A.object
+    [ "grant_id" .= grantId grant
+    , "peer" .= grantPeer grant
+    , "worker" .= grantWorker grant
+    , "spool" .= grantSpool grant
+    , "public_key" .= grantPublicKey grant
+    , "expires_at" .= fmap renderExpiry (grantExpiresAt grant)
+    ]
+    where
+      renderExpiry :: UTCTime -> T.Text
+      renderExpiry = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ"
+
+instance FromJSON Grant where
+  parseJSON = A.withObject "grant" $ \object -> do
+    let actual = sort (map K.toText (KM.keys object))
+    if actual /= grantKeys
+      then fail "grant must contain exactly grant_id, peer, worker, spool, public_key, expires_at"
+      else do
+        identifier <- object .: "grant_id"
+        peer <- object .: "peer"
+        worker <- object .: "worker"
+        spool <- object .: "spool"
+        publicKey <- object .: "public_key"
+        expiry <- object .: "expires_at"
+        case validateGrant identifier peer worker spool publicKey expiry of
+          Left message -> fail message
+          Right grant -> pure grant
+
+-- | Decode and validate one complete grant record.  Unknown or missing keys
+-- are rejected before any value is used.
+parseGrantJSON :: BS.ByteString -> Either String Grant
+parseGrantJSON bytes = case A.eitherDecodeStrict' bytes of
+  Left message -> Left message
+  Right grant -> Right grant
+
+validateGrant
+  :: T.Text
+  -> T.Text
+  -> T.Text
+  -> FilePath
+  -> T.Text
+  -> Maybe T.Text
+  -> Either String Grant
+validateGrant identifier peer worker spool publicKey expiryText = do
+  validateGrantId identifier
+  validateGrantPeer peer
+  validateGrantWorker worker
+  validateGrantSpool spool
+  validatePublicKey publicKey
+  expiry <- case expiryText of
+    Nothing -> Right Nothing
+    Just text -> Just <$> parseExpiry text
+  pure Grant
+    { grantId = identifier
+    , grantPeer = peer
+    , grantWorker = worker
+    , grantSpool = spool
+    , grantPublicKey = publicKey
+    , grantExpiresAt = expiry
+    }
+
+parseExpiry :: T.Text -> Either String UTCTime
+parseExpiry text = case parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ" (T.unpack text) of
+  Nothing -> Left "expires_at must be a UTC RFC3339 timestamp ending in Z"
+  Just value -> Right value
+
+validateGrantId :: T.Text -> Either String ()
+validateGrantId value
+  | T.length value /= 38 = Left "grant_id must be grant_ followed by 32 lower-case hex characters"
+  | not ("grant_" `T.isPrefixOf` value) = Left "grant_id must start with grant_"
+  | not (T.all isLowerHex (T.drop 6 value)) = Left "grant_id must use lower-case hexadecimal"
+  | otherwise = Right ()
+  where
+    isLowerHex character = character `elem` (['0' .. '9'] <> ['a' .. 'f'])
+
+validateGrantPeer :: T.Text -> Either String ()
+validateGrantPeer = validateLabel "peer"
+
+validateGrantWorker :: T.Text -> Either String ()
+validateGrantWorker = validateLabel "worker"
+
+validateLabel :: String -> T.Text -> Either String ()
+validateLabel label value
+  | T.null value = Left (label <> " must be non-empty")
+  | T.all isSafe value = Right ()
+  | otherwise = Left (label <> " must not contain control characters")
+  where
+    isSafe character = character >= ' ' && character /= '\DEL'
+
+-- | A record stores a canonical absolute path, not a path that will be
+-- normalised differently when the forced command later reads it.
+validateGrantSpool :: FilePath -> Either String ()
+validateGrantSpool value
+  | not (isCanonicalSpoolPath value) = Left "spool must be a canonical absolute path"
+  | otherwise = Right ()
+
+isCanonicalSpoolPath :: FilePath -> Bool
+isCanonicalSpoolPath value =
+  not (null value)
+    && isAbsolute value
+    && '\0' `notElem` value
+    && normalise value == value
+    && all (/= "..") (splitDirectories value)
+    && all (/= ".") (splitDirectories value)
+    && (value == "/" || not ("/" `isSuffixOf` value))
+
+-- | Validate the canonical two-word OpenSSH public-key form.  Comments and
+-- options are intentionally excluded: the complete key is inserted into a
+-- managed line by this module.
+validatePublicKey :: T.Text -> Either String ()
+validatePublicKey value = case T.splitOn " " value of
+  [keyType, encoded]
+    | T.length keyType <= 128
+        && validKeyType keyType
+        && validBase64 encoded -> case
+            (BAE.convertFromBase BAE.Base64 (TE.encodeUtf8 encoded)
+              :: Either String BS.ByteString) of
+          Right decoded
+            | TE.decodeUtf8' (keyBlobType decoded) == Right keyType
+                && not (BS.null (keyBlobBody decoded))
+                && TE.decodeUtf8 (BAE.convertToBase BAE.Base64 decoded) == encoded -> Right ()
+          _ -> Left "public_key contains invalid base64"
+  _ -> Left "public_key must be one OpenSSH key type and one base64 blob"
+  where
+    validKeyType keyType =
+      ("ssh-" `T.isPrefixOf` keyType || "ecdsa-" `T.isPrefixOf` keyType || "sk-" `T.isPrefixOf` keyType)
+        && T.all isKeyTypeChar keyType
+    isKeyTypeChar character =
+      character `elem` (['A' .. 'Z'] <> ['a' .. 'z'] <> ['0' .. '9'] <> "-_")
+    validBase64 encoded =
+      not (T.null encoded)
+        && T.all isBase64Char encoded
+        && let padding = T.length (T.takeWhileEnd (== '=') encoded)
+               body = T.take (T.length encoded - padding) encoded
+           in padding <= 2
+                && not (T.null body)
+                && T.all (/= '=') body
+                && T.length body `mod` 4 /= 1
+    isBase64Char character =
+      character `elem` (['A' .. 'Z'] <> ['a' .. 'z'] <> ['0' .. '9'] <> "+/=")
+    keyBlobType bytes
+      | BS.length bytes < 4 = BS.empty
+      | declared > BS.length bytes - 4 = BS.empty
+      | otherwise = BS.take declared (BS.drop 4 bytes)
+      where
+        declared = decodeLength (BS.take 4 bytes)
+    keyBlobBody bytes
+      | BS.length bytes < 4 = BS.empty
+      | declared > BS.length bytes - 4 = BS.empty
+      | otherwise = BS.drop (4 + declared) bytes
+      where
+        declared = decodeLength (BS.take 4 bytes)
+    decodeLength = BS.foldl' (\total byte -> total * 256 + fromIntegral byte) 0
+
+-- | Return a safe record path beneath a grants directory.  The caller still
+-- performs the atomic write; this helper prevents an ID from escaping it.
+grantRecordPath :: FilePath -> T.Text -> Either String FilePath
+grantRecordPath grantsDirectory identifier = do
+  validateGrantId identifier
+  if null grantsDirectory || '\0' `elem` grantsDirectory
+    then Left "grants directory must be non-empty and contain no NUL"
+    else Right (grantsDirectory </> T.unpack identifier <> ".json")
+
+managedGrantMarker :: T.Text -> Either String T.Text
+managedGrantMarker identifier = do
+  validateGrantId identifier
+  pure ("spool-grant:" <> identifier)
+
+isManagedGrantLine :: T.Text -> T.Text -> Bool
+isManagedGrantLine identifier line = case managedGrantMarker identifier of
+  Left _ -> False
+  Right marker -> (" " <> marker) `T.isSuffixOf` line
+
+-- | Remove exactly the line carrying a particular managed marker while
+-- preserving every other byte, including line endings and comments.
+filterManagedGrantLine :: T.Text -> BS.ByteString -> BS.ByteString
+filterManagedGrantLine identifier bytes = case managedGrantMarker identifier of
+  Left _ -> bytes
+  Right marker ->
+    let markerBytes = TE.encodeUtf8 (" " <> marker)
+        chunks = BS.split 10 bytes
+        keep chunk = not (markerBytes `BS.isSuffixOf` chunk)
+    in BS.intercalate "\n" (filter keep chunks)
+
+-- | Remove one exact managed line while preserving all other bytes.
+filterExactManagedLine :: BS.ByteString -> BS.ByteString -> BS.ByteString
+filterExactManagedLine managed bytes =
+  let target = dropTrailingNewline managed
+      chunks = BS.split 10 bytes
+  in BS.intercalate "\n" (filter (/= target) chunks)
+  where
+    dropTrailingNewline value
+      | not (BS.null value) && BS.last value == 10 = BS.init value
+      | otherwise = value
+
+-- | Render one managed authorized_keys line.  The executable is shell-quoted
+-- as a word and then escaped for the OpenSSH option's double quotes.
+renderManagedAuthorizedKeyLine :: FilePath -> Grant -> Either String BS.ByteString
+renderManagedAuthorizedKeyLine executable grant = do
+  validateGrantId (grantId grant)
+  validatePublicKey (grantPublicKey grant)
+  if not (isCanonicalSpoolPath executable)
+    then Left "spool executable must be a canonical absolute path"
+    else do
+      marker <- managedGrantMarker (grantId grant)
+      let command = shellQuote executable <> " remote --grant " <> T.unpack (grantId grant)
+          option = "restrict,command=\"" <> escapeOption command <> "\" "
+          line = option <> T.unpack (grantPublicKey grant) <> " " <> T.unpack marker <> "\n"
+      pure (BSC.pack line)
+  where
+    shellQuote path
+      | all isSafeShellChar path = path
+      | otherwise = "'" <> concatMap quoteSingle path <> "'"
+    quoteSingle '\'' = "'\"'\"'"
+    quoteSingle character = [character]
+    isSafeShellChar character = character `elem` (['A' .. 'Z'] <> ['a' .. 'z'] <> ['0' .. '9'] <> "_@%+=:,./-")
+    escapeOption [] = []
+    escapeOption ('\\' : rest) = "\\\\" <> escapeOption rest
+    escapeOption ('"' : rest) = "\\\"" <> escapeOption rest
+    escapeOption (character : rest) = character : escapeOption rest
+
+-- | The byte-level grammar for SSH_ORIGINAL_COMMAND.  No text decoder or
+-- shell tokenizer is involved, so malformed UTF-8 and NULs are rejected at
+-- the boundary.
+parseRemoteCommand :: BS.ByteString -> Either String RemoteCommand
+parseRemoteCommand bytes
+  | BS.length bytes > 64 = Left "remote command is longer than 64 bytes"
+  | not (BS.all isPrintableAscii bytes) = Left "remote command must be printable ASCII"
+  | bytes == "lease" = Right (RemoteLease Nothing)
+  | bytes == "ack" = Right RemoteAck
+  | bytes == "renew" = Right RemoteRenew
+  | bytes == "fail" = Right (RemoteFail True)
+  | bytes == "fail --no-retry" = Right (RemoteFail False)
+  | bytes == "fetch" = Right RemoteFetch
+  | Just suffix <- BS.stripPrefix "lease --count " bytes = do
+      count <- parseCount suffix
+      pure (RemoteLease (Just count))
+  | otherwise = Left "unknown remote command"
+  where
+    isPrintableAscii byte = byte >= 0x20 && byte <= 0x7e
+    parseCount value
+      | BS.null value = Left "lease count is missing"
+      | BS.length value > 19 = Left "lease count is too large"
+      | BS.length value > 1 && BS.head value == 0x30 = Left "lease count has a leading zero"
+      | not (BS.all (\byte -> byte >= 0x30 && byte <= 0x39) value) = Left "lease count must be decimal"
+      | otherwise =
+          let number = BS.foldl' (\total byte -> total * 10 + toInteger (byte - 0x30)) 0 value
+          in if number >= 1 && number <= 9223372036854775807
+               then Right number
+               else Left "lease count is outside the permitted range"

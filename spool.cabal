@@ -14,6 +14,7 @@ executable spool
   main-is:          Spool.hs
   other-modules:
       SpoolAttachments
+    , SpoolAccess
   hs-source-dirs:   .
   build-depends:
       aeson
@@ -29,3 +30,21 @@ executable spool
     , unix
   default-language: Haskell2010
   ghc-options:      -Wall -Werror -threaded
+
+test-suite remote-parser-test
+  type:             exitcode-stdio-1.0
+  main-is:          RemoteParserTest.hs
+  other-modules:
+      SpoolAccess
+  hs-source-dirs:   .
+  build-depends:
+      aeson
+    , base >=4.18 && <5
+    , bytestring
+    , directory
+    , filepath
+    , memory
+    , text
+    , time
+  default-language: Haskell2010
+  ghc-options:      -Wall -Werror

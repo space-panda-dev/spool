@@ -20,7 +20,7 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar,
                                 readMVar, modifyMVar_, tryReadMVar, withMVar)
 import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
 import Control.Exception (IOException, SomeException, bracket, catch,
-                          displayException, finally, throwIO, try)
+                          displayException, finally, onException, throwIO, try)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as A
@@ -39,11 +39,13 @@ import qualified Data.Text.Encoding.Error as TEE
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Unique (hashUnique, newUnique)
+import Numeric (showHex)
 import System.Directory (createDirectoryIfMissing,
-                         executable, getPermissions, getTemporaryDirectory,
+                         canonicalizePath, executable, getHomeDirectory,
+                         getPermissions, getTemporaryDirectory,
                          listDirectory, removeDirectoryRecursive, removeFile,
                          removePathForcibly, renameDirectory, renameFile)
-import System.Environment (getArgs)
+import System.Environment (getArgs, getExecutablePath)
 import System.Exit (ExitCode (..), exitSuccess, exitWith)
 import System.FilePath (isAbsolute, takeBaseName, takeDirectory,
                         takeExtension, (</>))
@@ -51,12 +53,14 @@ import System.IO (Handle, IOMode (AppendMode, ReadMode), hClose,
                   openBinaryFile, openBinaryTempFile, openFile, stderr)
 import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
-import System.Posix.Files (FileStatus, createLink, getFileStatus)
+import System.Posix.Files (FileStatus, createLink, getFileStatus, setFileMode)
+import qualified System.Posix.Env.ByteString as PosixEnv
 import System.IO.Unsafe (unsafePerformIO)
 import System.Process (CreateProcess (..), StdStream (CreatePipe),
                        createProcess, proc, terminateProcess,
                        waitForProcess)
 import qualified SpoolAttachments as SA
+import qualified SpoolAccess as Access
 
 type Object = KM.KeyMap A.Value
 
@@ -104,6 +108,8 @@ data Command
   | Fetch
   | Work T.Text FilePath (Maybe Int)
   | WorkShow FilePath
+  | GrantCommand T.Text T.Text FilePath (Maybe T.Text)
+  | RevokeCommand T.Text
 
 data SpoolFailure = SpoolFailure Int String
 
@@ -136,6 +142,7 @@ mainCommand = do
   args <- getArgs
   when (args == ["--version"]) $ putStrLn "spool 0.0.1" >> exitSuccess
   case args of
+    ["remote", "--grant", identifier] -> runRemote (T.pack identifier)
     ("work" : rest) | "--show" `elem` rest && "--dir" `notElem` args ->
       case parseWorkShow rest of
         Left message -> failWith 2 message
@@ -173,6 +180,18 @@ parseSubcommand ["fail", "--no-retry"] = Right (Fail False)
 parseSubcommand ["failures"] = Right Failures
 parseSubcommand ["results"] = Right Results
 parseSubcommand ["fetch"] = Right Fetch
+parseSubcommand ["grant", "--peer", peer, "--worker", worker, "--key", key]
+  | validWorker worker && not (null peer) =
+      Right (GrantCommand (T.pack peer) (T.pack worker) key Nothing)
+  | otherwise = Left "spool: grant requires non-empty peer and worker values"
+parseSubcommand
+    ["grant", "--peer", peer, "--worker", worker, "--key", key,
+     "--expires-at", expires]
+  | validWorker worker && not (null peer) =
+      Right (GrantCommand (T.pack peer) (T.pack worker) key (Just (T.pack expires)))
+  | otherwise = Left "spool: grant requires non-empty peer and worker values"
+parseSubcommand ["revoke", "--grant", identifier] =
+  Right (RevokeCommand (T.pack identifier))
 parseSubcommand ["status"] = Right (Status False)
 parseSubcommand ["status", "--json"] = Right (Status True)
 parseSubcommand ["lease", "--worker", worker]
@@ -225,7 +244,7 @@ validWorker :: String -> Bool
 validWorker value = not (null value) && all (not . (`elem` ['\n', '\r', '\t', ' '])) value
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]\n       spool work --config FILE --show"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--expires-at RFC3339]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --config FILE --show"
 
 runCommand :: Command -> Paths -> IO ()
 runCommand command paths = case command of
@@ -242,6 +261,9 @@ runCommand command paths = case command of
   Status json -> statusTasks paths json
   Work {} -> error "unreachable: Work is dispatched before runCommand"
   WorkShow {} -> error "unreachable: WorkShow is dispatched before runCommand"
+  GrantCommand peer worker key expiry ->
+    grantAccess paths peer worker key expiry
+  RevokeCommand identifier -> revokeAccess paths identifier
 
 withStore :: FilePath -> (Paths -> IO ()) -> IO ()
 withStore directory action = do
@@ -894,8 +916,10 @@ epochMicros :: IO Integer
 epochMicros = round . (* 1000000) <$> getPOSIXTime
 
 ackTasks :: Paths -> IO ()
-ackTasks paths = do
-  linesIn <- inputLines
+ackTasks paths = inputLines >>= ackLines paths
+
+ackLines :: Paths -> [BL.ByteString] -> IO ()
+ackLines paths linesIn = do
   failures <- foldM (ackOneAndReport paths) False linesIn
   when failures (throwFailure (SpoolFailure 4 "one or more leases were stale or unknown"))
 
@@ -974,8 +998,10 @@ findDoneLease paths ident leaseIdent = do
   pure (listToMaybe [value | Just value <- matches])
 
 renewTasks :: Paths -> IO ()
-renewTasks paths = do
-  linesIn <- inputLines
+renewTasks paths = inputLines >>= renewLines paths
+
+renewLines :: Paths -> [BL.ByteString] -> IO ()
+renewLines paths linesIn = do
   failures <- foldM (renewOneAndReport paths) False linesIn
   when failures (throwFailure (SpoolFailure 4 "one or more leases were stale or unknown"))
 
@@ -1007,8 +1033,10 @@ renewOne paths ident leaseIdent = do
           pure (Right ())
 
 failTasks :: Bool -> Paths -> IO ()
-failTasks retry paths = do
-  linesIn <- inputLines
+failTasks retry paths = inputLines >>= failLines retry paths
+
+failLines :: Bool -> Paths -> [BL.ByteString] -> IO ()
+failLines retry paths linesIn = do
   failures <- foldM (failOneAndReport retry paths) False linesIn
   when failures (throwFailure (SpoolFailure 4 "one or more leases were stale or unknown"))
 
@@ -1080,8 +1108,10 @@ resultsCommand paths = do
   mapM_ (BLC.putStrLn . canonical) (oldestFirst "finished_at" records)
 
 fetchAttachment :: Paths -> IO ()
-fetchAttachment paths = do
-  bytes <- BL.getContents
+fetchAttachment paths = BL.getContents >>= fetchAttachmentBytes paths
+
+fetchAttachmentBytes :: Paths -> BL.ByteString -> IO ()
+fetchAttachmentBytes paths bytes = do
   (ident, leaseIdent, digest) <- case parseFetchRequest bytes of
     Left message -> throwFailure (SpoolFailure 2 message)
     Right request -> pure request
@@ -1168,6 +1198,269 @@ statusTasks paths json = do
     then BLC.putStrLn (encodeStatus pending leased done failed)
     else putStrLn ("pending=" <> show pending <> " leased=" <> show leased
       <> " done=" <> show done <> " failed=" <> show failed)
+
+--------------------------------------------------------------------------
+-- Account grants and the exact SSH forced-command boundary.
+--------------------------------------------------------------------------
+
+accountGrantPaths :: IO (FilePath, FilePath)
+accountGrantPaths = do
+  home <- getHomeDirectory
+  pure (home </> ".spool" </> "grants", home </> ".ssh" </> "authorized_keys")
+
+prepareAccountPaths :: IO (FilePath, FilePath)
+prepareAccountPaths = do
+  (grants, authorizedKeys) <- accountGrantPaths
+  createDirectoryIfMissing True grants
+  createDirectoryIfMissing True (takeDirectory authorizedKeys)
+  setFileMode (takeDirectory authorizedKeys) 0o700
+  pure (grants, authorizedKeys)
+
+grantAccess :: Paths -> T.Text -> T.Text -> FilePath -> Maybe T.Text -> IO ()
+grantAccess paths peer worker keyPath expiry = do
+  canonicalSpool <- canonicalizePath (rootDir paths)
+  publicKey <- readCanonicalPublicKey keyPath
+  (grants, authorizedKeys) <- prepareAccountPaths
+  existing <- readGrantDirectory grants
+  when (any (sameWorkerOrKey canonicalSpool worker publicKey) existing)
+    (throwFailure (SpoolFailure 3
+      "an active grant for this spool already uses that worker or public key"))
+  identifier <- freshGrantId grants
+  grant <- case Access.validateGrant identifier peer worker canonicalSpool publicKey expiry of
+    Left message -> throwFailure (SpoolFailure 2 message)
+    Right value -> pure value
+  executablePath <- getExecutablePath >>= canonicalizePath
+  managedLine <- case Access.renderManagedAuthorizedKeyLine executablePath grant of
+    Left message -> throwFailure (SpoolFailure 2 message)
+    Right value -> pure value
+  recordPath <- either (throwFailure . SpoolFailure 2) pure
+    (Access.grantRecordPath grants identifier)
+  created <- atomicCreate recordPath (BL.fromStrict (Access.renderGrant grant))
+  unless created (throwFailure (SpoolFailure 75 "could not create unique grant record"))
+  appendManagedKey authorizedKeys managedLine
+    `onException` ignoreMissing (removeFile recordPath)
+  BLC.putStrLn (BL.fromStrict (Access.renderGrant grant))
+  where
+    sameWorkerOrKey spool workerName key grant =
+      Access.grantSpool grant == spool
+        && (Access.grantWorker grant == workerName
+          || Access.grantPublicKey grant == key)
+
+readCanonicalPublicKey :: FilePath -> IO T.Text
+readCanonicalPublicKey path = do
+  bytes <- BS.readFile path
+  let withoutNewline =
+        if not (BS.null bytes) && BS.last bytes == 10 then BS.init bytes else bytes
+  when (BS.null withoutNewline || BS.elem 10 withoutNewline || BS.elem 13 withoutNewline)
+    (throwFailure (SpoolFailure 2 "public key file must contain exactly one line"))
+  key <- case TE.decodeUtf8' withoutNewline of
+    Left _ -> throwFailure (SpoolFailure 2 "public key must be UTF-8")
+    Right value -> pure value
+  case Access.validatePublicKey key of
+    Left message -> throwFailure (SpoolFailure 2 message)
+    Right () -> pure key
+
+readGrantDirectory :: FilePath -> IO [Access.Grant]
+readGrantDirectory directory = do
+  files <- jsonFiles directory
+  forM files $ \path -> do
+    grant <- readGrantRecord 70 path
+    unless (T.unpack (Access.grantId grant) == takeBaseName path)
+      (throwFailure (SpoolFailure 70
+        ("grant filename does not match its record: " <> path)))
+    pure grant
+
+readGrantRecord :: Int -> FilePath -> IO Access.Grant
+readGrantRecord failureCode path = do
+  bytes <- BS.readFile path
+  case Access.parseGrantJSON bytes of
+    Left message -> throwFailure (SpoolFailure failureCode
+      ("invalid grant record " <> path <> ": " <> message))
+    Right grant -> pure grant
+
+freshGrantId :: FilePath -> IO T.Text
+freshGrantId grants = do
+  bytes <- bracket (openBinaryFile "/dev/urandom" ReadMode) hClose (`BS.hGet` 16)
+  unless (BS.length bytes == 16)
+    (throwFailure (SpoolFailure 75 "could not read a grant identifier"))
+  let identifier = "grant_" <> T.pack (concatMap renderByte (BS.unpack bytes))
+  path <- either (throwFailure . SpoolFailure 70) pure
+    (Access.grantRecordPath grants identifier)
+  collision <- fileExists path
+  if collision then freshGrantId grants else pure identifier
+  where
+    renderByte byte = case showHex byte "" of
+      [digit] -> ['0', digit]
+      digits -> digits
+
+appendManagedKey :: FilePath -> BS.ByteString -> IO ()
+appendManagedKey authorizedKeys managedLine = do
+  present <- fileExists authorizedKeys
+  current <- if present then BS.readFile authorizedKeys else pure BS.empty
+  let separator = if BS.null current || BS.last current == 10 then BS.empty else "\n"
+  atomicReplace authorizedKeys
+    (BL.fromStrict (current <> separator <> managedLine))
+  setFileMode authorizedKeys 0o600
+
+rewriteAuthorizedKeys :: FilePath -> (BS.ByteString -> BS.ByteString) -> IO ()
+rewriteAuthorizedKeys authorizedKeys transform = do
+  present <- fileExists authorizedKeys
+  when present $ do
+    current <- BS.readFile authorizedKeys
+    let updated = transform current
+    when (updated /= current) $ do
+      atomicReplace authorizedKeys (BL.fromStrict updated)
+      setFileMode authorizedKeys 0o600
+
+revokeAccess :: Paths -> T.Text -> IO ()
+revokeAccess paths identifier = do
+  case Access.validateGrantId identifier of
+    Left message -> throwFailure (SpoolFailure 2 message)
+    Right () -> pure ()
+  canonicalSpool <- canonicalizePath (rootDir paths)
+  (grants, authorizedKeys) <- prepareAccountPaths
+  activePath <- either (throwFailure . SpoolFailure 2) pure
+    (Access.grantRecordPath grants identifier)
+  let tombstonePath = grants </> T.unpack identifier <> ".revoked"
+  active <- fileExists activePath
+  activeGrant <- if active
+    then Just <$> readGrantRecord 70 activePath
+    else pure Nothing
+  case activeGrant of
+    Just value | Access.grantId value /= identifier ->
+      throwFailure (SpoolFailure 70 "grant filename does not match its record")
+    _ -> pure ()
+  case activeGrant of
+    Just value | Access.grantSpool value /= canonicalSpool ->
+      throwFailure (SpoolFailure 5 "grant belongs to a different spool")
+    _ -> pure ()
+  when active (renameFile activePath tombstonePath)
+  tombstoned <- fileExists tombstonePath
+  grant <- case activeGrant of
+    Just value -> pure (Just value)
+    Nothing | tombstoned -> Just <$> readGrantRecord 70 tombstonePath
+    Nothing -> pure Nothing
+  case grant of
+    Just value | Access.grantId value /= identifier ->
+      throwFailure (SpoolFailure 70 "grant tombstone does not match its identifier")
+    _ -> pure ()
+  case grant of
+    Just value | Access.grantSpool value /= canonicalSpool ->
+      throwFailure (SpoolFailure 5 "grant belongs to a different spool")
+    _ -> pure ()
+  rewriteAuthorizedKeys authorizedKeys
+    (Access.filterManagedGrantLine identifier)
+  case grant of
+    Just value -> reclaimWorkerLeases paths (Access.grantWorker value)
+    Nothing -> pure ()
+  when tombstoned (removeFile tombstonePath)
+  BLC.putStrLn (canonical (A.object
+    [ "grant_id" .= identifier
+    , "status" .= ("revoked" :: T.Text)
+    ]))
+
+reclaimWorkerLeases :: Paths -> T.Text -> IO ()
+reclaimWorkerLeases paths worker = do
+  files <- jsonFiles (leasedDir paths)
+  forM_ files $ \path -> do
+    let leaseIdent = T.pack (takeBaseName path)
+    owner <- readWorkerSidecar paths leaseIdent
+    when (owner == worker) $ do
+      task <- readTaskFile path
+      returnToPending paths task
+      removeFile path
+      removeSidecars paths leaseIdent
+
+runRemote :: T.Text -> IO ()
+runRemote identifier = do
+  case Access.validateGrantId identifier of
+    Left message -> failWith 2 ("spool: " <> message)
+    Right () -> pure ()
+  (grants, _) <- accountGrantPaths
+  path <- either (failWith 2 . ("spool: " <>)) pure
+    (Access.grantRecordPath grants identifier)
+  grant <- loadActiveRemoteGrant identifier path
+  requested <- PosixEnv.getEnv "SSH_ORIGINAL_COMMAND"
+  operation <- case Access.parseRemoteCommand (maybe BS.empty id requested) of
+    Left message -> failWith 2 ("spool: " <> message)
+    Right value -> pure value
+  let paths = makePaths (Access.grantSpool grant)
+  initialise paths
+  withLock paths $ do
+    current <- loadActiveRemoteGrant identifier path
+    unless (Access.grantSpool current == rootDir paths)
+      (failWith 5 "spool: grant is missing, revoked, or expired")
+    recoverAttachmentState paths
+    dispatchRemote paths (Access.grantWorker current) operation
+
+loadActiveRemoteGrant :: T.Text -> FilePath -> IO Access.Grant
+loadActiveRemoteGrant identifier path = do
+  present <- fileExists path
+  unless present (failWith 5 "spool: grant is missing, revoked, or expired")
+  grant <- readGrantRecord 5 path
+  unless (Access.grantId grant == identifier)
+    (failWith 5 "spool: grant is missing, revoked, or expired")
+  now <- getCurrentTime
+  when (maybe False (now >=) (Access.grantExpiresAt grant))
+    (failWith 5 "spool: grant is missing, revoked, or expired")
+  pure grant
+
+dispatchRemote :: Paths -> T.Text -> Access.RemoteCommand -> IO ()
+dispatchRemote paths worker operation = case operation of
+  Access.RemoteLease count -> do
+    let requested = maybe 1 id count
+    when (requested > toInteger (maxBound :: Int))
+      (throwFailure (SpoolFailure 2 "lease count is too large for this host"))
+    leaseTasks paths worker (fromInteger requested)
+  Access.RemoteAck -> do
+    linesIn <- inputLines
+    references <- mapM (fmap (\(ident, lease, _) -> (ident, lease)) . parseAckLine) linesIn
+    mapM_ (ensureRemoteAckOwner paths worker) references
+    ackLines paths linesIn
+  Access.RemoteRenew -> do
+    linesIn <- inputLines
+    references <- mapM parseLeaseRefLine linesIn
+    mapM_ (ensureLiveLeaseOwner paths worker) references
+    renewLines paths linesIn
+  Access.RemoteFail retry -> do
+    linesIn <- inputLines
+    references <- mapM (fmap (\(ident, lease, _) -> (ident, lease)) . parseFailLine) linesIn
+    mapM_ (ensureLiveLeaseOwner paths worker) references
+    failLines retry paths linesIn
+  Access.RemoteFetch -> do
+    bytes <- BL.getContents
+    (ident, leaseIdent, _) <- case parseFetchRequest bytes of
+      Left message -> throwFailure (SpoolFailure 2 message)
+      Right value -> pure value
+    ensureLiveLeaseOwner paths worker (ident, leaseIdent)
+    fetchAttachmentBytes paths bytes
+
+ensureLiveLeaseOwner :: Paths -> T.Text -> (T.Text, T.Text) -> IO ()
+ensureLiveLeaseOwner paths worker (ident, leaseIdent) = do
+  let path = leasedDir paths </> T.unpack leaseIdent <> ".json"
+  present <- fileExists path
+  unless present (throwFailure (SpoolFailure 4 "lease is unknown or stale"))
+  task <- readTaskFile path
+  unless (taskId task == ident)
+    (throwFailure (SpoolFailure 4 "lease does not belong to task_id"))
+  owner <- readWorkerSidecar paths leaseIdent
+  unless (owner == worker)
+    (throwFailure (SpoolFailure 4 "lease belongs to a different worker"))
+
+ensureRemoteAckOwner :: Paths -> T.Text -> (T.Text, T.Text) -> IO ()
+ensureRemoteAckOwner paths worker reference@(_, leaseIdent) = do
+  live <- fileExists (leasedDir paths </> T.unpack leaseIdent <> ".json")
+  if live
+    then ensureLiveLeaseOwner paths worker reference
+    else do
+      let resultPath = resultsDir paths </> T.unpack leaseIdent <> ".json"
+      present <- fileExists resultPath
+      unless present (throwFailure (SpoolFailure 4 "lease is unknown or stale"))
+      (record, _) <- readResultRecordFile resultPath
+      let (ident, _) = reference
+      unless (extractTextField "task_id" record == ident
+        && extractTextField "worker" record == worker)
+        (throwFailure (SpoolFailure 4 "lease belongs to a different worker"))
 
 --------------------------------------------------------------------------
 -- Worker: maps a capability to a locally configured executable and runs

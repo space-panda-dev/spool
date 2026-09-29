@@ -175,6 +175,12 @@ line and preserves unrelated lines. A managed key and worker are unique per
 spool. Revocation first disables the record, then removes the line, then
 reclaims that worker's live leases. Repeating revoke changes nothing.
 
+On success, `grant` emits its grant record as one JSON line. Reusing an active
+public key or worker for the same spool is exit 3. `revoke` emits
+`{"grant_id":"GRANT_ID","status":"revoked"}`; the same response is returned
+when that grant was already absent. Malformed grant arguments are exit 2 and
+account-file I/O failures are exit 75.
+
 The exact forced command and request grammar follow below.
 
 ### SSH remote command
