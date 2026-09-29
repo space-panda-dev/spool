@@ -1,6 +1,6 @@
 # 0005. Declare attachments by digest and fetch one verified stream
 
-Status: proposed
+Status: accepted
 
 Attachments must cross the task boundary without making payloads non-opaque,
 accepting caller paths, or becoming a cache. This proposal supplies the

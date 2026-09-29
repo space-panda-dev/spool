@@ -1,6 +1,6 @@
 # 0009. Status counts coordination records, not an exclusive partition
 
-Status: proposed
+Status: accepted
 
 The protocol names four task states, but a retrying failure both returns its
 task to pending and leaves a failure record. The existing `status.failed`

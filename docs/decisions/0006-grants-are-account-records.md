@@ -1,6 +1,6 @@
 # 0006. Grants are account records with expiry in the record
 
-Status: proposed
+Status: accepted
 
 A forced SSH command needs trusted spool and worker values that cannot come
 from the peer. The dedicated account also needs revocation and expiry to take

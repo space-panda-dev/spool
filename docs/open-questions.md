@@ -5,10 +5,6 @@ than guessing.
 
 ## Protocol
 
-- How is an attachment declared in the envelope, and how is it fetched over
-  SSH: a separate command, or a stream alongside the lease?
-- What limits apply to attachments (per task, per spool), and is transfer
-  resumable?
 - When may a done task and its result be deleted: once read, after a period,
   or by the caller's command? A spool must not become an archive of finished
   work.
@@ -20,11 +16,7 @@ than guessing.
 
 ## Access
 
-- What exactly is the remote command's interface, and how does it read the
-  requested command safely from SSH?
-- What format do grants take, and where does their expiry live?
 - Should identities come from Tailscale SSH instead of key files, for friends
   who do not manage keys?
 - How would a spool open to strangers work, with no tailnet? A caller would
   treat it as open to anyone.
-- What runs `reclaim`: a timer on the spool's host, and with what threshold?

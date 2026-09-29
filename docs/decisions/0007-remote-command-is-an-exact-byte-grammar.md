@@ -1,6 +1,6 @@
 # 0007. The remote command is an exact byte grammar
 
-Status: proposed
+Status: accepted
 
 OpenSSH supplies a requested command as one string intended for a shell. A
 peer allowed to lease must not be able to turn that string into a shell, name
@@ -34,7 +34,7 @@ options are malformed input.
 
 `lease` inserts the grant's worker. `ack`, `renew`, and `fail` use the same
 JSONL stdin and output as local operations after checking lease ownership.
-`fetch` accepts the proposal's one JSON request on stdin and writes only raw
+`fetch` accepts the protocol's one JSON request on stdin and writes only raw
 attachment bytes to stdout. It never accepts an identifier or digest as a
 command word. Diagnostics go only to stderr.
 

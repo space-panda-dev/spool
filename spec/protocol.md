@@ -6,8 +6,8 @@ Status: draft
 The protocol a spool and its workers follow. It is dedicated to the public
 domain under CC0 1.0: anyone may implement it. The version above must match
 [`VERSION`](VERSION). Most of it is carried over from the predecessor's task
-spool, where it was tested on one machine; the parts marked provisional are
-not settled.
+spool, where it was tested on one machine. Matters that are not settled remain
+listed in [`docs/open-questions.md`](../docs/open-questions.md).
 
 ## Tasks
 
@@ -22,9 +22,9 @@ A task is one JSON object with exactly these fields:
   `version` matches `[A-Za-z0-9.]+`. Only the grammar is checked.
 - `payload`: any JSON value, including null. Never interpreted.
 
-### Attachments (proposed)
+### Attachments
 
-The draft defined by
+The design defined by
 [ADR 0005](../docs/decisions/0005-attachment-declaration-and-fetch.md) adds an
 optional `attachments` field. Omission means an empty array; new writers emit
 the field explicitly.
@@ -68,19 +68,19 @@ A lease ID that is not the task's current lease acts on nothing.
 ## Commands
 
 Every command takes an explicit spool directory. Input and output are JSONL,
-except the proposed `fetch` command writes one raw byte stream.
+except `fetch`, which writes one raw byte stream.
 
 ```sh
 spool --dir DIR init
 spool --dir DIR put < tasks.jsonl
-spool --dir DIR put --attachments ATTACHMENT_DIR < tasks.jsonl  # proposed
+spool --dir DIR put --attachments ATTACHMENT_DIR < tasks.jsonl
 spool --dir DIR lease --worker WORKER [--count N]
 spool --dir DIR ack < acknowledgements.jsonl
 spool --dir DIR renew < renewals.jsonl
 spool --dir DIR fail [--no-retry] < failures.jsonl
 spool --dir DIR failures
 spool --dir DIR results
-spool --dir DIR fetch < attachment-request.json > attachment  # proposed
+spool --dir DIR fetch < attachment-request.json > attachment
 spool --dir DIR reclaim --older-than SECONDS
 spool --dir DIR status [--json]
 spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
@@ -106,7 +106,7 @@ Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
 
-### `status` counters (proposed clarification)
+### `status` counters
 
 Under
 [ADR 0009](../docs/decisions/0009-status-counts-coordination-records.md),
@@ -126,7 +126,7 @@ not an exclusive partition of task IDs. A retrying failure can contribute one
 pending task and one or more failed records; its `retried` field distinguishes
 that history from terminal failure.
 
-### `fetch` (proposed)
+### `fetch`
 
 `fetch` accepts exactly one JSON object:
 
@@ -140,9 +140,9 @@ and size before writing the raw bytes to stdout. Diagnostics use stderr. The
 receiver verifies digest and size again before exposing the file. Ranges,
 resumption, paths, and multiple requests in one invocation are unsupported.
 
-### Grants (proposed)
+### Grants
 
-The draft defined by
+The design defined by
 [ADR 0006](../docs/decisions/0006-grants-are-account-records.md) adds:
 
 ```sh
@@ -168,11 +168,11 @@ line and preserves unrelated lines. A managed key and worker are unique per
 spool. Revocation first disables the record, then removes the line, then
 reclaims that worker's live leases. Repeating revoke changes nothing.
 
-The exact forced command and request grammar remain proposed below.
+The exact forced command and request grammar follow below.
 
-### SSH remote command (proposed)
+### SSH remote command
 
-The draft defined by
+The design defined by
 [ADR 0007](../docs/decisions/0007-remote-command-is-an-exact-byte-grammar.md)
 uses this managed forced command:
 
@@ -208,7 +208,7 @@ the single JSON request defined above on stdin and writes verified raw bytes to
 stdout. Requested command words never contain task IDs, lease IDs, digests,
 paths, or a claimed worker.
 
-### Reclaim driver (proposed)
+### Reclaim driver
 
 Under [ADR 0008](../docs/decisions/0008-reclaim-is-caller-driven.md), Spool
 starts no daemon, timer, scheduler, or background reclaim loop. A caller on the
@@ -244,7 +244,7 @@ stdin in a fresh temporary directory. Exit 0 with JSON on stdout is a result;
 anything else is a failure, retried unless the capability was unknown or the
 payload too large. `work` acknowledges with that result.
 
-Under the proposed attachment draft, `work` fetches and verifies every
+With attachments, `work` fetches and verifies every
 declared attachment into `attachments/SHA256` below the fresh working
 directory before starting the capability. It attempts to delete that entire
 directory after the program exits. The spool keeps attachments across retry

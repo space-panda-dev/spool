@@ -1,6 +1,6 @@
 # 0008. Reclaim is caller-driven
 
-Status: proposed
+Status: accepted
 
 Expired leases need a liveness mechanism, but putting a clock loop inside
 Spool would create the daemon and scheduler the design deliberately avoids.

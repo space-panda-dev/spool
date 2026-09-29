@@ -10,8 +10,8 @@ change one, add a record that supersedes it. Undecided matters belong in
 | [0002](0002-a-spool-is-an-audience.md) | A spool is an audience |
 | [0003](0003-ssh-first.md) | SSH first, through a dedicated account |
 | [0004](0004-attachments.md) | Attachments live and die with their task |
-| [0005](0005-attachment-declaration-and-fetch.md) | Declare attachments by digest and fetch one verified stream (proposed) |
-| [0006](0006-grants-are-account-records.md) | Grants are account records with expiry in the record (proposed) |
-| [0007](0007-remote-command-is-an-exact-byte-grammar.md) | The remote command is an exact byte grammar (proposed) |
-| [0008](0008-reclaim-is-caller-driven.md) | Reclaim is caller-driven (proposed) |
-| [0009](0009-status-counts-coordination-records.md) | Status counts coordination records, not an exclusive partition (proposed) |
+| [0005](0005-attachment-declaration-and-fetch.md) | Declare attachments by digest and fetch one verified stream |
+| [0006](0006-grants-are-account-records.md) | Grants are account records with expiry in the record |
+| [0007](0007-remote-command-is-an-exact-byte-grammar.md) | The remote command is an exact byte grammar |
+| [0008](0008-reclaim-is-caller-driven.md) | Reclaim is caller-driven |
+| [0009](0009-status-counts-coordination-records.md) | Status counts coordination records, not an exclusive partition |

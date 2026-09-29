@@ -75,10 +75,10 @@ when the port is complete.
 | `status` | Translate | Preserve text and JSON forms exactly as documented ([commands](../spec/protocol.md#commands)). |
 | `work` | Rewrite | Keep the configured executor lifecycle, but route success through result-bearing `ack` and make rejected transitions loud ([Workers](../spec/protocol.md#workers)). |
 | `work --show` | Keep the mechanism | Printing resolved local worker configuration supports owner control without touching task meaning ([INV-4](invariants.md)). |
-| `grant` / `revoke` | Defer | Their format, expiry location, and exact remote command are explicit access open questions ([open questions](open-questions.md#access)). |
-| Remote command | Defer | Its safe fixed-word interface is deliberately undecided ([open questions](open-questions.md#access)). |
-| Attachment fetch | Defer | Envelope declaration and SSH transfer shape are deliberately undecided ([open questions](open-questions.md#protocol)). |
-| Reclaim driver | Defer | What invokes `reclaim` and with what threshold is deliberately undecided ([open questions](open-questions.md#access)). |
+| `grant` / `revoke` | Rewrite | Build account grant records, expiry checks, managed key lines, and fail-closed revocation from [ADR 0006](decisions/0006-grants-are-account-records.md). |
+| Remote command | Rewrite | Parse and dispatch only the exact byte grammar bound to the grant's spool and worker ([ADR 0007](decisions/0007-remote-command-is-an-exact-byte-grammar.md), [INV-5](invariants.md)). |
+| Attachment fetch | Rewrite | Stage and fetch digest-addressed verified streams with task-scoped cleanup ([ADR 0005](decisions/0005-attachment-declaration-and-fetch.md), [INV-8](invariants.md)). |
+| Reclaim driver | Delete | Spool supplies no driver; callers invoke the existing command directly and deployments may use their own timer ([ADR 0008](decisions/0008-reclaim-is-caller-driven.md)). |
 
 ## Test units
 
@@ -126,7 +126,7 @@ when the port is complete.
 | Permission/refusal branches for existence, rename, sidecar, and cleanup | Rewrite | Add missing tests so refused I/O cannot masquerade as absence, a race, or successful cleanup ([AGENTS.md](../AGENTS.md#how-to-work)). |
 | Real-writer corruption fixtures | Rewrite | Corrupt records and sidecars produced by public commands so validators are tested against the shapes the implementation actually writes ([protocol](../spec/protocol.md#commands)). |
 | CLI registry-to-handler reachability | Rewrite | Add an enumerated dispatch test so every declared command reaches its handler ([AGENTS.md](../AGENTS.md#checks)). |
-| Grant, remote-command, and attachment tests | Defer | Their interfaces are open questions and cannot be encoded yet ([open questions](open-questions.md)). |
+| Grant, remote-command, and attachment tests | Rewrite | Exercise the accepted interfaces end to end, including grant-bound identity and verified task-scoped attachment lifetime ([ADR 0005](decisions/0005-attachment-declaration-and-fetch.md), [ADR 0006](decisions/0006-grants-are-account-records.md), [ADR 0007](decisions/0007-remote-command-is-an-exact-byte-grammar.md)). |
 
 ## Documentation and packaging units
 
@@ -150,22 +150,19 @@ when the port is complete.
 ## Open-question boundaries
 
 No implementation unit in the local-mechanism phase depends on an open
-question. Work stops before attachment declaration and transfer, result
-retention and large results, protocol negotiation, hard cancellation, remote
-command input, grant representation and expiry, alternative identity or public
-access, and the process or timer that invokes `reclaim`. These boundaries are
-listed in [open questions](open-questions.md); predecessor behaviour is not
-evidence for an answer.
+question. The remaining boundaries are result retention and large results,
+protocol negotiation, hard cancellation, alternative identity, and public
+access. These boundaries are listed in [open questions](open-questions.md);
+predecessor behaviour is not evidence for an answer.
 
 ## Document gaps found during inventory
 
 1. Phase 2 added exit 70 for corrupt durable state to the
    [protocol exit-code table](../spec/protocol.md#exit-codes) and tests it with
    records made by the real writers.
-2. The meaning of `status.failed` is now explicit in proposed
+2. The meaning of `status.failed` is explicit in accepted
    [ADR 0009](decisions/0009-status-counts-coordination-records.md). The
-   proposal documents the ported behaviour but remains unaccepted as protocol
-   authority until the proposal gate is resolved.
+   decision documents the ported behaviour as protocol authority.
 3. Phase 2 specifies and tests that an equal repeated `ack` is a no-op while a
    different result under the resolved lease is exit 4 and cannot replace the
    stored result.
