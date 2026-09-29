@@ -22,7 +22,27 @@ A task is one JSON object with exactly these fields:
   `version` matches `[A-Za-z0-9.]+`. Only the grammar is checked.
 - `payload`: any JSON value, including null. Never interpreted.
 
-Attachments are provisional ([open questions](../docs/open-questions.md)).
+### Attachments (proposed)
+
+The draft defined by
+[ADR 0005](../docs/decisions/0005-attachment-declaration-and-fetch.md) adds an
+optional `attachments` field. Omission means an empty array; new writers emit
+the field explicitly.
+
+```json
+{"task_id":"task-one","capability":"classify@1","payload":{"anything":"opaque"},"attachments":[{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":123}]}
+```
+
+Each attachment has exactly `sha256` and `size`. `sha256` is 64 lower-case
+hexadecimal characters. `size` is an integer from 0 through
+9223372036854775807. Digests are unique and sorted lexicographically. No
+filename or path is part of the envelope. A lease carries the same attachment
+array unchanged.
+
+For a new task with attachments, `put --attachments DIR` reads each source
+from `DIR/SHA256`, computes its digest and size while staging a spool-owned
+copy, and commits the task only after every declaration matches. An equal task
+already present remains an idempotent no-op and does not require source files.
 
 ## States
 
@@ -47,17 +67,20 @@ A lease ID that is not the task's current lease acts on nothing.
 
 ## Commands
 
-Every command takes an explicit spool directory. Input and output are JSONL.
+Every command takes an explicit spool directory. Input and output are JSONL,
+except the proposed `fetch` command writes one raw byte stream.
 
 ```sh
 spool --dir DIR init
 spool --dir DIR put < tasks.jsonl
+spool --dir DIR put --attachments ATTACHMENT_DIR < tasks.jsonl  # proposed
 spool --dir DIR lease --worker WORKER [--count N]
 spool --dir DIR ack < acknowledgements.jsonl
 spool --dir DIR renew < renewals.jsonl
 spool --dir DIR fail [--no-retry] < failures.jsonl
 spool --dir DIR failures
 spool --dir DIR results
+spool --dir DIR fetch < attachment-request.json > attachment  # proposed
 spool --dir DIR reclaim --older-than SECONDS
 spool --dir DIR status [--json]
 spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
@@ -83,6 +106,20 @@ Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
 
+### `fetch` (proposed)
+
+`fetch` accepts exactly one JSON object:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+```
+
+The task and lease must be current and the digest must be declared by that
+task. The spool verifies the stored bytes against both the declared SHA-256
+and size before writing the raw bytes to stdout. Diagnostics use stderr. The
+receiver verifies digest and size again before exposing the file. Ranges,
+resumption, paths, and multiple requests in one invocation are unsupported.
+
 `grant`, `revoke`, and the remote command used over SSH are provisional
 ([ADR 0003](../docs/decisions/0003-ssh-first.md)).
 
@@ -107,3 +144,10 @@ and the complete environment a program receives. A program gets the payload on
 stdin in a fresh temporary directory. Exit 0 with JSON on stdout is a result;
 anything else is a failure, retried unless the capability was unknown or the
 payload too large. `work` acknowledges with that result.
+
+Under the proposed attachment draft, `work` fetches and verifies every
+declared attachment into `attachments/SHA256` below the fresh working
+directory before starting the capability. It attempts to delete that entire
+directory after the program exits. The spool keeps attachments across retry
+and reclaim, and deletes them when `ack` or `fail --no-retry` resolves the
+task.
