@@ -4,7 +4,7 @@ Spool keeps work that must outlive the process that asked for it. Someone puts
 a task on a spool; a worker pulls it, runs it, and reports a result or a
 failure; a task whose worker vanished is taken back and offered again.
 
-It is a small protocol with one reference implementation. It knows nothing
+It is a durable work queue protocol with one reference implementation. It knows nothing
 about what its tasks mean: a payload is opaque JSON, and a capability is a
 name that each worker's owner maps to a program they installed. Archive uses
 it, and any unrelated program can.
@@ -25,8 +25,8 @@ it, and any unrelated program can.
 
 ## What Spool is not
 
-A scheduler, a queue service, a store, or a way to run code on someone else's
-machine. Work that does not need to survive its caller should skip Spool and
+A queue server, a scheduler, a job platform, a store, or a way to run code on
+someone else's machine. It is a durable work queue kept in files. Work that does not need to survive its caller should skip Spool and
 use GNU parallel.
 
 ## The words
@@ -39,7 +39,7 @@ use GNU parallel.
 | worker | a named process that leases tasks and runs them |
 | lease | a worker's claim on one task, fenced by its ID |
 | attachment | a file staged with a task and deleted with it |
-| grant | one peer's permission to lease from one spool |
+| grant | one peer's permission to lease from one spool, until revoked or expired |
 
 ## Where to look
 

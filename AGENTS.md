@@ -34,10 +34,12 @@ the predecessor's federation layer used push and is not ported
 the remote command, attachments) is built from the decision records, not from
 the predecessor.
 
-The port is done when two real machines pass this: a task put on one host is
-leased over SSH by a worker on another, run, acknowledged, and its result read
-back; then a worker killed mid-task has its lease reclaimed and the task run
-again.
+The port is done when real machines pass this. Host A holds the spool. A task
+with an attachment is put on it; a worker on host B leases it over SSH, fetches
+the attachment, runs, renews, and acknowledges with a result; the attachment is
+deleted and the result read back. Then B is killed mid-task, the lease is
+reclaimed, a worker on host C runs the task, and B's late acknowledgement does
+nothing. If that works with the protocol this small, stop adding architecture.
 
 ## Checks
 

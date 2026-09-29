@@ -31,8 +31,10 @@ acknowledgement, changes nothing; the same task ID with different content is a
 conflict. ([ADR 0001](decisions/0001-pull-protocol.md))
 
 **INV-8. Attachments live only as long as their task.** They are verified by
-digest when staged and when received, and deleted from the spool and the worker
-when the task is done or finally failed.
+digest when staged and when received. The spool deletes its copies when the
+task is done or finally failed. A worker deletes its copies when the program
+exits, but Spool cannot confirm that, so a worker's machine remains somewhere a
+copy may survive.
 ([ADR 0004](decisions/0004-attachments.md))
 
 **INV-9. A spool is coordination, not a record.** Deleting a spool loses only

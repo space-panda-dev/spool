@@ -32,7 +32,10 @@ A task is **pending**, **leased**, **done**, or **failed**.
   with different content is a conflict.
 - `lease` moves a pending task to leased under a new lease ID, naming the
   worker.
-- `ack` with that lease ID moves it to done. Repeating it is a no-op.
+- `ack` with that lease ID moves it to done, carrying the task's result: any
+  JSON value, `{"task_id", "lease_id", "result"}`. The result is kept with the
+  done task until whoever put the task reads it; how long after that is open.
+  Repeating an equal ack is a no-op.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
   or, with `--no-retry`, moves it to failed.
@@ -82,4 +85,4 @@ limit; the configuration also sets the concurrency limit, the renew interval,
 and the complete environment a program receives. A program gets the payload on
 stdin in a fresh temporary directory. Exit 0 with JSON on stdout is a result;
 anything else is a failure, retried unless the capability was unknown or the
-payload too large.
+payload too large. `work` acknowledges with that result.

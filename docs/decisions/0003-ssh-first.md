@@ -23,7 +23,9 @@ key reaches nothing else.
 account's `authorized_keys` as `restrict,command="…"`, running a remote command
 that accepts only lease, ack, renew, fail, and attachment fetches, for one
 spool, under the worker name the grant fixes. `spool revoke` removes it. No one
-writes these lines by hand.
+writes these lines by hand. The remote command accepts a fixed set of words and
+no shell syntax, and it is tested adversarially: an escape from it turns a
+friend who may lease into a friend with a shell.
 
 **The transport carries the protocol; it never changes it.** The protocol is the
 same JSONL commands whether run locally or over SSH, so another transport (HTTP

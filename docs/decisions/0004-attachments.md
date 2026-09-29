@@ -17,6 +17,8 @@ capability as local paths.
 **They live only as long as the task.** When a task is done, or failed without
 retry, its attachments are deleted from the spool, and the worker deletes its
 copies once the program exits. A retried task keeps them until it resolves.
+The spool's deletion is guaranteed; the worker's is attempted, and a crash, a
+snapshot, or a dishonest worker can defeat it.
 
 **Spool is not a store.** Nothing is cached between tasks. If sending the same
 bytes repeatedly costs too much, keeping a copy on the worker's machine is the

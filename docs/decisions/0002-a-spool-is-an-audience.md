@@ -19,19 +19,25 @@ spool is choosing who may see the task. Spool has no routing, labels, or
 classes of its own.
 
 **A grant is one peer's permission to lease from one spool.** It names the
-peer, an optional expiry, and optional limits. Removing it revokes the peer at
-once; leases they hold are reclaimed like any other.
+peer and, optionally, when it expires; nothing else. Execution limits belong to
+the worker's owner, and what may be disclosed belongs to the caller. Removing a
+grant stops every further operation by that peer and reclaims their leases.
+Revocation ends authority, not possession: what the peer already received stays
+disclosed.
 
 **The worker's owner decides what runs.** Each worker's configuration maps
 capability names to programs its owner installed, with a timeout, a payload
 limit, a concurrency limit, and the complete environment each program gets. A
-task naming anything else is refused. Sharing capacity never hands over
+task naming anything else is refused, after the worker has already seen it:
+what a worker is configured to run never narrows who can read the spool. Sharing capacity never hands over
 control of the machine.
 
 ## Rejected
 
 - **Routing labels in the envelope.** Anyone who can read the spool reads every
   task whatever its label.
+- **Limits on grants.** Concurrency, budgets, or capability filters there would
+  rebuild a scheduler at the wrong layer.
 - **The predecessor's offers with generation numbers and restart-to-revoke.** A
   grant that can be deleted does the same with one mechanism.
 - **Sending code with a task.** It would make every worker a remote shell.
