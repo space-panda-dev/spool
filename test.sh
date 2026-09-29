@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Say where the suite stopped. The trap also fires where a failure is expected
+# and errexit is off, so it speaks only while errexit is on.
+set -E
+trap 'if [[ $- == *e* ]]; then echo "test.sh: line $LINENO failed: $BASH_COMMAND" >&2; fi' ERR
+
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
