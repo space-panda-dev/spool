@@ -10,9 +10,12 @@ The script never chooses hosts or credentials and never installs keys.
 
 ## Prerequisites
 
-- A has the tested `spool` binary and a dedicated SSH account. Its B and C
-  grants already exist, bind distinct workers, and use the public halves of
-  the private keys named on B and C.
+- A has the tested `spool` binary and a dedicated SSH account. The A-admin
+  target runs spool commands as the filesystem owner of the spool; sharing
+  the directory through an ACL is insufficient because durable task records
+  are deliberately mode `0600`. Its B and C grants already exist, bind
+  distinct workers, and use the public halves of the private keys named on B
+  and C.
 - The control machine can use batch SSH to the administrative accounts on A,
   B, and C. B and C can use their grant keys to reach A's dedicated account.
   When the controller is B or C, pass the literal target `local` for that
