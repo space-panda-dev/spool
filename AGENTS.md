@@ -23,31 +23,14 @@ any command, file, or exit code.
   behaviour unsupported. Add what you find to
   [docs/open-questions.md](docs/open-questions.md).
 
-## Porting from V2
-
-Spool starts as a port of the predecessor project's task spool
-(`experiments/task-spool`, about 1,200 lines of Haskell with a shell test
-suite). Its mechanism is proven on one machine; take it freely, renaming the
-package and binary to Spool's. Its cross-machine design was never run, and
-the predecessor's federation layer used push and is not ported
-([ADR 0001](docs/decisions/0001-pull-protocol.md)). What is new here (grants,
-the remote command, attachments) is built from the decision records, not from
-the predecessor.
-
-The port is done when real machines pass this. Host A holds the spool. A task
-with an attachment is put on it; a worker on host B leases it over SSH, fetches
-the attachment, runs, renews, and acknowledges with a result; the attachment is
-deleted and the result read back. Then B is killed mid-task, the lease is
-reclaimed, a worker on host C runs the task, and B's late acknowledgement does
-nothing. If that works with the protocol this small, stop adding architecture.
-
-The final three-role procedure and evidence contract are in the
-[real-machine gate runbook](docs/real-machine-gate.md). Run its script only on
-machines and paths the operator has explicitly authorized.
-
 ## Checks
 
 `make check` validates the repository's structure: links resolve, every
 document is linked from somewhere, every decision record is indexed, cited
 invariants exist and cite a decision, the protocol's version matches
 `spec/VERSION`, and every file has a licence in `REUSE.toml`.
+
+`nix flake check -L` builds the static binary and runs the parser and integration
+tests. Changes to grants, remote dispatch, attachment lifecycle, reclaim, or
+lease fencing also run the authorized three-role procedure in the
+[real-machine validation runbook](docs/real-machine-gate.md).

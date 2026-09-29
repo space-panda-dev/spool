@@ -26,8 +26,21 @@ it, and any unrelated program can.
 ## What Spool is not
 
 A queue server, a scheduler, a job platform, a store, or a way to run code on
-someone else's machine. It is a durable work queue kept in files. Work that does not need to survive its caller should skip Spool and
-use GNU parallel.
+someone else's machine. It is a durable work queue kept in files. Work that
+does not need to survive its caller should skip Spool and use GNU parallel.
+
+## Reference implementation
+
+The `spool` binary implements the protocol with files, atomic transitions, and
+JSONL commands. It can run configured local capabilities, renew and reclaim
+fenced leases, and retain results and failure history. Dedicated SSH accounts
+use revocable or expiring grants whose forced command exposes only worker
+operations and fixes the worker identity. Attachments are declared by digest,
+verified when staged and received, and deleted when their task resolves.
+
+The Nix flake builds a static binary. The integration suite exercises the local
+and forced-command paths; the real-machine validation exercises the full SSH,
+attachment, worker-death, reclaim, and stale-ack path.
 
 ## The words
 
@@ -49,13 +62,14 @@ spec/protocol.md       the protocol: envelope, states, commands, exit codes
 docs/invariants.md     what must always hold
 docs/decisions/        why each decision was made
 docs/open-questions.md what is deliberately not decided yet
+docs/real-machine-gate.md authorized cross-machine validation and evidence
 ```
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md); it applies to people too. Run `make check`. Sign
-off each commit (`git commit -s`) to certify it under the
-[Developer Certificate of Origin](https://developercertificate.org).
+Read [AGENTS.md](AGENTS.md); it applies to people too. Run `make check` and
+`nix flake check -L`. Sign off each commit (`git commit -s`) to certify it under
+the [Developer Certificate of Origin](https://developercertificate.org).
 
 ## Licence
 

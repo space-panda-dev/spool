@@ -1,12 +1,13 @@
-# Real-machine gate
+# Real-machine validation
 
-This is the final port gate from [`AGENTS.md`](../AGENTS.md). It is deliberately
-not a simulation: A holds the spool, B and C make worker requests through
-their own SSH grants, and reclaim is an explicit caller action on A.
+This exercises the end-to-end deployment path. It is deliberately not a
+simulation: A holds the spool, B and C make worker requests through their own
+SSH grants, and reclaim is an explicit caller action on A.
 
-Do not run the gate until the operator names and authorizes all three machines,
-accounts, spool path, binary, key paths, and temporary worker directories.
-The script never chooses hosts or credentials and never installs keys.
+Run it only after the operator names and authorizes all three roles and every
+machine, account, spool path, binary, key path, and temporary worker directory
+used by those roles. The script never chooses hosts or credentials and never
+installs keys.
 
 ## Prerequisites
 
@@ -57,7 +58,7 @@ gets a different lease and completes the task, and requires B's late ack to
 exit 4 without replacing C's result.
 
 Success ends with `PASS RUN_ID evidence=PATH`. Preserve that directory with
-the tested commit hash and the three machine identities. On failure, preserve
-the same files plus stderr; inspect state with local commands on A. The script
-removes only the exact attachment staging file and exact B/C files it created.
-It leaves the spool and its durable result/failure evidence intact.
+the tested commit hash and the A/B/C role-to-machine mapping. On failure,
+preserve the same files plus stderr; inspect state with local commands on A.
+The script removes only the exact attachment staging file and exact B/C files
+it created. It leaves the spool and its durable result/failure evidence intact.

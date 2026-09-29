@@ -5,9 +5,8 @@ Status: draft
 
 The protocol a spool and its workers follow. It is dedicated to the public
 domain under CC0 1.0: anyone may implement it. The version above must match
-[`VERSION`](VERSION). Most of it is carried over from the predecessor's task
-spool, where it was tested on one machine. Matters that are not settled remain
-listed in [`docs/open-questions.md`](../docs/open-questions.md).
+[`VERSION`](VERSION). Matters that are not settled remain listed in
+[`docs/open-questions.md`](../docs/open-questions.md).
 
 ## Tasks
 
