@@ -60,7 +60,10 @@ A task is **pending**, **leased**, **done**, or **failed**.
   different result is a stale-lease error and cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
-  or, with `--no-retry`, moves it to failed.
+  or, with `--no-retry`, moves it to failed. A lease has at most one failure
+  record. Where a record is already stored for a live lease, repeating the
+  same reason and retry choice completes the fail; a different reason or
+  choice is a stale-lease error and cannot replace the stored record.
 - `reclaim --older-than SECONDS` returns to pending every lease whose later of
   lease time and last renewal is older than that. The old lease ID is dead.
 

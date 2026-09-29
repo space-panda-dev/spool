@@ -1080,15 +1080,40 @@ failLease paths ident leaseIdent reason retry = do
         then pure (Left "lease does not belong to task_id")
         else do
           worker <- readWorkerSidecar paths leaseIdent
-          now <- getCurrentTime
-          let failedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
-              record = encodeFailedRecord task leaseIdent worker failedAt reason retry
-          _ <- atomicCreate (failedDir paths </> T.unpack leaseIdent <> ".json") record
-          when retry (returnToPending paths task)
-          removeFile source
-          removeSidecars paths leaseIdent
-          unless retry (tombstoneAndDelete paths (taskId task))
-          pure (Right retry)
+          stored <- writeFailureRecord paths task leaseIdent worker reason retry
+          case stored of
+            Left message -> pure (Left message)
+            Right () -> do
+              when retry (returnToPending paths task)
+              removeFile source
+              removeSidecars paths leaseIdent
+              unless retry (tombstoneAndDelete paths (taskId task))
+              pure (Right retry)
+
+-- | Record a failure once. A record already there belongs to a fail that was
+-- interrupted before it removed the lease: the same reason and retry choice
+-- finish that fail, and anything else is refused, as a differing result is
+-- for ack.
+writeFailureRecord
+  :: Paths -> Task -> T.Text -> T.Text -> T.Text -> Bool -> IO (Either String ())
+writeFailureRecord paths task leaseIdent worker reason retry = do
+  now <- getCurrentTime
+  let failedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
+      record = encodeFailedRecord task leaseIdent worker failedAt reason retry
+      path = failedDir paths </> T.unpack leaseIdent <> ".json"
+  created <- atomicCreate path record
+  if created
+    then pure (Right ())
+    else do
+      existing <- readFailureRecordFile path
+      pure $ if existing `recordsFailure` (reason, retry)
+        then Right ()
+        else Left "fail differs from the failure already recorded for this lease"
+  where
+    recordsFailure (A.Object object) (wantedReason, wantedRetry) =
+      KM.lookup "reason" object == Just (A.String wantedReason)
+        && KM.lookup "retried" object == Just (A.Bool wantedRetry)
+    recordsFailure _ _ = False
 
 -- | Recreate a task in pending/, exactly as reclaim does: idempotent if an
 -- equal task is already there, a hard failure if a conflicting one is.

@@ -330,6 +330,45 @@ jq 'del(.reason)' "$work/validated-records/failed/$validate_failure_lease.json" 
 mv "$work/bad-failure.json" "$work/validated-records/failed/$validate_failure_lease.json"
 expect_exit 70 spoolv failures
 
+# A fail interrupted after its record was written leaves the lease standing
+# beside that record. The state is rebuilt from the real writer's own files:
+# the lease is set aside, failed for real, then put back. Finishing it with
+# the same reason and retry choice completes the transition; a different
+# reason or choice is refused and cannot pass for having been recorded.
+spoolf() { "$spool_binary" --dir "$work/interrupted-fail" "$@"; }
+spoolf init
+printf '%s\n' '{"task_id":"interrupted-fail","capability":"validate@1","payload":{}}' \
+  | spoolf put >/dev/null
+spoolf lease --worker interrupted > "$work/interrupted-lease.jsonl"
+interrupted_lease=$(jq -r '.lease_id' "$work/interrupted-lease.jsonl")
+mkdir "$work/interrupted-saved"
+cp "$work/interrupted-fail/leased/$interrupted_lease.json" \
+  "$work/interrupted-fail/leased/$interrupted_lease.worker" "$work/interrupted-saved/"
+first_fail=$(jq -nc --arg lease "$interrupted_lease" \
+  '{task_id:"interrupted-fail",lease_id:$lease,reason:"first reason"}')
+other_fail=$(jq -nc --arg lease "$interrupted_lease" \
+  '{task_id:"interrupted-fail",lease_id:$lease,reason:"other reason"}')
+test "$first_fail" != "$other_fail"; check
+printf '%s\n' "$first_fail" | spoolf fail | jq -e '.status == "failed_retry"' >/dev/null; check
+cp "$work/interrupted-saved/$interrupted_lease.json" \
+  "$work/interrupted-saved/$interrupted_lease.worker" "$work/interrupted-fail/leased/"
+rm "$work/interrupted-fail/pending/interrupted-fail.json"
+spoolf status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 1' >/dev/null; check
+set +e
+printf '%s\n' "$other_fail" | spoolf fail >/dev/null 2>&1
+other_reason_exit=$?
+printf '%s\n' "$first_fail" | spoolf fail --no-retry >/dev/null 2>&1
+other_choice_exit=$?
+set -e
+test "$other_reason_exit" -eq 4; check
+test "$other_choice_exit" -eq 4; check
+spoolf status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 1' >/dev/null; check
+printf '%s\n' "$first_fail" | spoolf fail | jq -e '.status == "failed_retry"' >/dev/null; check
+spoolf status --json | jq -e '.pending == 1 and .leased == 0 and .failed == 1' >/dev/null; check
+spoolf failures | jq -s --arg lease "$interrupted_lease" -e \
+  'length == 1 and .[0].lease_id == $lease and .[0].reason == "first reason"
+   and .[0].retried == true' >/dev/null; check
+
 spools() { "$spool_binary" --dir "$work/corrupt-sidecars" "$@"; }
 spools init
 printf '%s\n' '{"task_id":"bad-renewal","capability":"validate@1","payload":{}}' \

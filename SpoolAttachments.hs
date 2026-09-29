@@ -22,7 +22,7 @@ module SpoolAttachments
   , attemptRemoveWorkerDirectory
   ) where
 
-import Control.Exception (IOException, bracket, finally, onException, try)
+import Control.Exception (IOException, bracket, onException, try)
 import Control.Monad (forM_, unless, when)
 import Crypto.Hash (Context, Digest, SHA256, hashFinalize, hashInit,
                     hashUpdate)
@@ -183,17 +183,17 @@ receiveAttachment workerAttachmentRoot attachment source = do
       hClose handle
       case result of
         Left (exception :: IOException) -> do
-          removeFile temporary `finally` pure ()
+          discardTemporary temporary
           ioError exception
         Right checked -> case checked of
           Left message -> do
-            removeFile temporary `finally` pure ()
+            discardTemporary temporary
             pure (Left message)
           Right () -> do
             published <- try (renameFile temporary destination)
             case published of
               Left (exception :: IOException) -> do
-                removeFile temporary `finally` pure ()
+                discardTemporary temporary
                 ioError exception
               Right () -> pure (Right ())
   where
@@ -224,14 +224,25 @@ copyVerified attachment source temporary destination = do
   hClose destinationHandle
   case result of
     Left (exception :: IOException) -> do
-      removeFile temporaryFile `finally` pure ()
+      discardTemporary temporaryFile
       ioError exception
     Right (Left message) -> do
-      removeFile temporaryFile `finally` pure ()
+      discardTemporary temporaryFile
       pure (Left message)
     Right (Right ()) -> do
       renameFile temporaryFile destination
       pure (Right ())
+
+-- | Remove a temporary file on the way out of a failure.  The failure already
+-- in hand is the one to report, so a refusal here must not replace it.  The
+-- file is not lost sight of: it lies in a directory whose own removal fails
+-- loudly.
+discardTemporary :: FilePath -> IO ()
+discardTemporary path = do
+  result <- try (removeFile path)
+  case result of
+    Left (_ :: IOException) -> pure ()
+    Right () -> pure ()
 
 withBinaryFile :: FilePath -> (Handle -> IO a) -> IO a
 withBinaryFile path action = bracket (openBinaryFile path ReadMode) hClose action
