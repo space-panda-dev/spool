@@ -15,6 +15,9 @@ The script never chooses hosts or credentials and never installs keys.
   the private keys named on B and C.
 - The control machine can use batch SSH to the administrative accounts on A,
   B, and C. B and C can use their grant keys to reach A's dedicated account.
+  When the controller is B or C, pass the literal target `local` for that
+  worker instead of making an SSH loopback. This also avoids transports that
+  execute commands but do not preserve their exit status.
 - A's spool path and the B/C work directories are absolute, traversal-free
   paths chosen for this run. The script does not delete the spool.
 - `ssh`, `scp`, `jq`, and a SHA-256 command are installed where the script
@@ -38,6 +41,9 @@ scripts/real-machine-gate.sh \
   --c-work-dir /absolute/path/on/c/spool-gate-c \
   --evidence-dir ./gate-evidence
 ```
+
+For example, a controller running on B uses `--b-admin local`. Paths belonging
+to B are then local to the controller; A and C remain batch SSH targets.
 
 The script creates unique task IDs and an A-side attachment staging directory.
 It records every JSON response in the evidence directory. It first proves B's

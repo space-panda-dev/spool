@@ -170,6 +170,18 @@ test "$old_ack_exit" -eq 4; check
 new_ack=$(jq -nc --arg task "$old_task" --arg lease "$new_lease" \
   '{task_id:$task,lease_id:$lease,result:{replacement:true}}')
 printf '%s\n' "$new_ack" | spool ack | jq -e '.status == "acked"' >/dev/null; check
+# Resolving the replacement lease must not make the reclaimed lease look like
+# an idempotent repeat.  Its token stays dead after the task is done.
+set +e
+printf '%s\n' "$old_ack" | spool ack >/dev/null 2>&1
+late_old_ack_exit=$?
+set -e
+test "$late_old_ack_exit" -eq 4; check
+spool results | jq -s --arg task "$old_task" --arg lease "$new_lease" -e \
+  'map(select(.task_id == $task)) | length == 1
+   and .[0].lease_id == $lease
+   and .[0].worker == "replacement"
+   and .[0].result == {replacement:true}' >/dev/null; check
 
 # Renew resets the reclaim clock: leasing, waiting, renewing, then reclaiming
 # with a threshold newer than the lease (but older than the renewal) leaves it.

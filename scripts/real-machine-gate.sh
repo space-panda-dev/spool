@@ -12,6 +12,7 @@ usage: real-machine-gate.sh \
   [--evidence-dir LOCAL_DIRECTORY]
 
 The grants for B and C must already bind their keys to distinct worker names.
+Either worker admin target may be "local" when the controller runs there.
 EOF
   exit 2
 }
@@ -58,7 +59,16 @@ if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1
   exit 2
 fi
 
-control_ssh() { ssh -o BatchMode=yes "$@"; }
+control_ssh() {
+  local target=$1
+  shift
+  if [[ $target == local ]]; then
+    [[ $# -eq 1 ]] || { echo "local control requires one command" >&2; return 2; }
+    /bin/sh -c "$1"
+  else
+    ssh -o BatchMode=yes "$target" "$@"
+  fi
+}
 control_scp() { scp -o BatchMode=yes "$@"; }
 require_remote_tools() {
   control_ssh "$1" \
