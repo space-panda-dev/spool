@@ -41,6 +41,10 @@ deleted and the result read back. Then B is killed mid-task, the lease is
 reclaimed, a worker on host C runs the task, and B's late acknowledgement does
 nothing. If that works with the protocol this small, stop adding architecture.
 
+The temporary [port ledger](docs/port-ledger.md) records the disposition and
+authority for every unit examined during the port. Delete it when the port is
+complete.
+
 ## Checks
 
 `make check` validates the repository's structure: links resolve, every
