@@ -150,6 +150,44 @@ reclaims that worker's live leases. Repeating revoke changes nothing.
 
 The exact forced command and request grammar remain proposed below.
 
+### SSH remote command (proposed)
+
+The draft defined by
+[ADR 0007](../docs/decisions/0007-remote-command-is-an-exact-byte-grammar.md)
+uses this managed forced command:
+
+```sh
+spool remote --grant GRANT_ID
+```
+
+The grant record supplies the only spool directory and worker name. The peer
+cannot override either one. The remote command checks the grant before every
+invocation and checks that each referenced lease belongs to its fixed worker.
+
+`SSH_ORIGINAL_COMMAND` is parsed literally, never by a shell. It is at most 64
+ASCII bytes and exactly one of:
+
+```text
+lease
+lease --count N
+ack
+renew
+fail
+fail --no-retry
+fetch
+```
+
+`N` is decimal from 1 through 9223372036854775807 with no sign or leading
+zero. Words use exactly one ASCII space. Empty input, NUL, non-ASCII, control
+bytes, other whitespace, shell metacharacters, quoting, escaping, extra words,
+and unknown options are malformed input with exit 2.
+
+`lease` uses the grant's worker. `ack`, `renew`, and `fail` carry their local
+JSONL stdin and output unchanged after the ownership check. `fetch` accepts
+the single JSON request defined above on stdin and writes verified raw bytes to
+stdout. Requested command words never contain task IDs, lease IDs, digests,
+paths, or a claimed worker.
+
 ## Exit codes
 
 | Code | Meaning |
