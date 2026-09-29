@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -- | JSONL from stdin, and the point where a malformed line becomes exit 2.
 module Spool.Input
   ( parseTaskLine
@@ -14,28 +11,21 @@ import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import qualified Data.Text as T
-import Spool.Failure (SpoolFailure (..), throwFailure)
-import Spool.Wire (Task (..), parseTask, parseAck, parseFail, parseLeaseRef)
+import Spool.Error (malformed, orThrow)
+import Spool.Types (LeaseId, TaskId)
+import Spool.Wire (Task, parseAck, parseFail, parseLeaseRef, parseTask)
 
 parseTaskLine :: BL.ByteString -> IO Task
-parseTaskLine bytes = case parseTask bytes of
-  Left message -> throwFailure (SpoolFailure 2 message)
-  Right task -> pure task
+parseTaskLine = orThrow malformed . parseTask
 
-parseAckLine :: BL.ByteString -> IO (T.Text, T.Text, A.Value)
-parseAckLine bytes = case parseAck bytes of
-  Left message -> throwFailure (SpoolFailure 2 message)
-  Right ack -> pure ack
+parseAckLine :: BL.ByteString -> IO (TaskId, LeaseId, A.Value)
+parseAckLine = orThrow malformed . parseAck
 
-parseLeaseRefLine :: BL.ByteString -> IO (T.Text, T.Text)
-parseLeaseRefLine bytes = case parseLeaseRef bytes of
-  Left message -> throwFailure (SpoolFailure 2 message)
-  Right reference -> pure reference
+parseLeaseRefLine :: BL.ByteString -> IO (TaskId, LeaseId)
+parseLeaseRefLine = orThrow malformed . parseLeaseRef
 
-parseFailLine :: BL.ByteString -> IO (T.Text, T.Text, T.Text)
-parseFailLine bytes = case parseFail bytes of
-  Left message -> throwFailure (SpoolFailure 2 message)
-  Right value -> pure value
+parseFailLine :: BL.ByteString -> IO (TaskId, LeaseId, T.Text)
+parseFailLine = orThrow malformed . parseFail
 
 isBlank :: BL.ByteString -> Bool
 isBlank = all (`elem` [' ', '\t', '\r', '\n']) . BLC.unpack

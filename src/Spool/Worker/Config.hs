@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The worker's configuration: which executable each capability maps to, and
 -- the limits its owner set.
@@ -13,6 +12,7 @@ module Spool.Worker.Config
   , encodeWorkConfig
   ) where
 
+import Control.Exception (throwIO)
 import Control.Monad (unless)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as A
@@ -21,13 +21,14 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import System.Directory (executable, getPermissions)
-import System.Exit (exitSuccess)
 import System.FilePath (isAbsolute)
-import Spool.Failure (failWith)
+import Spool.Error (malformed, orThrow)
 import Spool.Files (fileExists)
-import Spool.Wire (Object, validateCapability, rejectUnknown, canonical)
+import Spool.Types (Capability, capabilityText, mkCapability)
+import Spool.Wire (Object, rejectUnknown, canonical)
 
 data CapabilityConfig = CapabilityConfig
   { capExec :: FilePath
@@ -41,27 +42,22 @@ data WorkConfig = WorkConfig
   { wcMaxConcurrent :: Int
   , wcRenewSeconds :: Int
   , wcEnv :: [(String, String)]
-  , wcCapabilities :: KM.KeyMap CapabilityConfig
+  , wcCapabilities :: Map.Map Capability CapabilityConfig
   } deriving (Eq, Show)
 
 runWorkShow :: FilePath -> IO ()
 runWorkShow configPath = do
   config <- loadWorkConfig configPath
   BLC.putStrLn (encodeWorkConfig config)
-  exitSuccess
 
 loadWorkConfig :: FilePath -> IO WorkConfig
 loadWorkConfig configPath = do
   exists <- fileExists configPath
-  unless exists (failWith 2 ("spool: config file not found: " <> configPath))
+  unless exists (throwIO (malformed ("config file not found: " <> configPath)))
   bytes <- BL.readFile configPath
-  case parseWorkConfig bytes of
-    Left message -> failWith 2 ("spool: " <> message)
-    Right config -> do
-      checked <- checkExecutables config
-      case checked of
-        Left message -> failWith 2 ("spool: " <> message)
-        Right () -> pure config
+  config <- orThrow malformed (parseWorkConfig bytes)
+  orThrow malformed =<< checkExecutables config
+  pure config
 
 parseWorkConfig :: BL.ByteString -> Either String WorkConfig
 parseWorkConfig bytes = do
@@ -78,7 +74,7 @@ parseWorkConfig bytes = do
         { wcMaxConcurrent = maxConcurrent
         , wcRenewSeconds = renewSeconds
         , wcEnv = envPairs
-        , wcCapabilities = KM.fromList caps
+        , wcCapabilities = Map.fromList caps
         }
     _ -> Left "config must be a JSON object"
 
@@ -135,10 +131,10 @@ requiredCapText key object = case KM.lookup (K.fromText key) object of
   Just _ -> Left (T.unpack key <> " must be a string")
   Nothing -> Left ("missing " <> T.unpack key)
 
-parseCapabilityEntry :: K.Key -> A.Value -> Either String (K.Key, CapabilityConfig)
+parseCapabilityEntry :: K.Key -> A.Value -> Either String (Capability, CapabilityConfig)
 parseCapabilityEntry key value = do
   let capText = K.toText key
-  validateCapability capText
+  capability <- mkCapability capText
   case value of
     A.Object object -> do
       rejectUnknown
@@ -151,15 +147,15 @@ parseCapabilityEntry key value = do
       timeoutSeconds <- positiveField maxDelaySeconds "timeout_seconds" Nothing object
       maxPayload <- positiveField maxBound "max_payload_bytes" Nothing object
       maxOutput <- positiveField maxBound "max_output_bytes" Nothing object
-      pure (key, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload maxOutput)
+      pure (capability, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload maxOutput)
     _ -> Left (T.unpack capText <> " must be an object")
 
 checkExecutables :: WorkConfig -> IO (Either String ())
-checkExecutables config = go (KM.toList (wcCapabilities config))
+checkExecutables config = go (Map.toList (wcCapabilities config))
   where
     go [] = pure (Right ())
-    go ((key, capConfig) : rest) = do
-      result <- checkOneExecutable (K.toText key) capConfig
+    go ((capability, capConfig) : rest) = do
+      result <- checkOneExecutable (capabilityText capability) capConfig
       case result of
         Left message -> pure (Left message)
         Right () -> go rest
@@ -183,8 +179,7 @@ encodeWorkConfig config = canonical (A.object
   [ "max_concurrent" .= wcMaxConcurrent config
   , "renew_seconds" .= wcRenewSeconds config
   , "env" .= KM.fromList [ (K.fromText (T.pack k), A.toJSON v) | (k, v) <- wcEnv config ]
-  , "capabilities" .= KM.fromList
-      [ (key, encodeCapabilityConfig capConfig) | (key, capConfig) <- KM.toList (wcCapabilities config) ]
+  , "capabilities" .= Map.map encodeCapabilityConfig (wcCapabilities config)
   ])
 
 encodeCapabilityConfig :: CapabilityConfig -> A.Value

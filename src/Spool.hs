@@ -1,69 +1,72 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -- | A small, independent JSONL task spool: the entry point, which turns the
--- command line into one command and runs it.
+-- command line into one command, runs it, and is the only place a failure
+-- becomes a message and an exit status.
 module Spool
   ( main
   ) where
 
-import Control.Exception (IOException, catch, displayException)
-import Control.Monad (when)
+import Control.Exception (Handler (..), IOException, catches, displayException,
+                          throwIO)
 import qualified Data.Text as T
 import System.Environment (getArgs)
-import System.Exit (exitSuccess)
-import Spool.Cli (Command (..), parseCommand, parseWorkShow)
-import Spool.Failure (failWith)
-import Spool.Files (Paths (..), withLock, makePaths, initialise)
+import System.Exit (ExitCode (..), exitWith)
+import Spool.Cli (Command (..), StoreCommand (..), parseCommand, parseWorkShow)
+import Spool.Error (SpoolError (..), exitStatus, report, retryable)
+import Spool.Files (Paths, initialise, makePaths, withLock)
 import Spool.Grants (grantAccess, revokeAccess, runRemote)
 import Spool.Store
-  ( withStore
-  , recoverAttachmentState
-  , putTasks
-  , leaseTasks
-  , ackTasks
-  , renewTasks
+  ( ackTasks
   , failTasks
   , failuresCommand
-  , resultsCommand
   , fetchAttachment
+  , leaseTasks
+  , putTasks
   , reclaimTasks
+  , recoverAttachmentState
+  , renewTasks
+  , resultsCommand
   , statusTasks
+  , withStore
   )
 import Spool.Worker.Config (runWorkShow)
 import Spool.Worker.Run (runWork)
 
 main :: IO ()
-main = mainCommand `catch` handleFilesystemFailure
-
-handleFilesystemFailure :: IOException -> IO a
-handleFilesystemFailure exception =
-  failWith 75 ("spool: filesystem failure: " <> displayException exception)
-
-mainCommand :: IO ()
-mainCommand = do
+main = do
   args <- getArgs
-  when (args == ["--version"]) $ putStrLn "spool 0.0.1" >> exitSuccess
-  case args of
-    ["remote", "--grant", identifier] -> runRemote (T.pack identifier)
-    ("work" : rest) | "--show" `elem` rest && "--dir" `notElem` args ->
-      case parseWorkShow rest of
-        Left message -> failWith 2 message
-        Right configPath -> runWorkShow configPath
-    _ -> case parseCommand args of
-      Left message -> failWith 2 message
-      Right (directory, Work worker configPath maxTasks) -> do
+  run args `catches`
+    [ Handler exitWithFailure
+    , Handler (exitWithFailure . filesystemFailure)
+    ]
+
+exitWithFailure :: SpoolError -> IO a
+exitWithFailure failure = do
+  report failure
+  exitWith (ExitFailure (exitStatus failure))
+
+filesystemFailure :: IOException -> SpoolError
+filesystemFailure exception =
+  retryable ("filesystem failure: " <> displayException exception)
+
+run :: [String] -> IO ()
+run args = case args of
+  ["--version"] -> putStrLn "spool 0.0.1"
+  ["remote", "--grant", identifier] -> runRemote (T.pack identifier)
+  ("work" : rest) | "--show" `elem` rest && "--dir" `notElem` args ->
+    either (throwIO . Usage) runWorkShow (parseWorkShow rest)
+  _ -> do
+    (directory, command) <- either (throwIO . Usage) pure (parseCommand args)
+    case command of
+      Work worker configPath maxTasks -> do
         let paths = makePaths directory
         initialise paths
         withLock paths (recoverAttachmentState paths)
         runWork paths worker configPath maxTasks
-      Right (directory, WorkShow configPath) -> do
-        _ <- pure directory
-        runWorkShow configPath
-      Right (directory, command) -> withStore directory (runCommand command)
+      WorkShow configPath -> runWorkShow configPath
+      Store transition -> withStore directory (runStoreCommand transition)
 
-runCommand :: Command -> Paths -> IO ()
-runCommand command paths = case command of
+runStoreCommand :: StoreCommand -> Paths -> IO ()
+runStoreCommand command paths = case command of
   Init -> pure ()
   Put source -> putTasks paths source
   LeaseCommand worker count -> leaseTasks paths worker count
@@ -74,9 +77,7 @@ runCommand command paths = case command of
   Results -> resultsCommand paths
   Fetch -> fetchAttachment paths
   Reclaim age -> reclaimTasks paths age
-  Status json -> statusTasks paths json
-  Work {} -> error "unreachable: Work is dispatched before runCommand"
-  WorkShow {} -> error "unreachable: WorkShow is dispatched before runCommand"
+  Status format -> statusTasks paths format
   GrantCommand peer worker key expiry ->
     grantAccess paths peer worker key expiry
   RevokeCommand identifier -> revokeAccess paths identifier

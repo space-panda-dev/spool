@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -- | The spool's directories, its lock, and the atomic file operations every
 -- transition is built from.
 module Spool.Files
@@ -8,8 +5,16 @@ module Spool.Files
   , withLock
   , makePaths
   , initialise
+  , pendingPath
+  , leasedPath
+  , donePath
+  , failedPath
+  , resultPath
+  , workerSidecarPath
+  , renewedSidecarPath
   , jsonFiles
   , fileExists
+  , Created (..)
   , atomicCreate
   , atomicReplace
   , ignoreMissing
@@ -29,6 +34,8 @@ import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus)
 import System.IO.Unsafe (unsafePerformIO)
+import qualified Data.Text as T
+import Spool.Types (LeaseId, TaskId, leaseIdText, taskIdText)
 
 data Paths = Paths
   { rootDir :: FilePath
@@ -77,6 +84,25 @@ makePaths directory = Paths
   , lockPath = directory </> ".spool.lock"
   }
 
+-- A pending task is filed under its own identifier. Everything that follows
+-- a lease is filed under the lease's, which is what fences a stale worker.
+pendingPath :: Paths -> TaskId -> FilePath
+pendingPath paths ident = pendingDir paths </> T.unpack (taskIdText ident) <> ".json"
+
+leasedPath, donePath, failedPath, resultPath :: Paths -> LeaseId -> FilePath
+leasedPath paths = underLease (leasedDir paths) ".json"
+donePath paths = underLease (doneDir paths) ".json"
+failedPath paths = underLease (failedDir paths) ".json"
+resultPath paths = underLease (resultsDir paths) ".json"
+
+workerSidecarPath, renewedSidecarPath :: Paths -> LeaseId -> FilePath
+workerSidecarPath paths = underLease (leasedDir paths) ".worker"
+renewedSidecarPath paths = underLease (leasedDir paths) ".renewed"
+
+underLease :: FilePath -> String -> LeaseId -> FilePath
+underLease directory extension leaseIdent =
+  directory </> T.unpack (leaseIdText leaseIdent) <> extension
+
 initialise :: Paths -> IO ()
 initialise paths = mapM_ (createDirectoryIfMissing True)
   [rootDir paths, pendingDir paths, leasedDir paths, doneDir paths,
@@ -100,7 +126,14 @@ fileExists path = do
       | isDoesNotExistError exception -> pure False
       | otherwise -> ioError exception
 
-atomicCreate :: FilePath -> BL.ByteString -> IO Bool
+-- | Whether 'atomicCreate' made the file or found one already there.
+data Created = Created | AlreadyThere
+  deriving (Eq, Show)
+
+-- | Create a file with these bytes, or leave the one already there alone.
+-- The bytes are written to a temporary file and linked into place, so the
+-- name appears complete or not at all and never replaces another.
+atomicCreate :: FilePath -> BL.ByteString -> IO Created
 atomicCreate path bytes = do
   let directory = takeDirectory path
   createDirectoryIfMissing True directory
@@ -108,9 +141,9 @@ atomicCreate path bytes = do
   result <- (BL.hPut handle bytes >> hClose handle >> try (createLink temporary path))
     `finally` ignoreMissing (removeFile temporary)
   case result of
-    Right () -> pure True
+    Right () -> pure Created
     Left exception
-      | isAlreadyExistsError exception -> pure False
+      | isAlreadyExistsError exception -> pure AlreadyThere
       | otherwise -> ioError exception
 
 atomicReplace :: FilePath -> BL.ByteString -> IO ()

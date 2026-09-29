@@ -3,14 +3,17 @@
 
 -- | The attachment boundary for the file-backed spool.
 --
--- This module deliberately does not know about task records or leases.  It
--- owns the small, digest-addressed file operation which those records use:
+-- This module deliberately does not know about task records or leases; of a
+-- task it knows only the identifier.  It owns the small, digest-addressed
+-- file operation which those records use:
 -- declarations are strict, copies are staged before they become visible, and
 -- received bytes are verified before they are renamed into a worker's fresh
 -- directory.
 module Spool.Attachments
   ( Attachment (..)
-  , parseAttachment
+  , Sha256
+  , mkSha256
+  , sha256Text
   , validateAttachments
   , attachmentDirectory
   , attachmentPath
@@ -18,7 +21,6 @@ module Spool.Attachments
   , isStagingLeftover
   , receiveAttachment
   , verifyAttachmentFile
-  , removeTaskAttachments
   , attemptRemoveWorkerDirectory
   ) where
 
@@ -41,11 +43,31 @@ import System.FilePath ((</>))
 import System.IO (Handle, IOMode (ReadMode), hClose, hFlush,
                   openBinaryFile, openBinaryTempFile)
 import System.IO.Error (isDoesNotExistError)
+import Spool.Types (TaskId, taskIdText)
+
+-- | A SHA-256 digest as a declaration carries it: 64 lower-case hexadecimal
+-- characters.  It is safe as a file name, which is what it is used for.
+newtype Sha256 = Sha256 T.Text
+  deriving (Eq, Ord, Show)
+
+mkSha256 :: T.Text -> Either String Sha256
+mkSha256 value
+  | T.length value == 64 && T.all lowerHex value = Right (Sha256 value)
+  | otherwise = Left "sha256 must be 64 lower-case hexadecimal characters"
+  where
+    lowerHex character = character >= '0' && character <= '9'
+      || character >= 'a' && character <= 'f'
+
+sha256Text :: Sha256 -> T.Text
+sha256Text (Sha256 value) = value
+
+instance ToJSON Sha256 where
+  toJSON = toJSON . sha256Text
 
 -- | An attachment declaration is deliberately only a digest and a byte
 -- count.  There is no caller filename or path in the protocol.
 data Attachment = Attachment
-  { attachmentSha256 :: T.Text
+  { attachmentSha256 :: Sha256
   , attachmentSize :: Int64
   } deriving (Eq, Ord, Show)
 
@@ -67,7 +89,7 @@ parseAttachment = A.withObject "attachment" $ \object -> do
       actual = sort (KM.keys object)
   unless (actual == expected) $
     fail "attachment must contain exactly sha256 and size"
-  digest <- object .: "sha256"
+  digest <- either fail pure . mkSha256 =<< object .: "sha256"
   size <- object .: "size"
   case validateAttachment (Attachment digest size) of
     Left message -> fail message
@@ -86,42 +108,23 @@ validateAttachments attachments = do
   pure attachments
 
 validateAttachment :: Attachment -> Either String ()
-validateAttachment attachment = do
-  let digest = attachmentSha256 attachment
-      validHex character = character >= '0' && character <= '9'
-        || character >= 'a' && character <= 'f'
-  unless (T.length digest == 64 && T.all validHex digest) $
-    Left "sha256 must be 64 lower-case hexadecimal characters"
+validateAttachment attachment =
   unless (attachmentSize attachment >= 0) $
     Left "attachment size must be non-negative"
 
--- | Return a path whose final component has a fixed, non-traversable prefix.
--- The task-id check mirrors the protocol grammar so callers cannot use this
--- helper to accidentally turn an opaque identifier into a filesystem path.
-attachmentDirectory :: FilePath -> T.Text -> Either String FilePath
-attachmentDirectory root task = do
-  validateTaskToken task
-  pure (root </> ("task-" <> T.unpack task))
+-- | A task's directory beneath the attachment root.  Its name has a fixed
+-- prefix and an identifier whose grammar admits no separator, so it cannot
+-- leave the root.
+attachmentDirectory :: FilePath -> TaskId -> FilePath
+attachmentDirectory root task = root </> ("task-" <> T.unpack (taskIdText task))
 
-attachmentPath :: FilePath -> T.Text -> Attachment -> Either String FilePath
-attachmentPath root task attachment = do
-  directory <- attachmentDirectory root task
-  validateAttachment attachment
-  pure (directory </> T.unpack (attachmentSha256 attachment))
+attachmentPath :: FilePath -> TaskId -> Attachment -> FilePath
+attachmentPath root task attachment =
+  attachmentDirectory root task </> digestName attachment
 
-validateTaskToken :: T.Text -> Either String ()
-validateTaskToken task
-  | T.null task = Left "task_id must not be empty"
-  | T.any invalid task = Left "task_id contains an unsafe character"
-  | "--" `T.isInfixOf` task = Left "task_id may not contain --"
-  | otherwise = Right ()
-  where
-    valid character =
-      ('a' <= character && character <= 'z')
-        || ('A' <= character && character <= 'Z')
-        || ('0' <= character && character <= '9')
-        || character `elem` ("._-" :: String)
-    invalid character = not (valid character)
+-- | The file name an attachment goes by: its digest.
+digestName :: Attachment -> FilePath
+digestName = T.unpack . sha256Text . attachmentSha256
 
 -- | The template for a staging directory's name.  The name itself is the
 -- system's to choose, and it puts its unique part in front of a template that
@@ -140,31 +143,30 @@ isStagingLeftover name =
 -- | Stage all source files into a temporary directory and atomically publish
 -- the task directory.  A failed digest leaves no visible task directory.
 -- Existing destination directories are never removed or overwritten.
-stageAttachments :: FilePath -> FilePath -> T.Text
+stageAttachments :: FilePath -> FilePath -> TaskId
                  -> [Attachment] -> IO (Either String ())
 stageAttachments attachmentRoot sourceRoot task attachments = do
   validated <- pure (validateAttachments attachments)
   case validated of
     Left message -> pure (Left message)
     Right [] -> pure (Right ())
-    Right declarations -> case attachmentDirectory attachmentRoot task of
-      Left message -> pure (Left message)
-      Right destination -> do
-        createDirectoryIfMissing True attachmentRoot
-        (temporary, handle) <- openBinaryTempFile attachmentRoot stagingTemplate
-        hClose handle
-        removeFile temporary
-        createDirectoryIfMissing True temporary
-        result <- stageFiles temporary sourceRoot declarations
-          `onException` removeDirectoryRecursive temporary
-        case result of
-          Left message -> do
-            removeDirectoryRecursive temporary
-            pure (Left message)
-          Right () -> do
-            renameDirectory temporary destination
-              `onException` removeDirectoryRecursive temporary
-            pure (Right ())
+    Right declarations -> do
+      let destination = attachmentDirectory attachmentRoot task
+      createDirectoryIfMissing True attachmentRoot
+      (temporary, handle) <- openBinaryTempFile attachmentRoot stagingTemplate
+      hClose handle
+      removeFile temporary
+      createDirectoryIfMissing True temporary
+      result <- stageFiles temporary sourceRoot declarations
+        `onException` removeDirectoryRecursive temporary
+      case result of
+        Left message -> do
+          removeDirectoryRecursive temporary
+          pure (Left message)
+        Right () -> do
+          renameDirectory temporary destination
+            `onException` removeDirectoryRecursive temporary
+          pure (Right ())
 
 stageFiles :: FilePath -> FilePath -> [Attachment] -> IO (Either String ())
 stageFiles temporary sourceRoot declarations = do
@@ -172,8 +174,8 @@ stageFiles temporary sourceRoot declarations = do
   where
     go [] = pure (Right ())
     go (attachment : rest) = do
-      let source = sourceRoot </> T.unpack (attachmentSha256 attachment)
-          destination = temporary </> T.unpack (attachmentSha256 attachment)
+      let source = sourceRoot </> digestName attachment
+          destination = temporary </> digestName attachment
       checked <- copyVerified attachment source temporary destination
       case checked of
         Left message -> pure (Left message)
@@ -189,7 +191,7 @@ receiveAttachment workerAttachmentRoot attachment source = do
     Left message -> pure (Left message)
     Right () -> do
       createDirectoryIfMissing True workerAttachmentRoot
-      let destination = workerAttachmentRoot </> T.unpack (attachmentSha256 attachment)
+      let destination = workerAttachmentRoot </> digestName attachment
       (temporary, handle) <- openBinaryTempFile workerAttachmentRoot ".spool-attachment-receive"
       result <- try (receiveInto handle source)
       hClose handle
@@ -287,7 +289,7 @@ checkedAdd left right
 verifyDigest :: Attachment -> Context SHA256 -> Int64 -> Either String ()
 verifyDigest attachment context size =
   let digest = renderDigest (hashFinalize context :: Digest SHA256)
-  in if digest /= attachmentSha256 attachment
+  in if digest /= sha256Text (attachmentSha256 attachment)
        then Left "attachment sha256 does not match declaration"
        else if size /= attachmentSize attachment
          then Left "attachment size does not match declaration"
@@ -297,14 +299,6 @@ verifyDigest attachment context size =
 -- declaration carries.
 renderDigest :: Digest SHA256 -> T.Text
 renderDigest = T.pack . show
-
--- | Delete a task's spool-owned attachment directory.  The operation is
--- idempotent; callers that need crash recovery should perform their durable
--- tombstone transition before invoking it.
-removeTaskAttachments :: FilePath -> T.Text -> IO ()
-removeTaskAttachments root task = do
-  directory <- either (ioError . userError) pure (attachmentDirectory root task)
-  removeDirectoryRecursive directory `catchMissing` pure ()
 
 -- | Workers attempt to remove their entire fresh working directory after
 -- every program exit.  Returning the exception lets the caller fail loudly
@@ -316,14 +310,6 @@ attemptRemoveWorkerDirectory directory = do
     Left exception | isMissing exception -> Right ()
     Left exception -> Left exception
     Right () -> Right ())
-
-catchMissing :: IO a -> IO a -> IO a
-catchMissing action fallback = do
-  result <- try action
-  case result of
-    Left (exception :: IOException) | isMissing exception -> fallback
-    Left exception -> ioError exception
-    Right value -> pure value
 
 isMissing :: IOException -> Bool
 isMissing = isDoesNotExistError

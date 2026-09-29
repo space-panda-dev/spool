@@ -4,12 +4,12 @@
 -- a number is used as written or refused, never wrapped.
 module Test.WorkerConfig (tests) where
 
-import qualified Data.Aeson.Key as K
-import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.Either (isLeft)
 import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
+import Spool.Types (Capability, mkCapability)
 import Spool.Worker.Config
   ( CapabilityConfig (..)
   , WorkConfig (..)
@@ -29,8 +29,8 @@ tests = testGroup "worker configuration"
       wcEnv config @?= []
   , testCase "a capability reads as written" $ do
       config <- parsed (document "" capabilityBody)
-      KM.lookup (K.fromText "classify@1") (wcCapabilities config)
-        @?= Just (CapabilityConfig "/bin/cat" ["-u"] 5 1024 65536)
+      Map.toList (wcCapabilities config)
+        @?= [(classify, CapabilityConfig "/bin/cat" ["-u"] 5 1024 65536)]
   , testCase "what --show prints reads back as the same configuration" $ do
       config <- parsed
         (document "\"max_concurrent\":4,\"renew_seconds\":9,\"env\":{\"PATH\":\"/bin\"}," capabilityBody)
@@ -88,6 +88,9 @@ tests = testGroup "worker configuration"
     int64Max = toInteger (maxBound :: Int64)
     secondsMax = toInteger maxDelaySeconds
 
+classify :: Capability
+classify = either error id (mkCapability "classify@1")
+
 parsed :: BL.ByteString -> IO WorkConfig
 parsed = either assertFailure pure . parseWorkConfig
 
@@ -110,7 +113,7 @@ capability timeout payload output =
 
 capabilityField :: Integral a => (CapabilityConfig -> a) -> WorkConfig -> Integer
 capabilityField get config =
-  maybe (-1) (toInteger . get) (KM.lookup (K.fromText "classify@1") (wcCapabilities config))
+  maybe (-1) (toInteger . get) (Map.lookup classify (wcCapabilities config))
 
 atLimit :: String -> Integer -> BL.ByteString -> (WorkConfig -> Integer) -> TestTree
 atLimit label limit bytes get = testCase label $ do
