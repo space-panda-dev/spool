@@ -11,10 +11,12 @@ listed in [`docs/open-questions.md`](../docs/open-questions.md).
 
 ## Tasks
 
-A task is one JSON object with exactly these fields:
+A task is one JSON object with exactly the three required fields below and the
+optional `attachments` field defined in the next section. New writers include
+that field explicitly.
 
 ```json
-{"task_id":"task-one","capability":"classify@1","payload":{"anything":"opaque"}}
+{"task_id":"task-one","capability":"classify@1","payload":{"anything":"opaque"},"attachments":[]}
 ```
 
 - `task_id`: ASCII letters, digits, `.`, `_`, and `-`; `--` is reserved.
@@ -139,6 +141,11 @@ task. The spool verifies the stored bytes against both the declared SHA-256
 and size before writing the raw bytes to stdout. Diagnostics use stderr. The
 receiver verifies digest and size again before exposing the file. Ranges,
 resumption, paths, and multiple requests in one invocation are unsupported.
+Malformed requests and undeclared digests are exit 2. An unknown, stale, or
+wrong-task lease is exit 4. A stored attachment whose declared digest or size
+does not match is corrupt durable state and exit 70. A declaration whose
+source bytes do not match during `put` is malformed input and exit 2; source
+or staging I/O failure is exit 75.
 
 ### Grants
 

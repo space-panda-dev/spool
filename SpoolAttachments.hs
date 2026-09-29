@@ -1,0 +1,305 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_GHC -Wall -Werror #-}
+
+-- | The attachment boundary for the file-backed spool.
+--
+-- This module deliberately does not know about task records or leases.  It
+-- owns the small, digest-addressed file operation which those records use:
+-- declarations are strict, copies are staged before they become visible, and
+-- received bytes are verified before they are renamed into a worker's fresh
+-- directory.
+module SpoolAttachments
+  ( Attachment (..)
+  , parseAttachment
+  , validateAttachments
+  , attachmentDirectory
+  , attachmentPath
+  , stageAttachments
+  , receiveAttachment
+  , verifyAttachmentFile
+  , removeTaskAttachments
+  , attemptRemoveWorkerDirectory
+  ) where
+
+import Control.Exception (IOException, bracket, finally, onException, try)
+import Control.Monad (forM_, unless, when)
+import Crypto.Hash (Context, Digest, SHA256, hashFinalize, hashInit,
+                    hashUpdate)
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, (.:), (.=))
+import qualified Data.Aeson as A
+import qualified Data.Aeson.Key as K
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Aeson.Types as AT
+import qualified Data.ByteArray.Encoding as BAE
+import qualified Data.ByteString as BS
+import Data.Int (Int64)
+import Data.List (nub, sort)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive,
+                         removeFile, renameDirectory, renameFile)
+import System.FilePath ((</>))
+import System.IO (Handle, IOMode (ReadMode), hClose, hFlush,
+                  openBinaryFile, openBinaryTempFile)
+import System.IO.Error (isDoesNotExistError)
+
+-- | An attachment declaration is deliberately only a digest and a byte
+-- count.  There is no caller filename or path in the protocol.
+data Attachment = Attachment
+  { attachmentSha256 :: T.Text
+  , attachmentSize :: Int64
+  } deriving (Eq, Ord, Show)
+
+instance ToJSON Attachment where
+  toJSON attachment =
+    A.object
+      [ "sha256" .= attachmentSha256 attachment
+      , "size" .= attachmentSize attachment
+      ]
+
+instance FromJSON Attachment where
+  parseJSON = parseAttachment
+
+-- | Parse one declaration, rejecting unknown or missing fields.  List-level
+-- ordering and uniqueness are checked by 'validateAttachments'.
+parseAttachment :: Value -> AT.Parser Attachment
+parseAttachment = A.withObject "attachment" $ \object -> do
+  let expected = sort [K.fromText "sha256", K.fromText "size"]
+      actual = sort (KM.keys object)
+  unless (actual == expected) $
+    fail "attachment must contain exactly sha256 and size"
+  digest <- object .: "sha256"
+  size <- object .: "size"
+  case validateAttachment (Attachment digest size) of
+    Left message -> fail message
+    Right () -> pure (Attachment digest size)
+
+-- | Validate a canonical declaration list.  The input must already be
+-- strictly sorted and contain no duplicate digest.
+validateAttachments :: [Attachment] -> Either String [Attachment]
+validateAttachments attachments = do
+  forM_ attachments validateAttachment
+  let digests = map attachmentSha256 attachments
+  when (digests /= sort digests) $
+    Left "attachments must be sorted by sha256"
+  when (length digests /= length (nub digests)) $
+    Left "attachments must have unique sha256 digests"
+  pure attachments
+
+validateAttachment :: Attachment -> Either String ()
+validateAttachment attachment = do
+  let digest = attachmentSha256 attachment
+      validHex character = character >= '0' && character <= '9'
+        || character >= 'a' && character <= 'f'
+  unless (T.length digest == 64 && T.all validHex digest) $
+    Left "sha256 must be 64 lower-case hexadecimal characters"
+  unless (attachmentSize attachment >= 0) $
+    Left "attachment size must be non-negative"
+
+-- | Return a path whose final component has a fixed, non-traversable prefix.
+-- The task-id check mirrors the protocol grammar so callers cannot use this
+-- helper to accidentally turn an opaque identifier into a filesystem path.
+attachmentDirectory :: FilePath -> T.Text -> Either String FilePath
+attachmentDirectory root task = do
+  validateTaskToken task
+  pure (root </> ("task-" <> T.unpack task))
+
+attachmentPath :: FilePath -> T.Text -> Attachment -> Either String FilePath
+attachmentPath root task attachment = do
+  directory <- attachmentDirectory root task
+  validateAttachment attachment
+  pure (directory </> T.unpack (attachmentSha256 attachment))
+
+validateTaskToken :: T.Text -> Either String ()
+validateTaskToken task
+  | T.null task = Left "task_id must not be empty"
+  | T.any invalid task = Left "task_id contains an unsafe character"
+  | "--" `T.isInfixOf` task = Left "task_id may not contain --"
+  | otherwise = Right ()
+  where
+    valid character =
+      ('a' <= character && character <= 'z')
+        || ('A' <= character && character <= 'Z')
+        || ('0' <= character && character <= '9')
+        || character `elem` ("._-" :: String)
+    invalid character = not (valid character)
+
+-- | Stage all source files into a temporary directory and atomically publish
+-- the task directory.  A failed digest leaves no visible task directory.
+-- Existing destination directories are never removed or overwritten.
+stageAttachments :: FilePath -> FilePath -> T.Text
+                 -> [Attachment] -> IO (Either String ())
+stageAttachments attachmentRoot sourceRoot task attachments = do
+  validated <- pure (validateAttachments attachments)
+  case validated of
+    Left message -> pure (Left message)
+    Right [] -> pure (Right ())
+    Right declarations -> case attachmentDirectory attachmentRoot task of
+      Left message -> pure (Left message)
+      Right destination -> do
+        createDirectoryIfMissing True attachmentRoot
+        (temporary, handle) <- openBinaryTempFile attachmentRoot ".spool-attachment-stage"
+        hClose handle
+        removeFile temporary
+        createDirectoryIfMissing True temporary
+        result <- stageFiles temporary sourceRoot declarations
+          `onException` removeDirectoryRecursive temporary
+        case result of
+          Left message -> do
+            removeDirectoryRecursive temporary
+            pure (Left message)
+          Right () -> do
+            renameDirectory temporary destination
+              `onException` removeDirectoryRecursive temporary
+            pure (Right ())
+
+stageFiles :: FilePath -> FilePath -> [Attachment] -> IO (Either String ())
+stageFiles temporary sourceRoot declarations = do
+  go declarations
+  where
+    go [] = pure (Right ())
+    go (attachment : rest) = do
+      let source = sourceRoot </> T.unpack (attachmentSha256 attachment)
+          destination = temporary </> T.unpack (attachmentSha256 attachment)
+      checked <- copyVerified attachment source temporary destination
+      case checked of
+        Left message -> pure (Left message)
+        Right () -> go rest
+
+-- | Receive exactly one attachment stream into a worker directory.  The
+-- caller supplies a handle connected to the fetch response.  The destination
+-- is renamed only after both digest and size match the declaration.
+receiveAttachment :: FilePath -> Attachment -> Handle -> IO (Either String ())
+receiveAttachment workerAttachmentRoot attachment source = do
+  validated <- pure (validateAttachment attachment)
+  case validated of
+    Left message -> pure (Left message)
+    Right () -> do
+      createDirectoryIfMissing True workerAttachmentRoot
+      let destination = workerAttachmentRoot </> T.unpack (attachmentSha256 attachment)
+      (temporary, handle) <- openBinaryTempFile workerAttachmentRoot ".spool-attachment-receive"
+      result <- try (receiveInto handle source)
+      hClose handle
+      case result of
+        Left (exception :: IOException) -> do
+          removeFile temporary `finally` pure ()
+          ioError exception
+        Right checked -> case checked of
+          Left message -> do
+            removeFile temporary `finally` pure ()
+            pure (Left message)
+          Right () -> do
+            published <- try (renameFile temporary destination)
+            case published of
+              Left (exception :: IOException) -> do
+                removeFile temporary `finally` pure ()
+                ioError exception
+              Right () -> pure (Right ())
+  where
+    receiveInto handle sourceHandle = do
+      (context, size) <- copyStream sourceHandle handle hashInit 0
+      hFlush handle
+      pure (verifyDigest attachment context size)
+
+-- | Check an existing file without copying it.
+verifyAttachmentFile :: Attachment -> FilePath -> IO (Either String ())
+verifyAttachmentFile attachment path = do
+  validated <- pure (validateAttachment attachment)
+  case validated of
+    Left message -> pure (Left message)
+    Right () -> withBinaryFile path $ \handle -> do
+      (context, size) <- hashStream handle hashInit 0
+      pure (verifyDigest attachment context size)
+
+copyVerified :: Attachment -> FilePath -> FilePath -> FilePath -> IO (Either String ())
+copyVerified attachment source temporary destination = do
+  sourceHandle <- openBinaryFile source ReadMode
+  (temporaryFile, destinationHandle) <- openBinaryTempFile temporary ".spool-attachment-copy"
+  result <- try $ do
+    (context, size) <- copyStream sourceHandle destinationHandle hashInit 0
+    hFlush destinationHandle
+    pure (verifyDigest attachment context size)
+  hClose sourceHandle
+  hClose destinationHandle
+  case result of
+    Left (exception :: IOException) -> do
+      removeFile temporaryFile `finally` pure ()
+      ioError exception
+    Right (Left message) -> do
+      removeFile temporaryFile `finally` pure ()
+      pure (Left message)
+    Right (Right ()) -> do
+      renameFile temporaryFile destination
+      pure (Right ())
+
+withBinaryFile :: FilePath -> (Handle -> IO a) -> IO a
+withBinaryFile path action = bracket (openBinaryFile path ReadMode) hClose action
+
+hashStream :: Handle -> Context SHA256 -> Int64 -> IO (Context SHA256, Int64)
+hashStream handle context size = do
+  bytes <- BS.hGetSome handle (64 * 1024)
+  if BS.null bytes
+    then pure (context, size)
+    else do
+      nextSize <- checkedAdd size (fromIntegral (BS.length bytes))
+      hashStream handle (hashUpdate context bytes) nextSize
+
+copyStream :: Handle -> Handle -> Context SHA256 -> Int64
+           -> IO (Context SHA256, Int64)
+copyStream source destination context size = do
+  bytes <- BS.hGetSome source (64 * 1024)
+  if BS.null bytes
+    then pure (context, size)
+    else do
+      BS.hPut destination bytes
+      nextSize <- checkedAdd size (fromIntegral (BS.length bytes))
+      copyStream source destination (hashUpdate context bytes) nextSize
+
+checkedAdd :: Int64 -> Int64 -> IO Int64
+checkedAdd left right
+  | right > maxBound - left = ioError (userError "attachment exceeds Int64 size")
+  | otherwise = pure (left + right)
+
+verifyDigest :: Attachment -> Context SHA256 -> Int64 -> Either String ()
+verifyDigest attachment context size =
+  let digest = renderDigest (hashFinalize context :: Digest SHA256)
+  in if digest /= attachmentSha256 attachment
+       then Left "attachment sha256 does not match declaration"
+       else if size /= attachmentSize attachment
+         then Left "attachment size does not match declaration"
+         else Right ()
+
+renderDigest :: Digest SHA256 -> T.Text
+renderDigest digest =
+  TE.decodeUtf8 (BAE.convertToBase BAE.Base16 digest)
+
+-- | Delete a task's spool-owned attachment directory.  The operation is
+-- idempotent; callers that need crash recovery should perform their durable
+-- tombstone transition before invoking it.
+removeTaskAttachments :: FilePath -> T.Text -> IO ()
+removeTaskAttachments root task = do
+  directory <- either (ioError . userError) pure (attachmentDirectory root task)
+  removeDirectoryRecursive directory `catchMissing` pure ()
+
+-- | Workers attempt to remove their entire fresh working directory after
+-- every program exit.  Returning the exception lets the caller fail loudly
+-- instead of silently claiming cleanup that did not happen.
+attemptRemoveWorkerDirectory :: FilePath -> IO (Either IOException ())
+attemptRemoveWorkerDirectory directory = do
+  result <- try (removeDirectoryRecursive directory)
+  pure (case result of
+    Left exception | isMissing exception -> Right ()
+    Left exception -> Left exception
+    Right () -> Right ())
+
+catchMissing :: IO a -> IO a -> IO a
+catchMissing action fallback = do
+  result <- try action
+  case result of
+    Left (exception :: IOException) | isMissing exception -> fallback
+    Left exception -> ioError exception
+    Right value -> pure value
+
+isMissing :: IOException -> Bool
+isMissing = isDoesNotExistError

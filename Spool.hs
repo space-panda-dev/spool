@@ -31,7 +31,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.List (sort, sortOn)
+import Data.List (isPrefixOf, sort, sortOn)
 import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -42,13 +42,13 @@ import Data.Unique (hashUnique, newUnique)
 import System.Directory (createDirectoryIfMissing,
                          executable, getPermissions, getTemporaryDirectory,
                          listDirectory, removeDirectoryRecursive, removeFile,
-                         renameFile)
+                         removePathForcibly, renameDirectory, renameFile)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitSuccess, exitWith)
 import System.FilePath (isAbsolute, takeBaseName, takeDirectory,
                         takeExtension, (</>))
-import System.IO (Handle, IOMode (AppendMode), hClose, openBinaryTempFile,
-                  openFile, stderr)
+import System.IO (Handle, IOMode (AppendMode, ReadMode), hClose,
+                  openBinaryFile, openBinaryTempFile, openFile, stderr)
 import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus)
@@ -56,6 +56,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Process (CreateProcess (..), StdStream (CreatePipe),
                        createProcess, proc, terminateProcess,
                        waitForProcess)
+import qualified SpoolAttachments as SA
 
 type Object = KM.KeyMap A.Value
 
@@ -66,6 +67,8 @@ data Paths = Paths
   , doneDir :: FilePath
   , failedDir :: FilePath
   , resultsDir :: FilePath
+  , attachmentsDir :: FilePath
+  , attachmentCleanupDir :: FilePath
   , lockPath :: FilePath
   }
 
@@ -73,6 +76,7 @@ data Task = Task
   { taskId :: T.Text
   , taskCapability :: T.Text
   , taskPayload :: A.Value
+  , taskAttachments :: [SA.Attachment]
   } deriving (Eq, Show)
 
 data Lease = Lease
@@ -88,7 +92,7 @@ data AckStatus = Acked | AlreadyDone deriving (Eq, Show)
 
 data Command
   = Init
-  | Put
+  | Put (Maybe FilePath)
   | LeaseCommand T.Text Int
   | Ack
   | Reclaim Integer
@@ -97,6 +101,7 @@ data Command
   | Fail Bool
   | Failures
   | Results
+  | Fetch
   | Work T.Text FilePath (Maybe Int)
   | WorkShow FilePath
 
@@ -140,6 +145,7 @@ mainCommand = do
       Right (directory, Work worker configPath maxTasks) -> do
         let paths = makePaths directory
         initialise paths
+        withLock paths (recoverAttachmentState paths)
         runWork paths worker configPath maxTasks
       Right (directory, WorkShow configPath) -> do
         _ <- pure directory
@@ -156,13 +162,17 @@ parseCommand _ = Left usageText
 
 parseSubcommand :: [String] -> Either String Command
 parseSubcommand ["init"] = Right Init
-parseSubcommand ["put"] = Right Put
+parseSubcommand ["put"] = Right (Put Nothing)
+parseSubcommand ["put", "--attachments", directory]
+  | not (null directory) = Right (Put (Just directory))
+  | otherwise = Left "spool: --attachments requires a non-empty directory"
 parseSubcommand ["ack"] = Right Ack
 parseSubcommand ["renew"] = Right Renew
 parseSubcommand ["fail"] = Right (Fail True)
 parseSubcommand ["fail", "--no-retry"] = Right (Fail False)
 parseSubcommand ["failures"] = Right Failures
 parseSubcommand ["results"] = Right Results
+parseSubcommand ["fetch"] = Right Fetch
 parseSubcommand ["status"] = Right (Status False)
 parseSubcommand ["status", "--json"] = Right (Status True)
 parseSubcommand ["lease", "--worker", worker]
@@ -215,18 +225,19 @@ validWorker :: String -> Bool
 validWorker value = not (null value) && all (not . (`elem` ['\n', '\r', '\t', ' '])) value
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]\n       spool work --config FILE --show"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]\n       spool work --config FILE --show"
 
 runCommand :: Command -> Paths -> IO ()
 runCommand command paths = case command of
   Init -> pure ()
-  Put -> putTasks paths
+  Put source -> putTasks paths source
   LeaseCommand worker count -> leaseTasks paths worker count
   Ack -> ackTasks paths
   Renew -> renewTasks paths
   Fail retry -> failTasks retry paths
   Failures -> failuresCommand paths
   Results -> resultsCommand paths
+  Fetch -> fetchAttachment paths
   Reclaim age -> reclaimTasks paths age
   Status json -> statusTasks paths json
   Work {} -> error "unreachable: Work is dispatched before runCommand"
@@ -236,7 +247,7 @@ withStore :: FilePath -> (Paths -> IO ()) -> IO ()
 withStore directory action = do
   let paths = makePaths directory
   initialise paths
-  withLock paths (action paths)
+  withLock paths (recoverAttachmentState paths >> action paths)
 
 -- | The "work" command's concurrent tasks each take the store lock for
 -- their own transition, from separate green threads in this one process.
@@ -268,13 +279,48 @@ makePaths directory = Paths
   , doneDir = directory </> "done"
   , failedDir = directory </> "failed"
   , resultsDir = directory </> "results"
+  , attachmentsDir = directory </> "attachments"
+  , attachmentCleanupDir = directory </> ".attachment-cleanup"
   , lockPath = directory </> ".spool.lock"
   }
 
 initialise :: Paths -> IO ()
 initialise paths = mapM_ (createDirectoryIfMissing True)
   [rootDir paths, pendingDir paths, leasedDir paths, doneDir paths,
-   failedDir paths, resultsDir paths]
+   failedDir paths, resultsDir paths, attachmentsDir paths,
+   attachmentCleanupDir paths]
+
+-- | Finish interrupted attachment deletion and remove spool-owned copies for
+-- tasks which no longer have a pending or leased state. Recovery runs under
+-- the transition lock, so it cannot race a compliant put or resolution.
+recoverAttachmentState :: Paths -> IO ()
+recoverAttachmentState paths = do
+  cleanupNames <- listDirectory (attachmentCleanupDir paths)
+  mapM_ (removePathForcibly . (attachmentCleanupDir paths </>)) cleanupNames
+  pending <- jsonFiles (pendingDir paths) >>= mapM (fmap taskId . readTaskFile)
+  leased <- jsonFiles (leasedDir paths) >>= mapM (fmap taskId . readTaskFile)
+  let active = pending <> leased
+  names <- listDirectory (attachmentsDir paths)
+  forM_ names $ \name ->
+    if ".spool-attachment-stage" `isPrefixOf` name
+      then removePathForcibly (attachmentsDir paths </> name)
+      else case T.stripPrefix "task-" (T.pack name) of
+        Just ident | ident `notElem` active ->
+          tombstoneAndDelete paths ident
+        Just _ -> pure ()
+        Nothing -> throwFailure (SpoolFailure 70
+          ("unexpected entry in attachment store: " <> name))
+
+tombstoneAndDelete :: Paths -> T.Text -> IO ()
+tombstoneAndDelete paths ident = do
+  source <- either (throwFailure . SpoolFailure 70) pure
+    (SA.attachmentDirectory (attachmentsDir paths) ident)
+  present <- fileExists source
+  when present $ do
+    target <- either (throwFailure . SpoolFailure 70) pure
+      (SA.attachmentDirectory (attachmentCleanupDir paths) ident)
+    renameDirectory source target
+    removeDirectoryRecursive target
 
 failWith :: Int -> String -> IO a
 failWith code message = do
@@ -331,7 +377,7 @@ parseTask bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
-      rejectUnknown ["task_id", "capability", "payload"] object
+      rejectUnknown ["task_id", "capability", "payload", "attachments"] object
       ident <- requiredText "task_id" object
       validateTaskId ident
       capability <- requiredText "capability" object
@@ -339,7 +385,12 @@ parseTask bytes = do
       payload <- case KM.lookup "payload" object of
         Nothing -> Left "task is missing payload"
         Just value' -> Right value'
-      pure (Task ident capability payload)
+      attachments <- case KM.lookup "attachments" object of
+        Nothing -> Right []
+        Just value' -> case A.fromJSON value' of
+          A.Error message -> Left message
+          A.Success declarations -> SA.validateAttachments declarations
+      pure (Task ident capability payload attachments)
     _ -> Left "task must be a JSON object"
 
 parseAck :: BL.ByteString -> Either String (T.Text, T.Text, A.Value)
@@ -371,6 +422,21 @@ parseFail bytes = do
       validateLeaseId lease
       pure (ident, lease, reason)
     _ -> Left "fail must be a JSON object"
+
+parseFetchRequest :: BL.ByteString -> Either String (T.Text, T.Text, T.Text)
+parseFetchRequest bytes = do
+  value <- A.eitherDecode bytes
+  case value of
+    A.Object object -> do
+      rejectUnknown ["task_id", "lease_id", "sha256"] object
+      ident <- requiredText "task_id" object
+      lease <- requiredText "lease_id" object
+      digest <- requiredText "sha256" object
+      validateTaskId ident
+      validateLeaseId lease
+      _ <- SA.validateAttachments [SA.Attachment digest 0]
+      pure (ident, lease, digest)
+    _ -> Left "fetch request must be a JSON object"
 
 requiredText :: T.Text -> Object -> Either String T.Text
 requiredText key object = case KM.lookup (K.fromText key) object of
@@ -409,6 +475,7 @@ encodeTask task = canonical (A.object
   [ "task_id" .= taskId task
   , "capability" .= taskCapability task
   , "payload" .= taskPayload task
+  , "attachments" .= taskAttachments task
   ])
 
 encodePutResult :: Task -> PutStatus -> BL.ByteString
@@ -427,6 +494,7 @@ encodeLease lease = canonical (A.object
   , "worker" .= leaseWorker lease
   , "leased_at" .= leaseTime lease
   , "payload" .= taskPayload (leaseTask lease)
+  , "attachments" .= taskAttachments (leaseTask lease)
   ])
 
 encodeAckResult :: T.Text -> AckStatus -> BL.ByteString
@@ -534,22 +602,23 @@ isBlank = all (`elem` [' ', '\t', '\r', '\n']) . BLC.unpack
 inputLines :: IO [BL.ByteString]
 inputLines = filter (not . isBlank) . BLC.lines <$> BL.getContents
 
-putTasks :: Paths -> IO ()
-putTasks paths = do
+putTasks :: Paths -> Maybe FilePath -> IO ()
+putTasks paths sourceDirectory = do
   linesIn <- inputLines
   forM_ linesIn $ \line -> do
     task <- parseTaskLine line
-    result <- putOne paths task
+    result <- putOne paths sourceDirectory task
     BLC.putStrLn (encodePutResult task result)
 
-putOne :: Paths -> Task -> IO PutStatus
-putOne paths task = do
+putOne :: Paths -> Maybe FilePath -> Task -> IO PutStatus
+putOne paths sourceDirectory task = do
   existing <- findTask paths task
   case existing of
     Just True -> pure PutExisting
     Just False -> throwFailure (SpoolFailure 3
       ("task " <> T.unpack (taskId task) <> " already exists with different content"))
     Nothing -> do
+      stageTaskAttachments paths sourceDirectory task
       let path = pendingDir paths </> T.unpack (taskId task) <> ".json"
       created <- atomicCreate path (encodeTask task)
       if created
@@ -561,6 +630,17 @@ putOne paths task = do
             Just False -> throwFailure (SpoolFailure 3
               ("task " <> T.unpack (taskId task) <> " already exists with different content"))
             Nothing -> throwFailure (SpoolFailure 75 "could not create pending task")
+
+stageTaskAttachments :: Paths -> Maybe FilePath -> Task -> IO ()
+stageTaskAttachments _ _ task | null (taskAttachments task) = pure ()
+stageTaskAttachments _ Nothing _ = throwFailure (SpoolFailure 2
+  "tasks declaring attachments require put --attachments DIR")
+stageTaskAttachments paths (Just sourceDirectory) task = do
+  result <- SA.stageAttachments (attachmentsDir paths) sourceDirectory
+    (taskId task) (taskAttachments task)
+  case result of
+    Left message -> throwFailure (SpoolFailure 2 message)
+    Right () -> pure ()
 
 -- True means an equal task was found; False means the id was found with
 -- different content. The leased and done directories are intentionally
@@ -851,6 +931,7 @@ ackOne paths ident leaseIdent output = do
               case moved of
                 Right () -> do
                   removeSidecars paths leaseIdent
+                  tombstoneAndDelete paths (taskId task)
                   pure (Right Acked)
                 Left exception
                   | isDoesNotExistError exception -> do
@@ -965,6 +1046,7 @@ failLease paths ident leaseIdent reason retry = do
           when retry (returnToPending paths task)
           removeFile source
           removeSidecars paths leaseIdent
+          unless retry (tombstoneAndDelete paths (taskId task))
           pure (Right retry)
 
 -- | Recreate a task in pending/, exactly as reclaim does: idempotent if an
@@ -996,6 +1078,31 @@ resultsCommand paths = do
   files <- jsonFiles (resultsDir paths)
   records <- mapM (fmap fst . readResultRecordFile) files
   mapM_ (BLC.putStrLn . canonical) (oldestFirst "finished_at" records)
+
+fetchAttachment :: Paths -> IO ()
+fetchAttachment paths = do
+  bytes <- BL.getContents
+  (ident, leaseIdent, digest) <- case parseFetchRequest bytes of
+    Left message -> throwFailure (SpoolFailure 2 message)
+    Right request -> pure request
+  let leasePath = leasedDir paths </> T.unpack leaseIdent <> ".json"
+  present <- fileExists leasePath
+  unless present (throwFailure (SpoolFailure 4 "lease is unknown or stale"))
+  task <- readTaskFile leasePath
+  unless (taskId task == ident)
+    (throwFailure (SpoolFailure 4 "lease does not belong to task_id"))
+  attachment <- case
+      [declaration | declaration <- taskAttachments task,
+        SA.attachmentSha256 declaration == digest] of
+    declaration : _ -> pure declaration
+    [] -> throwFailure (SpoolFailure 2 "attachment is not declared by the task")
+  path <- either (throwFailure . SpoolFailure 70) pure
+    (SA.attachmentPath (attachmentsDir paths) ident attachment)
+  verified <- SA.verifyAttachmentFile attachment path
+  case verified of
+    Left message -> throwFailure (SpoolFailure 70
+      ("corrupt attachment for " <> T.unpack ident <> ": " <> message))
+    Right () -> BL.readFile path >>= BL.putStr
 
 oldestFirst :: T.Text -> [A.Value] -> [A.Value]
 oldestFirst key records = map snd (sortOn fst [(extractTextField key record, record) | record <- records])
@@ -1279,9 +1386,10 @@ runExecutable paths config task leaseIdent worker capConfig payloadBytes = do
   renewalThreadId <- forkIO
     (renewalLoop paths (taskId task) leaseIdent (wcRenewSeconds config)
       renewalFailure)
-  outcome <- runCapability capConfig (wcEnv config) tempDir payloadBytes
-    `finally` killThread renewalThreadId
-  removeDirectoryRecursive tempDir
+  outcome <- (do
+      receiveTaskAttachments paths task tempDir
+      runCapability capConfig (wcEnv config) tempDir payloadBytes)
+    `finally` (killThread renewalThreadId >> removeWorkerDirectory tempDir)
   renewalError <- tryReadMVar renewalFailure
   case renewalError of
     Just message -> throwFailure (SpoolFailure 4
@@ -1291,6 +1399,27 @@ runExecutable paths config task leaseIdent worker capConfig payloadBytes = do
       RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
         Left _ -> completeFailure paths (taskId task) leaseIdent "output is not JSON" True
         Right outputValue -> completeSuccess paths task leaseIdent worker outputValue
+
+receiveTaskAttachments :: Paths -> Task -> FilePath -> IO ()
+receiveTaskAttachments paths task tempDir = do
+  let workerAttachmentRoot = tempDir </> "attachments"
+  forM_ (taskAttachments task) $ \attachment -> do
+    source <- either (throwFailure . SpoolFailure 70) pure
+      (SA.attachmentPath (attachmentsDir paths) (taskId task) attachment)
+    bracket (openBinaryFile source ReadMode) hClose $ \handle -> do
+      received <- SA.receiveAttachment workerAttachmentRoot attachment handle
+      case received of
+        Left message -> throwFailure (SpoolFailure 70
+          ("attachment verification failed for " <> T.unpack (taskId task)
+            <> ": " <> message))
+        Right () -> pure ()
+
+removeWorkerDirectory :: FilePath -> IO ()
+removeWorkerDirectory directory = do
+  removed <- SA.attemptRemoveWorkerDirectory directory
+  case removed of
+    Left exception -> ioError exception
+    Right () -> pure ()
 
 renewalLoop :: Paths -> T.Text -> T.Text -> Int -> MVar String -> IO ()
 renewalLoop paths taskIdent leaseIdent renewSeconds failure = do

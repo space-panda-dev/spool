@@ -11,8 +11,9 @@ check() { checks=$((checks + 1)); }
 spool_binary=${SPOOL:-$work/spool-bin}
 if [[ -z ${SPOOL:-} ]]; then
   ghc_flags=(-O1 -threaded -Wall -Werror
-    -package aeson -package bytestring -package directory -package filepath
-    -package process -package text -package time -package unix)
+    -package aeson -package bytestring -package crypton -package directory
+    -package filepath -package memory -package process -package text -package time
+    -package unix)
   if [[ -n ${SPOOL_GHC_PACKAGE_ENV:-} ]]; then
     ghc_flags+=(-package-env "$SPOOL_GHC_PACKAGE_ENV")
   fi
@@ -613,4 +614,116 @@ spoolw status --json | jq -e '.pending == 0' >/dev/null; check
 "$spool_binary" --dir "$work/workspool" work --worker w1 --config "$work/success-config.json"
 expect_exit 1 spoolw lease --worker nobody
 
-printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, configured executor lifecycle, resource/concurrency limits (%d checks)\n' "$checks"
+#############################################################################
+# Attachments: declarations survive the envelope boundary, bytes are verified
+# on staging/fetch/worker receipt, and spool-owned copies share task lifetime.
+#############################################################################
+
+spoola() { "$spool_binary" --dir "$work/attachment-spool" "$@"; }
+spoola init
+attachment_source="$work/attachment-source"
+mkdir -p "$attachment_source"
+printf 'attachment bytes\n' > "$work/attachment-body"
+if command -v sha256sum >/dev/null 2>&1; then
+  attachment_digest=$(sha256sum "$work/attachment-body" | awk '{print $1}')
+else
+  attachment_digest=$(shasum -a 256 "$work/attachment-body" | awk '{print $1}')
+fi
+attachment_size=$(wc -c < "$work/attachment-body" | tr -d ' ')
+cp "$work/attachment-body" "$attachment_source/$attachment_digest"
+attachment_task=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"attachment-one",capability:"attachment@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$attachment_task" | spoola put --attachments "$attachment_source" \
+  | jq -e '.status == "inserted"' >/dev/null; check
+jq -e --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '.attachments == [{sha256:$digest,size:$size}]' \
+  "$work/attachment-spool/pending/attachment-one.json" >/dev/null; check
+
+spoola lease --worker attachment-worker > "$work/attachment-lease.jsonl"
+attachment_lease=$(jq -r '.lease_id' "$work/attachment-lease.jsonl")
+jq -e --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '.attachments == [{sha256:$digest,size:$size}]' \
+  "$work/attachment-lease.jsonl" >/dev/null; check
+attachment_fetch=$(jq -nc --arg digest "$attachment_digest" --arg lease "$attachment_lease" \
+  '{task_id:"attachment-one",lease_id:$lease,sha256:$digest}')
+printf '%s\n' "$attachment_fetch" | spoola fetch > "$work/attachment-received"
+cmp "$work/attachment-body" "$work/attachment-received"; check
+
+# Retry and reclaim keep the task-scoped bytes; only resolution removes them.
+attachment_failure=$(jq -nc --arg lease "$attachment_lease" \
+  '{task_id:"attachment-one",lease_id:$lease,reason:"retry"}')
+printf '%s\n' "$attachment_failure" | spoola fail >/dev/null
+test -f "$work/attachment-spool/attachments/task-attachment-one/$attachment_digest"; check
+spoola lease --worker attachment-worker > "$work/attachment-retry.jsonl"
+attachment_retry_lease=$(jq -r '.lease_id' "$work/attachment-retry.jsonl")
+spoola reclaim --older-than 0 >/dev/null
+test -f "$work/attachment-spool/attachments/task-attachment-one/$attachment_digest"; check
+spoola lease --worker attachment-worker > "$work/attachment-final.jsonl"
+attachment_final_lease=$(jq -r '.lease_id' "$work/attachment-final.jsonl")
+attachment_ack=$(jq -nc --arg lease "$attachment_final_lease" \
+  '{task_id:"attachment-one",lease_id:$lease,result:{received:true}}')
+printf '%s\n' "$attachment_ack" | spoola ack >/dev/null
+test ! -e "$work/attachment-spool/attachments/task-attachment-one"; check
+spoola results | jq -e 'select(.task_id == "attachment-one" and .result == {received:true})' >/dev/null; check
+
+# An equal resolved put is a no-op and does not need the source files again.
+rm "$attachment_source/$attachment_digest"
+printf '%s\n' "$attachment_task" | spoola put \
+  | jq -e '.status == "existing"' >/dev/null; check
+
+# A declaration mismatch never publishes a pending task or staged directory.
+bad_attachment=$(jq -nc --arg digest "$attachment_digest" --argjson size "$((attachment_size + 1))" \
+  '{task_id:"attachment-bad",capability:"attachment@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+cp "$work/attachment-body" "$attachment_source/$attachment_digest"
+set +e
+printf '%s\n' "$bad_attachment" | spoola put --attachments "$attachment_source" >/dev/null 2>&1
+bad_attachment_exit=$?
+set -e
+test "$bad_attachment_exit" -eq 2; check
+test ! -e "$work/attachment-spool/pending/attachment-bad.json"; check
+test ! -e "$work/attachment-spool/attachments/task-attachment-bad"; check
+
+# The worker receives verified bytes below attachments/SHA256 and its result
+# follows the ordinary result-bearing acknowledgement path.
+cat > "$bin/read-attachment" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+test "\$(cat attachments/$attachment_digest)" = "attachment bytes"
+printf '{"attachment":true}\n'
+SCRIPT
+chmod +x "$bin/read-attachment"
+worker_attachment_task=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"attachment-work",capability:"attachment@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$worker_attachment_task" | spoola put --attachments "$attachment_source" >/dev/null
+worker_config "attachment@1" "$bin/read-attachment" 5 1024 > "$work/attachment-config.json"
+spoola work --worker attachment-worker --config "$work/attachment-config.json" --max-tasks 1
+spoola results | jq -e 'select(.task_id == "attachment-work" and .result == {attachment:true})' >/dev/null; check
+test ! -e "$work/attachment-spool/attachments/task-attachment-work"; check
+
+# A stored-byte mismatch is corrupt durable state and emits no partial body.
+corrupt_task=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"attachment-corrupt",capability:"attachment@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$corrupt_task" | spoola put --attachments "$attachment_source" >/dev/null
+spoola lease --worker attachment-worker > "$work/attachment-corrupt-lease.jsonl"
+corrupt_attachment_lease=$(jq -r '.lease_id' "$work/attachment-corrupt-lease.jsonl")
+printf 'changed bytes\n' > "$work/attachment-spool/attachments/task-attachment-corrupt/$attachment_digest"
+corrupt_fetch=$(jq -nc --arg digest "$attachment_digest" --arg lease "$corrupt_attachment_lease" \
+  '{task_id:"attachment-corrupt",lease_id:$lease,sha256:$digest}')
+set +e
+printf '%s\n' "$corrupt_fetch" | spoola fetch > "$work/corrupt-fetch.out" 2>/dev/null
+corrupt_fetch_exit=$?
+set -e
+test "$corrupt_fetch_exit" -eq 70; check
+test ! -s "$work/corrupt-fetch.out"; check
+
+# Old task records remain readable when the new optional field is absent.
+old_task='{"task_id":"old-task-shape","capability":"old@1","payload":{}}'
+printf '%s\n' "$old_task" | spoola put >/dev/null
+jq 'del(.attachments)' "$work/attachment-spool/pending/old-task-shape.json" \
+  > "$work/old-task-shape.json"
+mv "$work/old-task-shape.json" "$work/attachment-spool/pending/old-task-shape.json"
+spoola lease --worker compatibility > "$work/old-task-lease.jsonl"
+jq -e '.task_id == "old-task-shape" and .attachments == []' \
+  "$work/old-task-lease.jsonl" >/dev/null; check
+
+printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, configured executor lifecycle, resource/concurrency limits (%d checks)\n' "$checks"
