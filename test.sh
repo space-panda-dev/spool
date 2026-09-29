@@ -912,6 +912,45 @@ spoola lease --worker compatibility > "$work/old-task-lease.jsonl"
 jq -e '.task_id == "old-task-shape" and .attachments == []' \
   "$work/old-task-lease.jsonl" >/dev/null; check
 
+# A put killed while staging leaves its staging directory behind, and the next
+# command clears it. The leftover is the real writer's own: the source is a
+# pipe held open here, so put has made the directory and is waiting for bytes
+# when it is killed.
+spooli() { "$spool_binary" --dir "$work/interrupted-stage" "$@"; }
+spooli init
+stage_source="$work/interrupted-stage-source"
+mkdir -p "$stage_source"
+stage_digest=$(printf '0%.0s' {1..64})
+mkfifo "$stage_source/$stage_digest"
+exec 9<>"$stage_source/$stage_digest"
+jq -nc --arg digest "$stage_digest" \
+  '{task_id:"interrupted-stage",capability:"attach@1",payload:{},attachments:[{sha256:$digest,size:1}]}' \
+  > "$work/interrupted-stage-task.jsonl"
+"$spool_binary" --dir "$work/interrupted-stage" put --attachments "$stage_source" \
+  < "$work/interrupted-stage-task.jsonl" >/dev/null 2>&1 &
+stage_put_pid=$!
+i=0
+while [ -z "$(ls -A "$work/interrupted-stage/attachments")" ] && [ "$i" -lt 100 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+kill -9 "$stage_put_pid"
+set +e
+wait "$stage_put_pid" 2>/dev/null
+set -e
+exec 9>&-
+test -n "$(ls -A "$work/interrupted-stage/attachments")"; check
+spooli status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+test -z "$(ls -A "$work/interrupted-stage/attachments")"; check
+
+# A task whose ID ends like a staging directory keeps its attachments: only
+# the writer's own leftovers are cleared.
+lookalike_task=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"lookalike.spool-attachment-stage",capability:"attach@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$lookalike_task" | spooli put --attachments "$attachment_source" >/dev/null
+spooli status >/dev/null
+test -f "$work/interrupted-stage/attachments/task-lookalike.spool-attachment-stage/$attachment_digest"; check
+
 #############################################################################
 # Grants and the SSH boundary: the account record supplies both spool and
 # worker, every remote word reaches only its named handler, and revoke fences.

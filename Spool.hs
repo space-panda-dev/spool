@@ -32,7 +32,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.List (isPrefixOf, sort, sortOn)
+import Data.List (sort, sortOn)
 import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -326,7 +326,7 @@ recoverAttachmentState paths = do
   let active = pending <> leased
   names <- listDirectory (attachmentsDir paths)
   forM_ names $ \name ->
-    if ".spool-attachment-stage" `isPrefixOf` name
+    if SA.isStagingLeftover name
       then removePathForcibly (attachmentsDir paths </> name)
       else case T.stripPrefix "task-" (T.pack name) of
         Just ident | ident `notElem` active ->

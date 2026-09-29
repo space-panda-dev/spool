@@ -16,6 +16,7 @@ module SpoolAttachments
   , attachmentDirectory
   , attachmentPath
   , stageAttachments
+  , isStagingLeftover
   , receiveAttachment
   , verifyAttachmentFile
   , removeTaskAttachments
@@ -34,7 +35,7 @@ import qualified Data.Aeson.Types as AT
 import qualified Data.ByteArray.Encoding as BAE
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
-import Data.List (nub, sort)
+import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive,
@@ -125,6 +126,20 @@ validateTaskToken task
         || character `elem` ("._-" :: String)
     invalid character = not (valid character)
 
+-- | The template for a staging directory's name.  The name itself is the
+-- system's to choose, and it puts its unique part in front of a template that
+-- begins with a dot: "12345-0.spool-attachment-stage".
+stagingTemplate :: String
+stagingTemplate = ".spool-attachment-stage"
+
+-- | Whether an entry in the attachment root is a staging directory left by an
+-- interrupted put.  The template is looked for anywhere in the name, so the
+-- answer does not rest on where the system puts its unique part.  A task's
+-- own directory is never one, whatever its ID contains.
+isStagingLeftover :: FilePath -> Bool
+isStagingLeftover name =
+  stagingTemplate `isInfixOf` name && not ("task-" `isPrefixOf` name)
+
 -- | Stage all source files into a temporary directory and atomically publish
 -- the task directory.  A failed digest leaves no visible task directory.
 -- Existing destination directories are never removed or overwritten.
@@ -139,7 +154,7 @@ stageAttachments attachmentRoot sourceRoot task attachments = do
       Left message -> pure (Left message)
       Right destination -> do
         createDirectoryIfMissing True attachmentRoot
-        (temporary, handle) <- openBinaryTempFile attachmentRoot ".spool-attachment-stage"
+        (temporary, handle) <- openBinaryTempFile attachmentRoot stagingTemplate
         hClose handle
         removeFile temporary
         createDirectoryIfMissing True temporary
