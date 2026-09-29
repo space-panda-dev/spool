@@ -18,7 +18,10 @@ it, and any unrelated program can.
   is put on it. Putting a task is telling them. Keep one spool per audience:
   one for your own machines, one for a friend who shares compute.
 - **The worker's owner decides what runs.** A friend's machine runs only the
-  capabilities its owner configured, under their limits.
+  capabilities its owner configured, under Spool's own limits on concurrency,
+  timeout, payload size, and output size. Those bound Spool's behaviour, not
+  the executable's; containing what a program can do to the machine it runs
+  on is the owner's job, not Spool's.
 - **Coordination, not a record.** A spool remembers what is pending, leased,
   done, and failed so work survives crashes. Anything that must last is made
   from its results by whoever asked.

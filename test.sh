@@ -356,13 +356,24 @@ exit 3
 SCRIPT
 chmod +x "$bin/crash-three"
 
-cat > "$bin/sleeper" <<'SCRIPT'
+grandchild_pidfile="$work/grandchild-pid"
+cat > "$bin/sleeper" <<SCRIPT
 #!/bin/sh
 cat >/dev/null
+# A grandchild in the same process group, so the timeout kill can be proven
+# to reach more than the immediate child.
+sh -c 'echo \$\$ > "$grandchild_pidfile"; sleep 30' &
 sleep 5
 printf '{"slept":true}\n'
 SCRIPT
 chmod +x "$bin/sleeper"
+
+cat > "$bin/big-output" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+yes 0123456789 | head -c 200000
+SCRIPT
+chmod +x "$bin/big-output"
 
 cat > "$bin/env-check" <<'SCRIPT'
 #!/bin/sh
@@ -427,11 +438,12 @@ SCRIPT
 chmod +x "$bin/wait-for-late-release"
 
 worker_config() {
-  # worker_config CAPABILITY EXEC TIMEOUT MAXBYTES [MAX_CONCURRENT]
+  # worker_config CAPABILITY EXEC TIMEOUT MAXBYTES [MAX_CONCURRENT] [MAX_OUTPUT_BYTES]
   jq -nc --arg cap "$1" --arg exec "$2" --argjson timeout "$3" --argjson maxbytes "$4" \
-    --argjson concurrent "${5:-1}" \
+    --argjson concurrent "${5:-1}" --argjson maxoutput "${6:-65536}" \
     '{max_concurrent: $concurrent, renew_seconds: 30, env: {PATH: "/usr/bin:/bin"},
-      capabilities: {($cap): {exec: $exec, args: [], timeout_seconds: $timeout, max_payload_bytes: $maxbytes}}}'
+      capabilities: {($cap): {exec: $exec, args: [], timeout_seconds: $timeout,
+        max_payload_bytes: $maxbytes, max_output_bytes: $maxoutput}}}'
 }
 
 spoolw() { "$spool_binary" --dir "$work/workspool" "$@"; }
@@ -461,6 +473,7 @@ echo "$show_output" | jq -e \
    and .capabilities["classify@1"].exec == "'"$bin"'/echo-classify"
    and .capabilities["classify@1"].timeout_seconds == 5
    and .capabilities["classify@1"].max_payload_bytes == 1024
+   and .capabilities["classify@1"].max_output_bytes == 65536
    and .capabilities["classify@1"].args == []' >/dev/null
 check
 
@@ -520,6 +533,39 @@ spoolw failures | jq -s --arg task work-timeout -e \
    and (.[0].reason | test("timeout after 1 s"))' >/dev/null
 check
 drain_pending "work-timeout"
+
+# The timeout kill reaches the whole process group, not just the immediate
+# child: the grandchild the sleeper script forked does not outlive it.
+i=0
+while [ ! -s "$grandchild_pidfile" ] && [ "$i" -lt 50 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+test -s "$grandchild_pidfile"; check
+grandchild_pid=$(cat "$grandchild_pidfile")
+grandchild_dead=1
+i=0
+while [ "$i" -lt 50 ]; do
+  if ! kill -0 "$grandchild_pid" 2>/dev/null; then
+    grandchild_dead=0
+    break
+  fi
+  sleep 0.1
+  i=$((i + 1))
+done
+test "$grandchild_dead" -eq 0; check
+
+# Output past max_output_bytes fails with retry and names the limit, rather
+# than growing the worker's memory to hold a runaway capability's output.
+output_task='{"task_id":"work-output-cap","capability":"bigoutput@1","payload":{}}'
+printf '%s\n' "$output_task" | spoolw put >/dev/null
+worker_config "bigoutput@1" "$bin/big-output" 5 1024 1 4096 > "$work/output-cap-config.json"
+spoolw work --worker w1 --config "$work/output-cap-config.json" --max-tasks 1
+spoolw failures | jq -s --arg task work-output-cap -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].retried == true
+   and (.[0].reason | test("max_output_bytes"))' >/dev/null
+check
+drain_pending "work-output-cap"
 
 # The environment is exactly the configured one: no caller HOME leaks through.
 envcheck_task='{"task_id":"work-envcheck","capability":"envcheck@1","payload":{}}'

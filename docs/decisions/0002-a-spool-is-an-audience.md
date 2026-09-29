@@ -27,10 +27,13 @@ disclosed.
 
 **The worker's owner decides what runs.** Each worker's configuration maps
 capability names to programs its owner installed, with a timeout, a payload
-limit, a concurrency limit, and the complete environment each program gets. A
-task naming anything else is refused, after the worker has already seen it:
-what a worker is configured to run never narrows who can read the spool. Sharing capacity never hands over
-control of the machine.
+limit, an output limit, a concurrency limit, and the complete environment each
+program gets. A task naming anything else is refused, after the worker has
+already seen it: what a worker is configured to run never narrows who can
+read the spool. Sharing capacity never hands over control of the machine.
+These are limits Spool itself enforces on a run, not resource isolation: an
+owner who needs CPU, memory, or filesystem containment wraps their executable
+with it themselves.
 
 ## Rejected
 

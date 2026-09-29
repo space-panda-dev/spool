@@ -29,7 +29,7 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.List (isPrefixOf, sort, sortOn)
 import Data.Maybe (listToMaybe)
@@ -55,10 +55,10 @@ import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus, setFileMode)
 import qualified System.Posix.Env.ByteString as PosixEnv
+import System.Posix.Signals (sigTERM, signalProcess)
 import System.IO.Unsafe (unsafePerformIO)
-import System.Process (CreateProcess (..), StdStream (CreatePipe),
-                       createProcess, proc, terminateProcess,
-                       waitForProcess)
+import System.Process (CreateProcess (..), ProcessHandle, StdStream (CreatePipe),
+                       createProcess, getPid, proc, waitForProcess)
 import qualified SpoolAttachments as SA
 import qualified SpoolAccess as Access
 
@@ -121,6 +121,7 @@ data CapabilityConfig = CapabilityConfig
   , capArgs :: [String]
   , capTimeoutSeconds :: Int
   , capMaxPayloadBytes :: Int64
+  , capMaxOutputBytes :: Int64
   } deriving (Eq, Show)
 
 data WorkConfig = WorkConfig
@@ -1464,7 +1465,11 @@ ensureRemoteAckOwner paths worker reference@(_, leaseIdent) = do
 
 --------------------------------------------------------------------------
 -- Worker: maps a capability to a locally configured executable and runs
--- leased tasks under an inspectable, resource-limited configuration.
+-- leased tasks under Spool's own declared limits: concurrency, timeout,
+-- payload size, and captured output size. These bound what Spool itself
+-- does, not what the executable can do to the machine it runs on -- there
+-- is no CPU/memory/file-size containment or sandbox. A capability owner who
+-- needs that wraps their executable (rlimits, a container, a VM) themselves.
 --------------------------------------------------------------------------
 
 runWorkShow :: FilePath -> IO ()
@@ -1599,14 +1604,17 @@ parseCapabilityEntry key value = do
   validateCapability capText
   case value of
     A.Object object -> do
-      rejectUnknown ["exec", "args", "timeout_seconds", "max_payload_bytes"] object
+      rejectUnknown
+        ["exec", "args", "timeout_seconds", "max_payload_bytes", "max_output_bytes"]
+        object
       execPath <- requiredCapText "exec" object
       unless (isAbsolute (T.unpack execPath))
         (Left (T.unpack capText <> ": exec must be an absolute path"))
       args <- optionalArgList object
       timeoutSeconds <- positiveIntField "timeout_seconds" Nothing object
       maxPayload <- positiveInt64Field "max_payload_bytes" object
-      pure (key, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload)
+      maxOutput <- positiveInt64Field "max_output_bytes" object
+      pure (key, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload maxOutput)
     _ -> Left (T.unpack capText <> " must be an object")
 
 checkExecutables :: WorkConfig -> IO (Either String ())
@@ -1648,6 +1656,7 @@ encodeCapabilityConfig capConfig = A.object
   , "args" .= capArgs capConfig
   , "timeout_seconds" .= capTimeoutSeconds capConfig
   , "max_payload_bytes" .= capMaxPayloadBytes capConfig
+  , "max_output_bytes" .= capMaxOutputBytes capConfig
   ]
 
 -- | Run one already-leased task to completion: refuse it outright if its
@@ -1746,8 +1755,12 @@ freshTempDir = do
   pure path
 
 -- | Run one capability executable with the given environment, cwd, and
--- stdin payload, killing it (and reporting a timeout) if it outlives
--- `capTimeoutSeconds`.
+-- stdin payload. It runs in its own process group (`create_group`), killed
+-- (and reporting a timeout) if it outlives `capTimeoutSeconds`, or (and
+-- reporting an overrun) if either stream's captured output outlives
+-- `capMaxOutputBytes`. Killing the group, not just the immediate process,
+-- reaches a descendant that would otherwise survive and keep the pipes
+-- open.
 runCapability :: CapabilityConfig -> [(String, String)] -> FilePath -> BL.ByteString -> IO RunOutcome
 runCapability capConfig envPairs cwdPath payload = do
   (Just hin, Just hout, Just herr, ph) <- createProcess (proc (capExec capConfig) (capArgs capConfig))
@@ -1756,20 +1769,24 @@ runCapability capConfig envPairs cwdPath payload = do
     , std_in = CreatePipe
     , std_out = CreatePipe
     , std_err = CreatePipe
+    , create_group = True
     }
   inputResult <- try (BL.hPut hin payload >> hClose hin)
     :: IO (Either IOException ())
+  let limit = capMaxOutputBytes capConfig
+      -- The child may exit between a limit firing and termination. That
+      -- process race is the only error intentionally ignored here.
+      kill = ignoreProcessRace (terminateGroup ph)
   outVar <- newEmptyMVar
   errVar <- newEmptyMVar
-  _ <- forkIO (readerThread hout outVar)
-  _ <- forkIO (readerThread herr errVar)
+  outputExceeded <- newIORef False
+  _ <- forkIO (readerThread limit outputExceeded kill hout outVar)
+  _ <- forkIO (readerThread limit outputExceeded kill herr errVar)
   timedOut <- newIORef False
   watchdog <- forkIO $ do
     threadDelay (capTimeoutSeconds capConfig * 1000000)
     writeIORef timedOut True
-    -- The child may exit between the watchdog firing and termination. That
-    -- process race is the only error intentionally ignored here.
-    ignoreProcessRace (terminateProcess ph)
+    kill
   exitCode <- waitForProcess ph
   killThread watchdog
   outResult <- readMVar outVar
@@ -1777,20 +1794,56 @@ runCapability capConfig envPairs cwdPath payload = do
   outBytes <- either ioError pure outResult
   errBytes <- either ioError pure errResult
   isTimeout <- readIORef timedOut
+  isOutputExceeded <- readIORef outputExceeded
   pure $ case inputResult of
     Left exception -> RunFailure
       ("could not write payload: " <> T.pack (displayException exception))
     Right () | isTimeout ->
       RunFailure ("timeout after " <> T.pack (show (capTimeoutSeconds capConfig)) <> " s")
+    Right () | isOutputExceeded ->
+      RunFailure ("output exceeds max_output_bytes " <> T.pack (show limit))
     Right () -> case exitCode of
       ExitSuccess -> RunSuccess (BL.fromStrict outBytes)
       ExitFailure n -> RunFailure
         ("exit " <> T.pack (show n) <> ": " <> decodeLenient (tailBytes 1000 errBytes))
 
-readerThread :: Handle -> MVar (Either IOException BS.ByteString) -> IO ()
-readerThread handle var = do
-  result <- try (BS.hGetContents handle) :: IO (Either IOException BS.ByteString)
+-- | Send SIGTERM to the negative of the child's pid, i.e. every process in
+-- its group, not just the one Spool exec'd. `getPid` returns Nothing once
+-- the process handle has already been reaped, which this treats as nothing
+-- left to signal.
+terminateGroup :: ProcessHandle -> IO ()
+terminateGroup ph = do
+  running <- getPid ph
+  case running of
+    Nothing -> pure ()
+    Just pid -> signalProcess sigTERM (negate pid)
+
+readerThread
+  :: Int64 -> IORef Bool -> IO () -> Handle -> MVar (Either IOException BS.ByteString) -> IO ()
+readerThread limit exceededRef kill handle var = do
+  result <- try (readCapped limit exceededRef kill handle) :: IO (Either IOException BS.ByteString)
   putMVar var result
+
+-- | Read a handle to EOF in chunks, stopping (and killing the process) the
+-- moment the total exceeds `limit`, so a capability that writes without
+-- bound cannot grow the worker's memory without bound either.
+readCapped :: Int64 -> IORef Bool -> IO () -> Handle -> IO BS.ByteString
+readCapped limit exceededRef kill handle = go [] 0
+  where
+    chunkSize = 65536
+    go chunks total = do
+      chunk <- BS.hGetSome handle chunkSize
+      if BS.null chunk
+        then pure (BS.concat (reverse chunks))
+        else do
+          let total' = total + fromIntegral (BS.length chunk)
+              chunks' = chunk : chunks
+          if total' > limit
+            then do
+              writeIORef exceededRef True
+              kill
+              pure (BS.concat (reverse chunks'))
+            else go chunks' total'
 
 tailBytes :: Int -> BS.ByteString -> BS.ByteString
 tailBytes n bytes = BS.drop (max 0 (BS.length bytes - n)) bytes

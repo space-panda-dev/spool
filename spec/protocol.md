@@ -249,12 +249,23 @@ expose reclaim.
 ## Workers
 
 `work` runs leased tasks with programs its owner configured. Each capability
-names an absolute executable, optional arguments, a timeout, and a payload
-limit; the configuration also sets the concurrency limit, the renew interval,
-and the complete environment a program receives. A program gets the payload on
-stdin in a fresh temporary directory. Exit 0 with JSON on stdout is a result;
-anything else is a failure, retried unless the capability was unknown or the
-payload too large. `work` acknowledges with that result.
+names an absolute executable, optional arguments, a timeout, a payload limit,
+and an output limit; the configuration also sets the concurrency limit, the
+renew interval, and the complete environment a program receives. A program
+gets the payload on stdin in a fresh temporary directory, in its own process
+group. Exit 0 with JSON on stdout is a result; anything else is a failure,
+retried unless the capability was unknown or the payload too large. `work`
+acknowledges with that result.
+
+These are the limits Spool itself enforces on a run: wall-clock time,
+concurrent runs, payload bytes accepted, and stdout/stderr bytes captured
+(each stream capped independently; past its cap the run is killed and failed,
+retried). They bound what Spool does, not what the executable can do to the
+machine it runs on: there is no CPU, memory, or file-size containment, and no
+namespace or container boundary. A capability owner who needs that wraps
+their executable themselves; Spool only guarantees that killing a run reaches
+its whole process group, not just the process it exec'd, because a timed-out
+or overrun capability may have spawned children of its own.
 
 With attachments, `work` fetches and verifies every
 declared attachment into `attachments/SHA256` below the fresh working
