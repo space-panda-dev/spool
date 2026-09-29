@@ -1,0 +1,15 @@
+# Which licence covers which files (https://reuse.software). Code is
+# AGPL-3.0-or-later; everything else is CC0-1.0. See the README.
+# A file that matches nothing here fails `make check`: decide which it is.
+version = 1
+SPDX-PackageName = "Spool"
+
+[[annotations]]
+path = ["Makefile", "scripts/**"]
+SPDX-FileCopyrightText = "The Spool contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ["*.md", "docs/**", "spec/**"]
+SPDX-FileCopyrightText = "The Spool contributors"
+SPDX-License-Identifier = "CC0-1.0"
