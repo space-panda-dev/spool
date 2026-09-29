@@ -188,6 +188,19 @@ the single JSON request defined above on stdin and writes verified raw bytes to
 stdout. Requested command words never contain task IDs, lease IDs, digests,
 paths, or a claimed worker.
 
+### Reclaim driver (proposed)
+
+Under [ADR 0008](../docs/decisions/0008-reclaim-is-caller-driven.md), Spool
+starts no daemon, timer, scheduler, or background reclaim loop. A caller on the
+spool host invokes the existing command directly; a deployment may arrange the
+same invocation through its existing host timer facility.
+
+`--older-than SECONDS` remains required, non-negative, and the sole threshold
+configuration. It has no default and is not persisted. A recurring deployment
+uses a positive threshold greater than its workers' renewal interval plus the
+maximum renewal delay it intends to tolerate. The remote command does not
+expose reclaim.
+
 ## Exit codes
 
 | Code | Meaning |
