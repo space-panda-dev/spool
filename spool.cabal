@@ -48,3 +48,23 @@ test-suite remote-parser-test
     , time
   default-language: Haskell2010
   ghc-options:      -Wall -Werror
+
+test-suite attachment-cleanup-test
+  type:             exitcode-stdio-1.0
+  main-is:          AttachmentCleanupTest.hs
+  other-modules:
+      SpoolAttachments
+  hs-source-dirs:   .
+  build-depends:
+      aeson
+    , base >=4.18 && <5
+    , bytestring
+    , crypton
+    , directory
+    , filepath
+    , memory
+    , process
+    , text
+    , unix
+  default-language: Haskell2010
+  ghc-options:      -Wall -Werror -threaded

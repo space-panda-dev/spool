@@ -155,7 +155,12 @@ printf '%s\n' "$reclaim_task" | spool put >/dev/null
 spool lease --worker crash-sim > "$work/reclaim-lease.jsonl"
 old_lease=$(jq -r '.lease_id' "$work/reclaim-lease.jsonl")
 old_task=$(jq -r '.task_id' "$work/reclaim-lease.jsonl")
-spool reclaim --older-than 0 >/dev/null
+# reclaim reports each returned task as one JSON line, like every other
+# command. jq -s fails on anything that is not JSON, so a bare task ID cannot
+# pass.
+spool reclaim --older-than 0 > "$work/reclaimed.jsonl"
+jq -s -e '. == [{"status":"reclaimed","task_id":"task-reclaim"}]' \
+  "$work/reclaimed.jsonl" >/dev/null; check
 spool lease --worker replacement > "$work/replacement-lease.jsonl"
 new_lease=$(jq -r '.lease_id' "$work/replacement-lease.jsonl")
 test "$old_task" = "task-reclaim"; check
@@ -325,6 +330,45 @@ jq 'del(.reason)' "$work/validated-records/failed/$validate_failure_lease.json" 
 mv "$work/bad-failure.json" "$work/validated-records/failed/$validate_failure_lease.json"
 expect_exit 70 spoolv failures
 
+# A fail interrupted after its record was written leaves the lease standing
+# beside that record. The state is rebuilt from the real writer's own files:
+# the lease is set aside, failed for real, then put back. Finishing it with
+# the same reason and retry choice completes the transition; a different
+# reason or choice is refused and cannot pass for having been recorded.
+spoolf() { "$spool_binary" --dir "$work/interrupted-fail" "$@"; }
+spoolf init
+printf '%s\n' '{"task_id":"interrupted-fail","capability":"validate@1","payload":{}}' \
+  | spoolf put >/dev/null
+spoolf lease --worker interrupted > "$work/interrupted-lease.jsonl"
+interrupted_lease=$(jq -r '.lease_id' "$work/interrupted-lease.jsonl")
+mkdir "$work/interrupted-saved"
+cp "$work/interrupted-fail/leased/$interrupted_lease.json" \
+  "$work/interrupted-fail/leased/$interrupted_lease.worker" "$work/interrupted-saved/"
+first_fail=$(jq -nc --arg lease "$interrupted_lease" \
+  '{task_id:"interrupted-fail",lease_id:$lease,reason:"first reason"}')
+other_fail=$(jq -nc --arg lease "$interrupted_lease" \
+  '{task_id:"interrupted-fail",lease_id:$lease,reason:"other reason"}')
+test "$first_fail" != "$other_fail"; check
+printf '%s\n' "$first_fail" | spoolf fail | jq -e '.status == "failed_retry"' >/dev/null; check
+cp "$work/interrupted-saved/$interrupted_lease.json" \
+  "$work/interrupted-saved/$interrupted_lease.worker" "$work/interrupted-fail/leased/"
+rm "$work/interrupted-fail/pending/interrupted-fail.json"
+spoolf status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 1' >/dev/null; check
+set +e
+printf '%s\n' "$other_fail" | spoolf fail >/dev/null 2>&1
+other_reason_exit=$?
+printf '%s\n' "$first_fail" | spoolf fail --no-retry >/dev/null 2>&1
+other_choice_exit=$?
+set -e
+test "$other_reason_exit" -eq 4; check
+test "$other_choice_exit" -eq 4; check
+spoolf status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 1' >/dev/null; check
+printf '%s\n' "$first_fail" | spoolf fail | jq -e '.status == "failed_retry"' >/dev/null; check
+spoolf status --json | jq -e '.pending == 1 and .leased == 0 and .failed == 1' >/dev/null; check
+spoolf failures | jq -s --arg lease "$interrupted_lease" -e \
+  'length == 1 and .[0].lease_id == $lease and .[0].reason == "first reason"
+   and .[0].retried == true' >/dev/null; check
+
 spools() { "$spool_binary" --dir "$work/corrupt-sidecars" "$@"; }
 spools init
 printf '%s\n' '{"task_id":"bad-renewal","capability":"validate@1","payload":{}}' \
@@ -367,6 +411,24 @@ sleep 5
 printf '{"slept":true}\n'
 SCRIPT
 chmod +x "$bin/sleeper"
+
+stubborn_pidfile="$work/stubborn-pid"
+stubborn_finished="$work/stubborn-finished"
+cat > "$bin/stubborn" <<SCRIPT
+#!/bin/sh
+# Ignores SIGTERM, as do the sleeps it starts, so only SIGKILL ends it early.
+trap '' TERM
+cat >/dev/null
+echo \$\$ > "$stubborn_pidfile"
+i=0
+while [ "\$i" -lt 150 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+: > "$stubborn_finished"
+printf '{"stubborn":true}\n'
+SCRIPT
+chmod +x "$bin/stubborn"
 
 cat > "$bin/big-output" <<'SCRIPT'
 #!/bin/sh
@@ -477,6 +539,42 @@ echo "$show_output" | jq -e \
    and .capabilities["classify@1"].args == []' >/dev/null
 check
 
+# A configured integer is used as written or refused, never wrapped. Each
+# limit is accepted at its largest value and refused one above it. The files
+# are written by hand because jq rounds integers this large.
+limit_config() {
+  # limit_config MAX_CONCURRENT RENEW TIMEOUT MAX_PAYLOAD MAX_OUTPUT
+  printf '{"max_concurrent":%s,"renew_seconds":%s,"capabilities":{"classify@1":{"exec":"%s","timeout_seconds":%s,"max_payload_bytes":%s,"max_output_bytes":%s}}}\n' \
+    "$1" "$2" "$bin/echo-classify" "$3" "$4" "$5" > "$work/limit-config.json"
+}
+int_max=9223372036854775807
+int_over=9223372036854775808
+seconds_max=9223372036854
+seconds_over=9223372036855
+test "$int_max" != "$int_over"; check
+test "$seconds_max" != "$seconds_over"; check
+limit_config "$int_max" "$seconds_max" "$seconds_max" "$int_max" "$int_max"
+"$spool_binary" work --config "$work/limit-config.json" --show > "$work/limit-show.json"
+grep -F "\"max_concurrent\":$int_max," "$work/limit-show.json" >/dev/null; check
+grep -F "\"renew_seconds\":$seconds_max}" "$work/limit-show.json" >/dev/null; check
+grep -F "\"timeout_seconds\":$seconds_max}" "$work/limit-show.json" >/dev/null; check
+grep -F "\"max_payload_bytes\":$int_max," "$work/limit-show.json" >/dev/null; check
+grep -F "\"max_output_bytes\":$int_max," "$work/limit-show.json" >/dev/null; check
+limit_config "$int_over" 30 5 1024 1024
+expect_exit 2 "$spool_binary" work --config "$work/limit-config.json" --show
+limit_config 1 "$seconds_over" 5 1024 1024
+expect_exit 2 "$spool_binary" work --config "$work/limit-config.json" --show
+limit_config 1 30 "$seconds_over" 1024 1024
+expect_exit 2 "$spool_binary" work --config "$work/limit-config.json" --show
+limit_config 1 30 5 "$int_over" 1024
+expect_exit 2 "$spool_binary" work --config "$work/limit-config.json" --show
+limit_config 1 30 5 1024 "$int_over"
+expect_exit 2 "$spool_binary" work --config "$work/limit-config.json" --show
+# A value that wraps to a small positive number is the quiet case: 2^64 + 1
+# must not become a one-second timeout.
+limit_config 1 30 18446744073709551617 1024 1024
+expect_exit 2 "$spool_binary" work --config "$work/limit-config.json" --show
+
 # Success is an end-to-end chain: configured executable output becomes the
 # ack result and remains available through results.
 success_task='{"task_id":"work-success","capability":"classify@1","payload":{"n":1}}'
@@ -554,6 +652,25 @@ while [ "$i" -lt 50 ]; do
   i=$((i + 1))
 done
 test "$grandchild_dead" -eq 0; check
+
+# The timeout holds against a program that ignores SIGTERM: it is killed
+# outright after the grace period, long before its own 15 seconds are up.
+# The marker it writes on a natural exit is the proof it never got there.
+stubborn_task='{"task_id":"work-stubborn","capability":"stubborn@1","payload":{}}'
+printf '%s\n' "$stubborn_task" | spoolw put >/dev/null
+worker_config "stubborn@1" "$bin/stubborn" 1 1024 > "$work/stubborn-config.json"
+spoolw work --worker w1 --config "$work/stubborn-config.json" --max-tasks 1
+test -s "$stubborn_pidfile"; check
+test ! -e "$stubborn_finished"; check
+if kill -0 "$(cat "$stubborn_pidfile")" 2>/dev/null; then
+  echo "a capability ignoring SIGTERM outlived its timeout" >&2; exit 1
+fi
+check
+spoolw failures | jq -s --arg task work-stubborn -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].retried == true
+   and (.[0].reason | test("timeout after 1 s"))' >/dev/null
+check
+drain_pending "work-stubborn"
 
 # Output past max_output_bytes fails with retry and names the limit, rather
 # than growing the worker's memory to hold a runaway capability's output.
@@ -795,6 +912,45 @@ spoola lease --worker compatibility > "$work/old-task-lease.jsonl"
 jq -e '.task_id == "old-task-shape" and .attachments == []' \
   "$work/old-task-lease.jsonl" >/dev/null; check
 
+# A put killed while staging leaves its staging directory behind, and the next
+# command clears it. The leftover is the real writer's own: the source is a
+# pipe held open here, so put has made the directory and is waiting for bytes
+# when it is killed.
+spooli() { "$spool_binary" --dir "$work/interrupted-stage" "$@"; }
+spooli init
+stage_source="$work/interrupted-stage-source"
+mkdir -p "$stage_source"
+stage_digest=$(printf '0%.0s' {1..64})
+mkfifo "$stage_source/$stage_digest"
+exec 9<>"$stage_source/$stage_digest"
+jq -nc --arg digest "$stage_digest" \
+  '{task_id:"interrupted-stage",capability:"attach@1",payload:{},attachments:[{sha256:$digest,size:1}]}' \
+  > "$work/interrupted-stage-task.jsonl"
+"$spool_binary" --dir "$work/interrupted-stage" put --attachments "$stage_source" \
+  < "$work/interrupted-stage-task.jsonl" >/dev/null 2>&1 &
+stage_put_pid=$!
+i=0
+while [ -z "$(ls -A "$work/interrupted-stage/attachments")" ] && [ "$i" -lt 100 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+kill -9 "$stage_put_pid"
+set +e
+wait "$stage_put_pid" 2>/dev/null
+set -e
+exec 9>&-
+test -n "$(ls -A "$work/interrupted-stage/attachments")"; check
+spooli status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+test -z "$(ls -A "$work/interrupted-stage/attachments")"; check
+
+# A task whose ID ends like a staging directory keeps its attachments: only
+# the writer's own leftovers are cleared.
+lookalike_task=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"lookalike.spool-attachment-stage",capability:"attach@1",payload:{},attachments:[{sha256:$digest,size:$size}]}')
+printf '%s\n' "$lookalike_task" | spooli put --attachments "$attachment_source" >/dev/null
+spooli status >/dev/null
+test -f "$work/interrupted-stage/attachments/task-lookalike.spool-attachment-stage/$attachment_digest"; check
+
 #############################################################################
 # Grants and the SSH boundary: the account record supplies both spool and
 # worker, every remote word reaches only its named handler, and revoke fences.
@@ -1020,6 +1176,79 @@ HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
 expired_grant_id=$(jq -r '.grant_id' "$work/expired-grant.json")
 expect_exit 5 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
   "$spool_binary" remote --grant "$expired_grant_id"
+
+# A worker name survives the lease record whole. "Ł" (U+0141) and "A"
+# (U+0041) share their low byte, so a record that kept one byte per character
+# would hand the lease of one to the other. The wide name is set in the grant
+# record because JSON is UTF-8 whatever the locale; an argument is not.
+narrow_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC'
+wide_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD'
+printf '%s\n' "$narrow_key" > "$work/narrow.pub"
+printf '%s\n' "$wide_key" > "$work/wide.pub"
+spoolg grant --peer narrow-peer --worker A --key "$work/narrow.pub" \
+  > "$work/narrow-grant.json"
+spoolg grant --peer wide-peer --worker wide-placeholder --key "$work/wide.pub" \
+  > "$work/wide-grant.json"
+narrow_grant_id=$(jq -r '.grant_id' "$work/narrow-grant.json")
+wide_grant_id=$(jq -r '.grant_id' "$work/wide-grant.json")
+jq -c '.worker = "Ł"' "$grant_home/.spool/grants/$wide_grant_id.json" \
+  > "$work/wide-grant-record.json"
+mv "$work/wide-grant-record.json" "$grant_home/.spool/grants/$wide_grant_id.json"
+remote_as() {
+  local grant=$1 requested=$2
+  HOME="$grant_home" SSH_ORIGINAL_COMMAND="$requested" \
+    "$spool_binary" remote --grant "$grant"
+}
+printf '%s\n' '{"task_id":"wide-worker","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_as "$wide_grant_id" 'lease' > "$work/wide-lease.jsonl"
+jq -e '.task_id == "wide-worker" and .worker == "Ł" and .worker != "A"' \
+  "$work/wide-lease.jsonl" >/dev/null; check
+wide_lease=$(jq -r '.lease_id' "$work/wide-lease.jsonl")
+wide_ref=$(jq -nc --arg lease "$wide_lease" '{task_id:"wide-worker",lease_id:$lease}')
+wide_ack=$(jq -nc --arg lease "$wide_lease" \
+  '{task_id:"wide-worker",lease_id:$lease,result:{wide:true}}')
+set +e
+printf '%s\n' "$wide_ref" | remote_as "$narrow_grant_id" 'renew' >/dev/null 2>&1
+narrow_renew_exit=$?
+printf '%s\n' "$wide_ack" | remote_as "$narrow_grant_id" 'ack' >/dev/null 2>&1
+narrow_ack_exit=$?
+set -e
+test "$narrow_renew_exit" -eq 4; check
+test "$narrow_ack_exit" -eq 4; check
+printf '%s\n' "$wide_ref" | remote_as "$wide_grant_id" 'renew' \
+  | jq -e '.status == "renewed"' >/dev/null; check
+printf '%s\n' "$wide_ack" | remote_as "$wide_grant_id" 'ack' \
+  | jq -e '.status == "acked"' >/dev/null; check
+spoolg results | jq -s -e \
+  'map(select(.task_id == "wide-worker")) | length == 1 and .[0].worker == "Ł"' \
+  >/dev/null; check
+# The completed lease stays fenced: a repeat of the same ack is a no-op for
+# its owner and still refused for the other worker.
+printf '%s\n' "$wide_ack" | remote_as "$wide_grant_id" 'ack' \
+  | jq -e '.status == "already_done"' >/dev/null; check
+set +e
+printf '%s\n' "$wide_ack" | remote_as "$narrow_grant_id" 'ack' >/dev/null 2>&1
+narrow_repeat_exit=$?
+set -e
+test "$narrow_repeat_exit" -eq 4; check
+
+# A worker sidecar that is not UTF-8 is corrupt durable state, not a name.
+printf '%s\n' '{"task_id":"bad-worker-sidecar","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_as "$wide_grant_id" 'lease' > "$work/bad-sidecar-lease.jsonl"
+bad_sidecar_lease=$(jq -r '.lease_id' "$work/bad-sidecar-lease.jsonl")
+bad_sidecar_ack=$(jq -nc --arg lease "$bad_sidecar_lease" \
+  '{task_id:"bad-worker-sidecar",lease_id:$lease,result:{}}')
+cp "$work/grant-spool/leased/$bad_sidecar_lease.worker" "$work/good-worker-sidecar"
+printf '\377' > "$work/grant-spool/leased/$bad_sidecar_lease.worker"
+set +e
+printf '%s\n' "$bad_sidecar_ack" | spoolg ack >/dev/null 2>&1
+bad_sidecar_exit=$?
+set -e
+test "$bad_sidecar_exit" -eq 70; check
+cp "$work/good-worker-sidecar" "$work/grant-spool/leased/$bad_sidecar_lease.worker"
+printf '%s\n' "$bad_sidecar_ack" | spoolg ack | jq -e '.status == "acked"' >/dev/null; check
 
 # Revoke disables access, removes only its managed line, and reclaims leases
 # for the fixed worker. The old lease remains fenced after return to pending.

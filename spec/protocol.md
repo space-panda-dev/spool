@@ -60,7 +60,10 @@ A task is **pending**, **leased**, **done**, or **failed**.
   different result is a stale-lease error and cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
-  or, with `--no-retry`, moves it to failed.
+  or, with `--no-retry`, moves it to failed. A lease has at most one failure
+  record. Where a record is already stored for a live lease, repeating the
+  same reason and retry choice completes the fail; a different reason or
+  choice is a stale-lease error and cannot replace the stored record.
 - `reclaim --older-than SECONDS` returns to pending every lease whose later of
   lease time and last renewal is older than that. The old lease ID is dead.
 
@@ -106,6 +109,13 @@ interpret it.
 Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
+
+`reclaim` emits one JSON object per task it returned to pending, and nothing
+when no lease was old enough:
+
+```json
+{"task_id":"task-one","status":"reclaimed"}
+```
 
 ### `status` counters
 
@@ -257,6 +267,12 @@ group. Exit 0 with JSON on stdout is a result; anything else is a failure,
 retried unless the capability was unknown or the payload too large. `work`
 acknowledges with that result.
 
+Every number in the configuration is a whole number of at least 1. The
+concurrency limit and the byte limits may be as large as the host's integers
+allow; `renew_seconds` and `timeout_seconds` may be at most 9223372036854. A
+number outside its range is malformed input and exit 2; it is never rounded,
+wrapped, or clamped.
+
 These are the limits Spool itself enforces on a run: wall-clock time,
 concurrent runs, payload bytes accepted, and stdout/stderr bytes captured
 (each stream capped independently; past its cap the run is killed and failed,
@@ -266,6 +282,10 @@ namespace or container boundary. A capability owner who needs that wraps
 their executable themselves; Spool only guarantees that killing a run reaches
 its whole process group, not just the process it exec'd, because a timed-out
 or overrun capability may have spawned children of its own.
+
+Killing a run sends its process group SIGTERM. A program may ignore that, so
+a run still going 5 seconds later is sent SIGKILL. The limit on wall-clock
+time is therefore enforced within `timeout_seconds` plus 5 seconds.
 
 With attachments, `work` fetches and verifies every
 declared attachment into `attachments/SHA256` below the fresh working

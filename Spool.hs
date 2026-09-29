@@ -17,11 +17,12 @@ module Main (main) where
 
 import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar,
-                                readMVar, modifyMVar_, tryReadMVar, withMVar)
+                                readMVar, modifyMVar_, takeMVar, tryPutMVar,
+                                tryReadMVar, withMVar)
 import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
 import Control.Exception (IOException, SomeException, bracket, catch,
                           displayException, finally, onException, throwIO, try)
-import Control.Monad (foldM, forM, forM_, unless, when)
+import Control.Monad (foldM, forM, forM_, unless, void, when)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
@@ -31,7 +32,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.List (isPrefixOf, sort, sortOn)
+import Data.List (sort, sortOn)
 import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -55,7 +56,7 @@ import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus, setFileMode)
 import qualified System.Posix.Env.ByteString as PosixEnv
-import System.Posix.Signals (sigTERM, signalProcess)
+import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcess)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Process (CreateProcess (..), ProcessHandle, StdStream (CreatePipe),
                        createProcess, getPid, proc, waitForProcess)
@@ -325,7 +326,7 @@ recoverAttachmentState paths = do
   let active = pending <> leased
   names <- listDirectory (attachmentsDir paths)
   forM_ names $ \name ->
-    if ".spool-attachment-stage" `isPrefixOf` name
+    if SA.isStagingLeftover name
       then removePathForcibly (attachmentsDir paths </> name)
       else case T.stripPrefix "task-" (T.pack name) of
         Just ident | ident `notElem` active ->
@@ -538,6 +539,12 @@ encodeFailResult :: T.Text -> Bool -> BL.ByteString
 encodeFailResult ident retried = canonical (A.object
   [ "task_id" .= ident
   , "status" .= (if retried then "failed_retry" else "failed" :: T.Text)
+  ])
+
+encodeReclaimResult :: T.Text -> BL.ByteString
+encodeReclaimResult ident = canonical (A.object
+  [ "task_id" .= ident
+  , "status" .= ("reclaimed" :: T.Text)
   ])
 
 encodeFailedRecord :: Task -> T.Text -> T.Text -> T.Text -> T.Text -> Bool -> BL.ByteString
@@ -804,9 +811,9 @@ ignoreProcessRace action = action `catch` ignore
     ignore :: IOException -> IO ()
     ignore _ = pure ()
 
--- Sidecars: a lease's worker (written once) and its last renewal (rewritten
--- on every renew). Neither has a ".json" extension, so jsonFiles never
--- returns them.
+-- Sidecars: a lease's worker (written once, as UTF-8) and its last renewal
+-- (rewritten on every renew). Neither has a ".json" extension, so jsonFiles
+-- never returns them.
 workerSidecarPath :: Paths -> T.Text -> FilePath
 workerSidecarPath paths leaseIdent = leasedDir paths </> T.unpack leaseIdent <> ".worker"
 
@@ -816,7 +823,7 @@ renewedSidecarPath paths leaseIdent = leasedDir paths </> T.unpack leaseIdent <>
 writeWorkerSidecar :: Paths -> T.Text -> T.Text -> IO ()
 writeWorkerSidecar paths leaseIdent worker = do
   created <- atomicCreate
-    (workerSidecarPath paths leaseIdent) (BLC.pack (T.unpack worker))
+    (workerSidecarPath paths leaseIdent) (BL.fromStrict (TE.encodeUtf8 worker))
   unless created (throwFailure (SpoolFailure 70
     ("worker sidecar already exists for " <> T.unpack leaseIdent)))
 
@@ -827,7 +834,12 @@ readWorkerSidecar paths leaseIdent = do
   if not exists
     then throwFailure (SpoolFailure 70
       ("leased task has no worker sidecar: " <> T.unpack leaseIdent))
-    else T.strip . T.pack . BLC.unpack <$> BL.readFile path
+    else do
+      bytes <- BS.readFile path
+      case TE.decodeUtf8' bytes of
+        Left _ -> throwFailure (SpoolFailure 70
+          ("corrupt worker sidecar for " <> T.unpack leaseIdent))
+        Right worker -> pure (T.strip worker)
 
 writeRenewedSidecar :: Paths -> T.Text -> Integer -> IO ()
 writeRenewedSidecar paths leaseIdent micros =
@@ -1068,15 +1080,40 @@ failLease paths ident leaseIdent reason retry = do
         then pure (Left "lease does not belong to task_id")
         else do
           worker <- readWorkerSidecar paths leaseIdent
-          now <- getCurrentTime
-          let failedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
-              record = encodeFailedRecord task leaseIdent worker failedAt reason retry
-          _ <- atomicCreate (failedDir paths </> T.unpack leaseIdent <> ".json") record
-          when retry (returnToPending paths task)
-          removeFile source
-          removeSidecars paths leaseIdent
-          unless retry (tombstoneAndDelete paths (taskId task))
-          pure (Right retry)
+          stored <- writeFailureRecord paths task leaseIdent worker reason retry
+          case stored of
+            Left message -> pure (Left message)
+            Right () -> do
+              when retry (returnToPending paths task)
+              removeFile source
+              removeSidecars paths leaseIdent
+              unless retry (tombstoneAndDelete paths (taskId task))
+              pure (Right retry)
+
+-- | Record a failure once. A record already there belongs to a fail that was
+-- interrupted before it removed the lease: the same reason and retry choice
+-- finish that fail, and anything else is refused, as a differing result is
+-- for ack.
+writeFailureRecord
+  :: Paths -> Task -> T.Text -> T.Text -> T.Text -> Bool -> IO (Either String ())
+writeFailureRecord paths task leaseIdent worker reason retry = do
+  now <- getCurrentTime
+  let failedAt = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" now)
+      record = encodeFailedRecord task leaseIdent worker failedAt reason retry
+      path = failedDir paths </> T.unpack leaseIdent <> ".json"
+  created <- atomicCreate path record
+  if created
+    then pure (Right ())
+    else do
+      existing <- readFailureRecordFile path
+      pure $ if existing `recordsFailure` (reason, retry)
+        then Right ()
+        else Left "fail differs from the failure already recorded for this lease"
+  where
+    recordsFailure (A.Object object) (wantedReason, wantedRetry) =
+      KM.lookup "reason" object == Just (A.String wantedReason)
+        && KM.lookup "retried" object == Just (A.Bool wantedRetry)
+    recordsFailure _ _ = False
 
 -- | Recreate a task in pending/, exactly as reclaim does: idempotent if an
 -- equal task is already there, a hard failure if a conflicting one is.
@@ -1174,7 +1211,7 @@ reclaimOne paths leasedPath = do
   returnToPending paths task
   removeFile leasedPath
   removeSidecars paths leaseIdent
-  BLC.putStrLn (BLC.pack (T.unpack (taskId task)))
+  BLC.putStrLn (encodeReclaimResult (taskId task))
 
 leaseMicros :: T.Text -> Maybe Integer
 leaseMicros value = case T.stripPrefix "lease_" value of
@@ -1534,8 +1571,8 @@ parseWorkConfig bytes = do
   case value of
     A.Object object -> do
       rejectUnknown ["max_concurrent", "renew_seconds", "env", "capabilities"] object
-      maxConcurrent <- positiveIntField "max_concurrent" (Just 1) object
-      renewSeconds <- positiveIntField "renew_seconds" (Just 30) object
+      maxConcurrent <- positiveField maxBound "max_concurrent" (Just 1) object
+      renewSeconds <- positiveField maxDelaySeconds "renew_seconds" (Just 30) object
       envPairs <- optionalEnvMap object
       capsObject <- requiredObject "capabilities" object
       caps <- traverse (uncurry parseCapabilityEntry) (KM.toList capsObject)
@@ -1553,25 +1590,27 @@ requiredObject key object = case KM.lookup (K.fromText key) object of
   Just _ -> Left (T.unpack key <> " must be an object")
   Nothing -> Left ("config is missing " <> T.unpack key)
 
-positiveIntField :: T.Text -> Maybe Int -> Object -> Either String Int
-positiveIntField key def object = case KM.lookup (K.fromText key) object of
+-- | A whole number from 1 through `limit`. aeson's bounded decoder does the
+-- conversion: it refuses a fraction or a value outside the target type where
+-- rounding through Integer would wrap it, and it never expands a huge
+-- exponent to find out.
+positiveField
+  :: (A.FromJSON a, Integral a, Show a)
+  => a -> T.Text -> Maybe a -> Object -> Either String a
+positiveField limit key def object = case KM.lookup (K.fromText key) object of
   Nothing -> maybe (Left ("missing " <> T.unpack key)) Right def
-  Just (A.Number number) ->
-    let value = round number :: Integer
-    in if value > 0 && fromInteger value == number
-       then Right (fromInteger value)
-       else Left (T.unpack key <> " must be a positive integer")
-  Just _ -> Left (T.unpack key <> " must be a positive integer")
+  Just value@(A.Number _) -> case A.fromJSON value of
+    A.Success number | number > 0 && number <= limit -> Right number
+    _ -> Left outOfRange
+  Just _ -> Left outOfRange
+  where
+    outOfRange = T.unpack key <> " must be a positive integer no greater than "
+      <> show limit
 
-positiveInt64Field :: T.Text -> Object -> Either String Int64
-positiveInt64Field key object = case KM.lookup (K.fromText key) object of
-  Nothing -> Left ("missing " <> T.unpack key)
-  Just (A.Number number) ->
-    let value = round number :: Integer
-    in if value > 0 && fromInteger value == number
-       then Right (fromInteger value)
-       else Left (T.unpack key <> " must be a positive integer")
-  Just _ -> Left (T.unpack key <> " must be a positive integer")
+-- | The largest number of seconds whose microseconds still fit the Int that
+-- `threadDelay` takes.
+maxDelaySeconds :: Int
+maxDelaySeconds = maxBound `div` 1000000
 
 optionalEnvMap :: Object -> Either String [(String, String)]
 optionalEnvMap object = case KM.lookup "env" object of
@@ -1611,9 +1650,9 @@ parseCapabilityEntry key value = do
       unless (isAbsolute (T.unpack execPath))
         (Left (T.unpack capText <> ": exec must be an absolute path"))
       args <- optionalArgList object
-      timeoutSeconds <- positiveIntField "timeout_seconds" Nothing object
-      maxPayload <- positiveInt64Field "max_payload_bytes" object
-      maxOutput <- positiveInt64Field "max_output_bytes" object
+      timeoutSeconds <- positiveField maxDelaySeconds "timeout_seconds" Nothing object
+      maxPayload <- positiveField maxBound "max_payload_bytes" Nothing object
+      maxOutput <- positiveField maxBound "max_output_bytes" Nothing object
       pure (key, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload maxOutput)
     _ -> Left (T.unpack capText <> " must be an object")
 
@@ -1754,13 +1793,19 @@ freshTempDir = do
   createDirectoryIfMissing True path
   pure path
 
+-- | How long a run that has been sent SIGTERM may keep going before it is
+-- sent SIGKILL.
+terminationGraceSeconds :: Int
+terminationGraceSeconds = 5
+
 -- | Run one capability executable with the given environment, cwd, and
 -- stdin payload. It runs in its own process group (`create_group`), killed
 -- (and reporting a timeout) if it outlives `capTimeoutSeconds`, or (and
 -- reporting an overrun) if either stream's captured output outlives
 -- `capMaxOutputBytes`. Killing the group, not just the immediate process,
 -- reaches a descendant that would otherwise survive and keep the pipes
--- open.
+-- open. The kill is SIGTERM first; a program may ignore that, so one still
+-- running `terminationGraceSeconds` later is sent SIGKILL, which it cannot.
 runCapability :: CapabilityConfig -> [(String, String)] -> FilePath -> BL.ByteString -> IO RunOutcome
 runCapability capConfig envPairs cwdPath payload = do
   (Just hin, Just hout, Just herr, ph) <- createProcess (proc (capExec capConfig) (capArgs capConfig))
@@ -1773,10 +1818,18 @@ runCapability capConfig envPairs cwdPath payload = do
     }
   inputResult <- try (BL.hPut hin payload >> hClose hin)
     :: IO (Either IOException ())
+  -- The watchdog and both readers can each ask for the kill; the first
+  -- request wins and the terminator carries it out once. The child may exit
+  -- between a limit firing and a signal. That process race is the only
+  -- error intentionally ignored here.
+  killRequested <- newEmptyMVar
+  terminator <- forkIO $ do
+    takeMVar killRequested
+    ignoreProcessRace (signalGroup sigTERM ph)
+    threadDelay (terminationGraceSeconds * 1000000)
+    ignoreProcessRace (signalGroup sigKILL ph)
   let limit = capMaxOutputBytes capConfig
-      -- The child may exit between a limit firing and termination. That
-      -- process race is the only error intentionally ignored here.
-      kill = ignoreProcessRace (terminateGroup ph)
+      kill = void (tryPutMVar killRequested ())
   outVar <- newEmptyMVar
   errVar <- newEmptyMVar
   outputExceeded <- newIORef False
@@ -1789,6 +1842,7 @@ runCapability capConfig envPairs cwdPath payload = do
     kill
   exitCode <- waitForProcess ph
   killThread watchdog
+  killThread terminator
   outResult <- readMVar outVar
   errResult <- readMVar errVar
   outBytes <- either ioError pure outResult
@@ -1807,16 +1861,16 @@ runCapability capConfig envPairs cwdPath payload = do
       ExitFailure n -> RunFailure
         ("exit " <> T.pack (show n) <> ": " <> decodeLenient (tailBytes 1000 errBytes))
 
--- | Send SIGTERM to the negative of the child's pid, i.e. every process in
+-- | Send a signal to the negative of the child's pid, i.e. every process in
 -- its group, not just the one Spool exec'd. `getPid` returns Nothing once
 -- the process handle has already been reaped, which this treats as nothing
 -- left to signal.
-terminateGroup :: ProcessHandle -> IO ()
-terminateGroup ph = do
+signalGroup :: Signal -> ProcessHandle -> IO ()
+signalGroup signal ph = do
   running <- getPid ph
   case running of
     Nothing -> pure ()
-    Just pid -> signalProcess sigTERM (negate pid)
+    Just pid -> signalProcess signal (negate pid)
 
 readerThread
   :: Int64 -> IORef Bool -> IO () -> Handle -> MVar (Either IOException BS.ByteString) -> IO ()

@@ -16,13 +16,14 @@ module SpoolAttachments
   , attachmentDirectory
   , attachmentPath
   , stageAttachments
+  , isStagingLeftover
   , receiveAttachment
   , verifyAttachmentFile
   , removeTaskAttachments
   , attemptRemoveWorkerDirectory
   ) where
 
-import Control.Exception (IOException, bracket, finally, onException, try)
+import Control.Exception (IOException, bracket, onException, try)
 import Control.Monad (forM_, unless, when)
 import Crypto.Hash (Context, Digest, SHA256, hashFinalize, hashInit,
                     hashUpdate)
@@ -34,7 +35,7 @@ import qualified Data.Aeson.Types as AT
 import qualified Data.ByteArray.Encoding as BAE
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
-import Data.List (nub, sort)
+import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive,
@@ -125,6 +126,20 @@ validateTaskToken task
         || character `elem` ("._-" :: String)
     invalid character = not (valid character)
 
+-- | The template for a staging directory's name.  The name itself is the
+-- system's to choose, and it puts its unique part in front of a template that
+-- begins with a dot: "12345-0.spool-attachment-stage".
+stagingTemplate :: String
+stagingTemplate = ".spool-attachment-stage"
+
+-- | Whether an entry in the attachment root is a staging directory left by an
+-- interrupted put.  The template is looked for anywhere in the name, so the
+-- answer does not rest on where the system puts its unique part.  A task's
+-- own directory is never one, whatever its ID contains.
+isStagingLeftover :: FilePath -> Bool
+isStagingLeftover name =
+  stagingTemplate `isInfixOf` name && not ("task-" `isPrefixOf` name)
+
 -- | Stage all source files into a temporary directory and atomically publish
 -- the task directory.  A failed digest leaves no visible task directory.
 -- Existing destination directories are never removed or overwritten.
@@ -139,7 +154,7 @@ stageAttachments attachmentRoot sourceRoot task attachments = do
       Left message -> pure (Left message)
       Right destination -> do
         createDirectoryIfMissing True attachmentRoot
-        (temporary, handle) <- openBinaryTempFile attachmentRoot ".spool-attachment-stage"
+        (temporary, handle) <- openBinaryTempFile attachmentRoot stagingTemplate
         hClose handle
         removeFile temporary
         createDirectoryIfMissing True temporary
@@ -183,17 +198,17 @@ receiveAttachment workerAttachmentRoot attachment source = do
       hClose handle
       case result of
         Left (exception :: IOException) -> do
-          removeFile temporary `finally` pure ()
+          discardTemporary temporary
           ioError exception
         Right checked -> case checked of
           Left message -> do
-            removeFile temporary `finally` pure ()
+            discardTemporary temporary
             pure (Left message)
           Right () -> do
             published <- try (renameFile temporary destination)
             case published of
               Left (exception :: IOException) -> do
-                removeFile temporary `finally` pure ()
+                discardTemporary temporary
                 ioError exception
               Right () -> pure (Right ())
   where
@@ -224,14 +239,25 @@ copyVerified attachment source temporary destination = do
   hClose destinationHandle
   case result of
     Left (exception :: IOException) -> do
-      removeFile temporaryFile `finally` pure ()
+      discardTemporary temporaryFile
       ioError exception
     Right (Left message) -> do
-      removeFile temporaryFile `finally` pure ()
+      discardTemporary temporaryFile
       pure (Left message)
     Right (Right ()) -> do
       renameFile temporaryFile destination
       pure (Right ())
+
+-- | Remove a temporary file on the way out of a failure.  The failure already
+-- in hand is the one to report, so a refusal here must not replace it.  The
+-- file is not lost sight of: it lies in a directory whose own removal fails
+-- loudly.
+discardTemporary :: FilePath -> IO ()
+discardTemporary path = do
+  result <- try (removeFile path)
+  case result of
+    Left (_ :: IOException) -> pure ()
+    Right () -> pure ()
 
 withBinaryFile :: FilePath -> (Handle -> IO a) -> IO a
 withBinaryFile path action = bracket (openBinaryFile path ReadMode) hClose action
