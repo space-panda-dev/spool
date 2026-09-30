@@ -82,6 +82,7 @@ test-suite spool-test
     , Test.Attachments
     , Test.Cli
     , Test.Error
+    , Test.Files
     , Test.Types
     , Test.Wire
     , Test.WorkerConfig

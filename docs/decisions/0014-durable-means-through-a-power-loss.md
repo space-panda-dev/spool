@@ -1,6 +1,6 @@
 # 0014. Durable means through a power loss
 
-Status: proposed
+Status: accepted
 
 Spool calls itself a durable work queue and keeps work that must outlive the
 process that asked for it. Every transition is atomic: a file appears whole

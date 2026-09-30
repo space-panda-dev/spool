@@ -26,22 +26,33 @@ module Spool.Files
   , Created (..)
   , atomicCreate
   , atomicReplace
+  , syncedRename
+  , syncedRemove
+  , syncedRenameDirectory
+  , syncedRemoveDirectory
+  , syncHandle
+  , syncDirectory
   , ignoreMissing
   , epochMicros
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (IOException, bracket, catch, finally, try)
+import Control.Monad (unless)
 import qualified Data.ByteString.Lazy as BL
 import Data.List (sort)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Directory (createDirectoryIfMissing, listDirectory, removeFile,
-                         renameFile)
+                         removePathForcibly, renameDirectory, renameFile)
 import System.FilePath (takeDirectory, takeExtension, (</>))
-import System.IO (IOMode (AppendMode), hClose, openBinaryTempFile, openFile)
+import System.IO (Handle, IOMode (AppendMode), hClose, hFlush, openBinaryTempFile,
+                  openFile)
 import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus)
+import System.Posix.IO (OpenMode (ReadOnly), closeFd, defaultFileFlags, handleToFd,
+                        openFd)
+import System.Posix.Unistd (fileSynchronise)
 import qualified Data.Text as T
 import Spool.Types (LeaseId, TaskId, leaseIdText, taskIdText)
 
@@ -153,20 +164,70 @@ atomicCreate path bytes = do
   let directory = takeDirectory path
   createDirectoryIfMissing True directory
   (temporary, handle) <- openBinaryTempFile directory ".spool-task"
-  result <- (BL.hPut handle bytes >> hClose handle >> try (createLink temporary path))
+  result <- (BL.hPut handle bytes >> syncHandle handle >> try (createLink temporary path))
     `finally` ignoreMissing (removeFile temporary)
   case result of
-    Right () -> pure Created
+    Right () -> Created <$ syncDirectory directory
     Left exception
       | isAlreadyExistsError exception -> pure AlreadyThere
       | otherwise -> ioError exception
 
+-- | Give a file these bytes, replacing what it held, so that it holds the
+-- old bytes or the new and never part of either.
 atomicReplace :: FilePath -> BL.ByteString -> IO ()
 atomicReplace path bytes = do
   let directory = takeDirectory path
   (temporary, handle) <- openBinaryTempFile directory ".spool-sequence"
-  (BL.hPut handle bytes >> hClose handle >> renameFile temporary path)
+  (BL.hPut handle bytes >> syncHandle handle >> renameFile temporary path)
     `finally` ignoreMissing (removeFile temporary)
+  syncDirectory directory
+
+-- What a command answers for is on the disk when it answers (ADR 0014). A
+-- file's bytes are synced before it is given its name, and a directory is
+-- synced after a name is added to it, removed from it, or moved.
+
+-- | Move a file, and sync the directories it left and joined.
+syncedRename :: FilePath -> FilePath -> IO ()
+syncedRename from to = do
+  renameFile from to
+  syncDirectories from to
+
+-- | Remove a file, and sync the directory it left.
+syncedRemove :: FilePath -> IO ()
+syncedRemove path = do
+  removeFile path
+  syncDirectory (takeDirectory path)
+
+-- | Move a directory, and sync the directories it left and joined.
+syncedRenameDirectory :: FilePath -> FilePath -> IO ()
+syncedRenameDirectory from to = do
+  renameDirectory from to
+  syncDirectories from to
+
+-- | Remove a directory and everything in it, and sync the directory it left.
+syncedRemoveDirectory :: FilePath -> IO ()
+syncedRemoveDirectory path = do
+  removePathForcibly path
+  syncDirectory (takeDirectory path)
+
+syncDirectories :: FilePath -> FilePath -> IO ()
+syncDirectories from to = do
+  syncDirectory (takeDirectory from)
+  unless (takeDirectory from == takeDirectory to) (syncDirectory (takeDirectory to))
+
+-- | Write a handle's bytes through to the disk and close it.  The handle is
+-- unusable afterwards.
+syncHandle :: Handle -> IO ()
+syncHandle handle = do
+  hFlush handle
+  fd <- handleToFd handle
+  fileSynchronise fd `finally` closeFd fd
+
+-- | Write a directory's entries through to the disk, so that a name added,
+-- removed, or moved is there after a power loss.
+syncDirectory :: FilePath -> IO ()
+syncDirectory directory =
+  bracket (openFd directory ReadOnly defaultFileFlags) closeFd fileSynchronise
 
 ignoreMissing :: IO () -> IO ()
 ignoreMissing action = action `catch` ignore

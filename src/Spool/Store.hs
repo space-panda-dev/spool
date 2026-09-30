@@ -50,8 +50,7 @@ import Data.Maybe (listToMaybe)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (getCurrentTime)
-import System.Directory (listDirectory, removeDirectoryRecursive, removeFile,
-                         removePathForcibly, renameDirectory, renameFile)
+import System.Directory (listDirectory)
 import System.FilePath (takeBaseName, (</>))
 import System.IO (IOMode (ReadMode), withBinaryFile)
 import System.IO.Error (isDoesNotExistError)
@@ -91,6 +90,10 @@ import Spool.Files
   , pendingPath
   , renewedSidecarPath
   , resultPath
+  , syncedRemove
+  , syncedRemoveDirectory
+  , syncedRename
+  , syncedRenameDirectory
   , withLock
   , workerSidecarPath
   )
@@ -183,14 +186,14 @@ finishCommitted paths = do
 recoverAttachmentState :: Paths -> IO ()
 recoverAttachmentState paths = do
   cleanupNames <- listDirectory (attachmentCleanupDir paths)
-  mapM_ (removePathForcibly . (attachmentCleanupDir paths </>)) cleanupNames
+  mapM_ (syncedRemoveDirectory . (attachmentCleanupDir paths </>)) cleanupNames
   pending <- jsonFiles (pendingDir paths) >>= mapM (fmap taskId . readTaskFile)
   leased <- jsonFiles (leasedDir paths) >>= mapM (fmap taskId . readTaskFile)
   let active = pending <> leased
   names <- listDirectory (attachmentsDir paths)
   forM_ names $ \name ->
     if SA.isStagingLeftover name
-      then removePathForcibly (attachmentsDir paths </> name)
+      then syncedRemoveDirectory (attachmentsDir paths </> name)
       else case T.stripPrefix "task-" (T.pack name) of
         Just owner -> do
           ident <- orThrow corrupt (mkTaskId owner)
@@ -204,8 +207,8 @@ tombstoneAndDelete paths ident = do
       target = SA.attachmentDirectory (attachmentCleanupDir paths) ident
   present <- fileExists source
   when present $ do
-    renameDirectory source target
-    removeDirectoryRecursive target
+    syncedRenameDirectory source target
+    syncedRemoveDirectory target
 
 putTasks :: Paths -> Maybe FilePath -> IO ()
 putTasks paths sourceDirectory = do
@@ -361,8 +364,8 @@ readRenewedSidecar paths leaseIdent = do
 
 removeSidecars :: Paths -> LeaseId -> IO ()
 removeSidecars paths leaseIdent = do
-  ignoreMissing (removeFile (workerSidecarPath paths leaseIdent))
-  ignoreMissing (removeFile (renewedSidecarPath paths leaseIdent))
+  ignoreMissing (syncedRemove (workerSidecarPath paths leaseIdent))
+  ignoreMissing (syncedRemove (renewedSidecarPath paths leaseIdent))
 
 -- | The lease a file in the leased directory holds, which is its name.
 leaseIdOfFile :: FilePath -> IO LeaseId
@@ -396,7 +399,7 @@ leaseUpTo paths worker count = do
           micros <- epochMicros
           leaseIdent <- uniqueLeaseId paths micros (taskId task)
           let lease = Lease task leaseIdent worker (timestamp now)
-          moved <- try (renameFile path (leasedPath paths leaseIdent))
+          moved <- try (syncedRename path (leasedPath paths leaseIdent))
             :: IO (Either IOException ())
           case moved of
             Left exception
@@ -483,7 +486,7 @@ ackOne paths (LeaseRef ident leaseIdent) output = do
 -- go, and the task's attachments go.
 completeAck :: Paths -> Task -> LeaseId -> IO ()
 completeAck paths task leaseIdent = do
-  renameFile (leasedPath paths leaseIdent) (donePath paths leaseIdent)
+  syncedRename (leasedPath paths leaseIdent) (donePath paths leaseIdent)
   removeSidecars paths leaseIdent
   tombstoneAndDelete paths (taskId task)
 
@@ -582,7 +585,7 @@ failLease paths (LeaseRef ident leaseIdent) reason retry = do
 completeFail :: Paths -> Task -> LeaseId -> Retry -> IO ()
 completeFail paths task leaseIdent retry = do
   when (retry == Retry) (returnToPending paths task)
-  removeFile (leasedPath paths leaseIdent)
+  syncedRemove (leasedPath paths leaseIdent)
   removeSidecars paths leaseIdent
   when (retry == NoRetry) (tombstoneAndDelete paths (taskId task))
 
@@ -713,7 +716,7 @@ reclaimOne :: Paths -> FilePath -> LeaseId -> IO ()
 reclaimOne paths leasedFile leaseIdent = do
   task <- readTaskFile leasedFile
   returnToPending paths task
-  removeFile leasedFile
+  syncedRemove leasedFile
   removeSidecars paths leaseIdent
   BLC.putStrLn (encodeReclaimResult (taskId task))
 

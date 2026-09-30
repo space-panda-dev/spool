@@ -22,4 +22,4 @@ document and the implementation say nothing of it until it is accepted.
 | [0011](0011-a-lease-id-is-opaque-to-its-holder.md) | A lease identifier is opaque to its holder |
 | [0012](0012-every-line-is-read-first-and-answered.md) | Every line is read first, and every line is answered |
 | [0013](0013-the-record-commits-and-recovery-finishes.md) | The record commits the transition, and recovery finishes it |
-| [0014](0014-durable-means-through-a-power-loss.md) | Proposed: durable means through a power loss |
+| [0014](0014-durable-means-through-a-power-loss.md) | Durable means through a power loss |
