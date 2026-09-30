@@ -128,6 +128,13 @@ grantRecord =
       assertBool "the names differ" (workerNameText (grantWorker grant) /= "A")
       fmap (workerNameText . grantWorker) (parseGrantJSON (renderGrant grant))
         @?= Right "\321"
+  , testCase "a record is written in canonical form" $ do
+      grant <- either assertFailure pure
+        (grantWith "worker-one" (Just "2026-10-01T00:00:00Z"))
+      renderGrant grant @?= TE.encodeUtf8
+        ( "{\"expires_at\":\"2026-10-01T00:00:00Z\",\"grant_id\":\"" <> identifierText
+            <> "\",\"peer\":\"peer-one\",\"public_key\":\"" <> publicKey
+            <> "\",\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}" )
   , testCase "an unknown field is refused" $
       assertBool "refused" $ isLeft $ parseGrantJSON
         "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"expires_at\":null,\"extra\":1}"

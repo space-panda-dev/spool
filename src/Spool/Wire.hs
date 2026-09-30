@@ -48,10 +48,9 @@ import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
-import Data.Foldable (toList)
-import Data.List (sortOn)
 import qualified Data.Text as T
 import qualified Spool.Attachments as SA
+import Spool.Canonical (canonical, encode)
 import Spool.Types
   ( Capability
   , LeaseId
@@ -343,29 +342,6 @@ encodeReclaimResult ident = reply ident "reclaimed"
 -- | What a transition answers: the task, and what became of it.
 reply :: TaskId -> T.Text -> BL.ByteString
 reply ident status = canonical (A.object ["task_id" .= ident, "status" .= status])
-
--- | The canonical bytes of anything the protocol writes.
-encode :: ToJSON a => a -> BL.ByteString
-encode = canonical . toJSON
-
--- | One line, no spaces, and the keys of every object in order, so that
--- equal values are equal bytes.
-canonical :: A.Value -> BL.ByteString
-canonical value = case value of
-  A.Null -> "null"
-  A.Bool True -> "true"
-  A.Bool False -> "false"
-  A.Number number -> A.encode number
-  A.String text -> A.encode text
-  A.Array values -> "[" <> joinComma (map canonical (toList values)) <> "]"
-  A.Object object -> "{" <> joinComma (map encodePair ordered) <> "}"
-    where
-      ordered = sortOn (K.toText . fst) (KM.toList object)
-      encodePair (key, child) = A.encode (K.toText key) <> ":" <> canonical child
-
-joinComma :: [BL.ByteString] -> BL.ByteString
-joinComma [] = ""
-joinComma (firstValue : rest) = firstValue <> foldMap ("," <>) rest
 
 readInteger :: T.Text -> Maybe Integer
 readInteger value = case reads (T.unpack value) of

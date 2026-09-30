@@ -37,6 +37,7 @@ library
       Spool
     , Spool.Access
     , Spool.Attachments
+    , Spool.Canonical
     , Spool.Cli
     , Spool.Error
     , Spool.Files

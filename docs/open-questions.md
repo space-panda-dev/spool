@@ -11,8 +11,13 @@ than guessing.
 - How are large results returned? Results are small JSON; anything bigger is
   the capability's business until a real need says otherwise.
 - How is the protocol versioned, and how does a worker learn the version a
-  spool speaks?
+  spool speaks? Every reader refuses a field it does not define, so the
+  first field added to an envelope or a record makes every older reader
+  refuse it. The answer has to come before that field does.
 - Is there a hard cancel for a running task?
+- Should a worker stop a run when its lease is lost? A renewal that is
+  refused is found only when the program finishes, so the program runs to
+  the end of work that can no longer be acknowledged.
 
 ## Access
 

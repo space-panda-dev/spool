@@ -42,6 +42,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (UTCTime, defaultTimeLocale, formatTime, parseTimeM)
 import System.FilePath (isAbsolute, normalise, splitDirectories, (</>))
+import Spool.Canonical (encode)
 import Spool.Types (Retry (..), WorkerName, workerNameFromGrant)
 
 -- | @grant_@ and then 32 lower-case hexadecimal characters.
@@ -152,9 +153,9 @@ grantKeys = sort
   , "expires_at"
   ]
 
--- | The record as the bytes of one atomic file.
+-- | The record as the bytes of one atomic file, in canonical form.
 renderGrant :: Grant -> BS.ByteString
-renderGrant = BL.toStrict . A.encode
+renderGrant = BL.toStrict . encode
 
 instance ToJSON Grant where
   toJSON grant = A.object

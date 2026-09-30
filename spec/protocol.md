@@ -91,6 +91,56 @@ spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
 spool work --config FILE --show
 ```
 
+### What a command writes
+
+Every JSON line Spool writes, to stdout or to a file, is canonical: one line,
+no space outside a string, and the keys of every object in code point order.
+Equal values are therefore equal bytes. The examples in this document list
+fields in the order they are easiest to read, which is not that order. Input
+may have its keys in any order and any JSON whitespace.
+
+Whatever a command has to say about a failure goes to stderr as text, one
+line beginning `spool: `. stderr is for a person; nothing in it is part of
+the protocol, and its wording may change.
+
+`put`, `ack`, `renew`, `fail`, and `reclaim` answer on stdout with one line
+for each task they acted on, in the order they acted:
+
+```json
+{"task_id":"task-one","status":"inserted"}
+```
+
+| Command | `status` | Meaning |
+|---|---|---|
+| `put` | `inserted` | the task is now pending |
+| `put` | `existing` | an equal task was already there |
+| `ack` | `acked` | the task is now done |
+| `ack` | `already_done` | the same acknowledgement had been made |
+| `renew` | `renewed` | the lease will not be reclaimed yet |
+| `fail` | `failed_retry` | the task is pending again |
+| `fail --no-retry` | `failed` | the task is failed |
+| `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
+
+`init` answers nothing.
+
+`lease` answers with one line for each task it leased, and exits 1 with no
+line when nothing was pending:
+
+```json
+{"task_id":"task-one","capability":"classify@1","lease_id":"lease_...","worker":"worker-one","leased_at":"2026-09-29T12:00:00Z","payload":{"anything":"opaque"},"attachments":[]}
+```
+
+`ack`, `renew`, and `fail` take one line for each lease:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","result":{"anything":"opaque"}}
+{"task_id":"task-one","lease_id":"lease_..."}
+{"task_id":"task-one","lease_id":"lease_...","reason":"why"}
+```
+
+A line whose lease is stale or unknown gets no line on stdout. The lines
+after it are still acted on, and the command then exits 4.
+
 `results` emits one JSON object per acknowledged task, oldest first:
 
 ```json
@@ -166,8 +216,8 @@ spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--expir
 spool --dir DIR revoke --grant GRANT_ID
 ```
 
-`grant` creates this exact record beneath the dedicated account's
-`$HOME/.spool/grants/` directory:
+`grant` creates this record, in canonical form, beneath the dedicated
+account's `$HOME/.spool/grants/` directory:
 
 ```json
 {"grant_id":"grant_0123456789abcdef0123456789abcdef","peer":"peer-one","worker":"worker-one","spool":"/absolute/spool","public_key":"ssh-ed25519 AAAA...","expires_at":"2026-10-01T00:00:00Z"}
