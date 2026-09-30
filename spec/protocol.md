@@ -82,6 +82,15 @@ A task is **pending**, **leased**, **done**, or **failed**.
 
 A lease ID that is not the task's current lease acts on nothing.
 
+Under [ADR 0011](../docs/decisions/0011-a-lease-id-is-opaque-to-its-holder.md),
+a `lease_id` is `lease_` followed by one or more of ASCII letters, digits,
+`.`, `_`, and `-`, without `--`, and is at most 200 characters. A worker is
+given a `lease_id` and gives it back unchanged; it reads nothing from it. What
+follows `lease_` belongs to the spool that made it. A `lease_id` that fits
+the grammar and names no lease on file is stale or unknown (exit 4), never
+malformed input. `leased_at` is the time the lease was taken, for a worker
+that wants it.
+
 ## Commands
 
 Every command takes an explicit spool directory. Input and output are JSONL,
