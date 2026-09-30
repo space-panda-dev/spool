@@ -110,8 +110,8 @@ import Spool.Types
   , leaseStarted
   , mkLeaseId
   , mkTaskId
+  , mkWorkerName
   , newLeaseId
-  , storedWorkerName
   , taskIdText
   , timestamp
   , workerNameText
@@ -306,10 +306,12 @@ readWorkerSidecar paths leaseIdent = do
       ("leased task has no worker sidecar: " <> showLease leaseIdent))
     else do
       bytes <- BS.readFile path
-      case TE.decodeUtf8' bytes of
+      case mkWorkerName . T.strip =<< decoded bytes of
         Left _ -> throwIO (corrupt
           ("corrupt worker sidecar for " <> showLease leaseIdent))
-        Right worker -> pure (storedWorkerName (T.strip worker))
+        Right worker -> pure worker
+  where
+    decoded = either (const (Left "not UTF-8")) Right . TE.decodeUtf8'
 
 writeRenewedSidecar :: Paths -> LeaseId -> Integer -> IO ()
 writeRenewedSidecar paths leaseIdent micros =

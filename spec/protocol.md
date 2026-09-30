@@ -18,10 +18,23 @@ that field explicitly.
 {"task_id":"task-one","capability":"classify@1","payload":{"anything":"opaque"},"attachments":[]}
 ```
 
-- `task_id`: ASCII letters, digits, `.`, `_`, and `-`; `--` is reserved.
+- `task_id`: a name (below); `--` is reserved.
 - `capability`: `name@version`, where `name` matches `[A-Za-z0-9._-]+` and
-  `version` matches `[A-Za-z0-9.]+`. Only the grammar is checked.
+  `version` matches `[A-Za-z0-9.]+`, 1 to 128 characters in all. Only the
+  grammar is checked.
 - `payload`: any JSON value, including null. Never interpreted.
+
+### Names
+
+Under [ADR 0010](../docs/decisions/0010-names-have-one-grammar-and-a-length.md),
+a name is 1 to 128 characters from ASCII letters, digits, `.`, `_`, and `-`.
+`task_id` is a name. `worker` is a name of at most 64 characters, wherever it
+is given: as an argument, in a grant, in a lease. `peer` is a label for a
+person to read: 1 to 128 characters, none of them a control character.
+
+The rule holds wherever the name is read. A name outside it is malformed
+input from a caller (exit 2), a denied grant from a peer (exit 5), and
+corrupt durable state in the spool's own files (exit 70).
 
 ### Attachments
 

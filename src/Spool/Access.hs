@@ -43,7 +43,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time (UTCTime, defaultTimeLocale, formatTime, parseTimeM)
 import System.FilePath (isAbsolute, normalise, splitDirectories, (</>))
 import Spool.Canonical (encode)
-import Spool.Types (Retry (..), WorkerName, workerNameFromGrant)
+import Spool.Types (Retry (..), WorkerName, mkWorkerName, validatePeer)
 
 -- | @grant_@ and then 32 lower-case hexadecimal characters.
 newtype GrantId = GrantId T.Text
@@ -204,8 +204,8 @@ validateGrant
   -> Either String Grant
 validateGrant identifierText peer workerText spool publicKeyValue expiryText = do
   identifier <- mkGrantId identifierText
-  validateLabel "peer" peer
-  worker <- workerNameFromGrant workerText
+  validatePeer peer
+  worker <- mkWorkerName workerText
   validateGrantSpool spool
   publicKey <- mkPublicKey publicKeyValue
   expiry <- case expiryText of
@@ -224,14 +224,6 @@ parseExpiry :: T.Text -> Either String UTCTime
 parseExpiry text = case parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ" (T.unpack text) of
   Nothing -> Left "expires_at must be a UTC RFC3339 timestamp ending in Z"
   Just value -> Right value
-
-validateLabel :: String -> T.Text -> Either String ()
-validateLabel label value
-  | T.null value = Left (label <> " must be non-empty")
-  | T.all isSafe value = Right ()
-  | otherwise = Left (label <> " must not contain control characters")
-  where
-    isSafe character = character >= ' ' && character /= '\DEL'
 
 -- | A record stores a canonical absolute path, not a path that will be
 -- normalised differently when the forced command later reads it.

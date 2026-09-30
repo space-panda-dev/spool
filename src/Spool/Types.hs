@@ -18,10 +18,9 @@ module Spool.Types
   , leaseIdText
   , leaseStarted
   , WorkerName
-  , workerNameFromArgument
-  , workerNameFromGrant
-  , storedWorkerName
+  , mkWorkerName
   , workerNameText
+  , validatePeer
   , Retry (..)
   , retryFlag
   , StatusFormat (..)
@@ -36,16 +35,27 @@ import Data.Aeson.Types (toJSONKeyText)
 import qualified Data.Text as T
 import Data.Time (UTCTime, defaultTimeLocale, formatTime)
 
--- | ASCII letters, digits, @.@, @_@, and @-@; @--@ is reserved.
+-- | A name: 1 to 128 of ASCII letters, digits, @.@, @_@, and @-@.  Every
+-- identifier a caller chooses is one, so that it is the same wherever it is
+-- typed, is safe as a file name, and leaves a file name room for what the
+-- spool adds to it.
+nameChecked :: String -> Int -> T.Text -> Either String T.Text
+nameChecked what longest value
+  | T.null value = Left (what <> " must be non-empty")
+  | T.length value > longest =
+      Left (what <> " must be at most " <> show longest <> " characters")
+  | T.all tokenChar value = Right value
+  | otherwise =
+      Left (what <> " must contain only ASCII letters, digits, '.', '_' or '-'")
+
+-- | A name; @--@ is reserved.
 newtype TaskId = TaskId T.Text
   deriving (Eq, Ord, Show)
 
 mkTaskId :: T.Text -> Either String TaskId
 mkTaskId value
-  | T.null value = Left "task_id must be non-empty"
   | T.isInfixOf "--" value = Left "task_id cannot contain --"
-  | T.all tokenChar value = Right (TaskId value)
-  | otherwise = Left "task_id must contain only ASCII letters, digits, '.', '_' or '-'"
+  | otherwise = TaskId <$> nameChecked "task_id" 128 value
 
 taskIdText :: TaskId -> T.Text
 taskIdText (TaskId value) = value
@@ -53,8 +63,8 @@ taskIdText (TaskId value) = value
 instance ToJSON TaskId where
   toJSON = toJSON . taskIdText
 
--- | @name\@version@.  Only the grammar is checked; the name means whatever
--- a worker's owner configured it to mean.
+-- | @name\@version@, at most 128 characters in all.  Only the grammar is
+-- checked; the name means whatever a worker's owner configured it to mean.
 newtype Capability = Capability T.Text
   deriving (Eq, Ord, Show)
 
@@ -62,6 +72,7 @@ mkCapability :: T.Text -> Either String Capability
 mkCapability value = case T.breakOn "@" value of
   (name, rest)
     | T.null rest -> Left "capability must be of the form name@version"
+    | T.length value > 128 -> Left "capability must be at most 128 characters"
     | T.null name -> Left "capability name must be non-empty"
     | T.null version -> Left "capability version must be non-empty"
     | not (T.all tokenChar name) ->
@@ -117,36 +128,27 @@ leaseStarted (LeaseId value) =
 instance ToJSON LeaseId where
   toJSON = toJSON . leaseIdText
 
--- | Who is leasing.  Two rules admit a name, and they differ: a name given as
--- an argument may hold no whitespace, and a name in a grant may hold no
--- control character.  The protocol states neither, so both stand until it
--- does, each under its own name here.
+-- | Who is leasing: a name of at most 64 characters, the same wherever it
+-- is given, as an argument, in a grant, or in a lease.
 newtype WorkerName = WorkerName T.Text
   deriving (Eq, Ord, Show)
 
--- | A name from the command line: non-empty, with no space, tab, or line end.
-workerNameFromArgument :: String -> Either String WorkerName
-workerNameFromArgument value
-  | not (null value) && all (`notElem` ['\n', '\r', '\t', ' ']) value =
-      Right (WorkerName (T.pack value))
-  | otherwise = Left "worker must be a non-empty token"
-
--- | A name from a grant record: non-empty, with no control character.
-workerNameFromGrant :: T.Text -> Either String WorkerName
-workerNameFromGrant value
-  | T.null value = Left "worker must be non-empty"
-  | T.all printable value = Right (WorkerName value)
-  | otherwise = Left "worker must not contain control characters"
-  where
-    printable character = character >= ' ' && character /= '\DEL'
-
--- | A name read back from the spool's own files, taken as it was written.
--- It passed one of the two rules when it was recorded.
-storedWorkerName :: T.Text -> WorkerName
-storedWorkerName = WorkerName
+mkWorkerName :: T.Text -> Either String WorkerName
+mkWorkerName = fmap WorkerName . nameChecked "worker" 64
 
 workerNameText :: WorkerName -> T.Text
 workerNameText (WorkerName value) = value
+
+-- | A peer is a label for a person to read, never compared or made into a
+-- path: 1 to 128 characters, none of them a control character.
+validatePeer :: T.Text -> Either String ()
+validatePeer value
+  | T.null value = Left "peer must be non-empty"
+  | T.length value > 128 = Left "peer must be at most 128 characters"
+  | T.all printable value = Right ()
+  | otherwise = Left "peer must not contain control characters"
+  where
+    printable character = character >= ' ' && character /= '\DEL'
 
 instance ToJSON WorkerName where
   toJSON = toJSON . workerNameText

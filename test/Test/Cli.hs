@@ -10,7 +10,7 @@ import Spool.Types
   ( Retry (..)
   , StatusFormat (..)
   , WorkerName
-  , workerNameFromArgument
+  , mkWorkerName
   )
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, testCase, (@?=))
@@ -24,7 +24,7 @@ tests = testGroup "command line"
   ]
 
 w :: WorkerName
-w = either error id (workerNameFromArgument "w")
+w = either error id (mkWorkerName "w")
 
 acceptedForms :: [([String], Command)]
 acceptedForms =

@@ -1,6 +1,6 @@
 # 0010. Names have one grammar and a length
 
-Status: proposed
+Status: accepted
 
 The protocol gives `task_id` and `capability` a grammar and gives `worker`
 and `peer` none. The implementation fills the gap twice: a worker named as an

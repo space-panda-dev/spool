@@ -61,9 +61,9 @@ import Spool.Types
   , mkCapability
   , mkLeaseId
   , mkTaskId
+  , mkWorkerName
   , retryFlag
   , storedTimestamp
-  , storedWorkerName
   )
 
 type Object = KM.KeyMap A.Value
@@ -294,11 +294,12 @@ recordIdentity object = do
   identText <- requiredText "task_id" object
   leaseText <- requiredText "lease_id" object
   capabilityText <- requiredText "capability" object
-  worker <- requiredText "worker" object
+  workerText <- requiredText "worker" object
   ident <- mkTaskId identText
   lease <- mkLeaseId leaseText
   capability <- mkCapability capabilityText
-  pure (ident, lease, capability, storedWorkerName worker)
+  worker <- mkWorkerName workerText
+  pure (ident, lease, capability, worker)
 
 -- | A field that must be there and may hold any value, null included.
 required :: String -> K.Key -> Object -> Either String A.Value
