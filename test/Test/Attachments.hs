@@ -12,8 +12,11 @@ import Data.Either (isLeft)
 import qualified Data.Text as T
 import Spool.Attachments
   ( Attachment (..)
+  , Sha256
   , isStagingLeftover
+  , mkSha256
   , receiveAttachment
+  , sha256Text
   , validateAttachments
   )
 import System.Directory (getTemporaryDirectory, listDirectory,
@@ -41,8 +44,8 @@ tests = do
           refusalSurvivesRefusedCleanup
     ]
 
-digest :: Char -> T.Text
-digest = T.replicate 64 . T.singleton
+digest :: Char -> Sha256
+digest = either error id . mkSha256 . T.replicate 64 . T.singleton
 
 declarations :: [TestTree]
 declarations =
@@ -55,11 +58,16 @@ declarations =
   , testCase "a repeated digest is refused" $
       assertBool "refused" $ isLeft $
         validateAttachments [Attachment (digest 'a') 1, Attachment (digest 'a') 2]
+  , testCase "a digest reads back as the text it was made from" $
+      sha256Text (digest 'a') @?= T.replicate 64 "a"
   , testCase "an upper-case digest is refused" $
-      assertBool "refused" (isLeft (validateAttachments [Attachment (digest 'A') 1]))
+      assertBool "refused" (isLeft (mkSha256 (T.replicate 64 "A")))
   , testCase "a short digest is refused" $
-      assertBool "refused" $ isLeft $
-        validateAttachments [Attachment (T.replicate 63 "a") 1]
+      assertBool "refused" (isLeft (mkSha256 (T.replicate 63 "a")))
+  , testCase "a long digest is refused" $
+      assertBool "refused" (isLeft (mkSha256 (T.replicate 65 "a")))
+  , testCase "a path for a digest is refused" $
+      assertBool "refused" (isLeft (mkSha256 "../../etc/passwd"))
   , testCase "a negative size is refused" $
       assertBool "refused" (isLeft (validateAttachments [Attachment (digest 'a') (-1)]))
   ]

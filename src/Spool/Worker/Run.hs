@@ -17,15 +17,15 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar,
                                 tryReadMVar)
 import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
 import Control.Exception (IOException, SomeException, bracket, catch,
-                          displayException, finally, throwIO, try)
+                          displayException, finally, fromException, throwIO,
+                          toException, try)
 import Control.Monad (forM_, void)
 import qualified Data.Aeson as A
-import qualified Data.Aeson.Key as K
-import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
@@ -38,9 +38,23 @@ import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcess)
 import System.Process (CreateProcess (..), ProcessHandle, StdStream (CreatePipe),
                        createProcess, getPid, proc, waitForProcess)
 import qualified Spool.Attachments as SA
-import Spool.Failure (SpoolFailure (..), throwFailure)
+import Spool.Error
+  ( SpoolError
+  , corrupt
+  , exitStatus
+  , report
+  , withContext
+  )
 import Spool.Files (Paths (..), withLock, epochMicros)
 import Spool.Store (leaseUpTo, ackOne, renewOne, failLease)
+import Spool.Types
+  ( LeaseId
+  , Retry (..)
+  , TaskId
+  , WorkerName
+  , capabilityText
+  , taskIdText
+  )
 import Spool.Wire (Task (..), Lease (..), canonical)
 import Spool.Worker.Config
   ( CapabilityConfig (..)
@@ -57,7 +71,7 @@ ignoreProcessRace action = action `catch` ignore
     ignore :: IOException -> IO ()
     ignore _ = pure ()
 
-runWork :: Paths -> T.Text -> FilePath -> Maybe Int -> IO ()
+runWork :: Paths -> WorkerName -> FilePath -> Maybe Int -> IO ()
 runWork paths worker configPath maxTasks = do
   config <- loadWorkConfig configPath
   slots <- newQSem (wcMaxConcurrent config)
@@ -77,8 +91,9 @@ runWork paths worker configPath maxTasks = do
                 writeIORef launchedRef (launched + 1)
                 _ <- forkFinally (runOneLease paths config lease) $ \outcome -> do
                   case outcome of
-                    Left exception ->
-                      modifyMVar_ workerFailures (pure . (exception :))
+                    Left exception -> do
+                      held <- reported exception
+                      modifyMVar_ workerFailures (pure . (held :))
                     Right () -> pure ()
                   signalQSem slots
                   signalQSem completions
@@ -93,6 +108,14 @@ runWork paths worker configPath maxTasks = do
   where
     waitAll _ 0 = pure ()
     waitAll sem n = waitQSem sem >> waitAll sem (n - 1 :: Int)
+    -- A task's failure is said when it happens, while the others run on.
+    -- What is kept for the end is only its exit status, so the entry point
+    -- does not say it a second time.
+    reported exception = case fromException exception of
+      Just failure -> do
+        report (failure :: SpoolError)
+        pure (toException (ExitFailure (exitStatus failure)))
+      Nothing -> pure exception
 
 -- | Run one already-leased task to completion: refuse it outright if its
 -- capability or payload size fails the configuration's rules, otherwise
@@ -101,23 +124,23 @@ runOneLease :: Paths -> WorkConfig -> Lease -> IO ()
 runOneLease paths config lease = do
   let task = leaseTask lease
       leaseIdent = leaseId lease
-      worker = leaseWorker lease
-      capText = taskCapability task
-  case KM.lookup (K.fromText capText) (wcCapabilities config) of
+      capability = taskCapability task
+  case Map.lookup capability (wcCapabilities config) of
     Nothing -> completeFailure paths (taskId task) leaseIdent
-      ("capability " <> capText <> " is not in the worker configuration") False
+      ("capability " <> capabilityText capability
+        <> " is not in the worker configuration") NoRetry
     Just capConfig -> do
       let payloadBytes = canonical (taskPayload task)
       if BL.length payloadBytes > capMaxPayloadBytes capConfig
         then completeFailure paths (taskId task) leaseIdent
           ("payload of " <> T.pack (show (BL.length payloadBytes))
             <> " bytes exceeds max_payload_bytes " <> T.pack (show (capMaxPayloadBytes capConfig)))
-          False
-        else runExecutable paths config task leaseIdent worker capConfig payloadBytes
+          NoRetry
+        else runExecutable paths config task leaseIdent capConfig payloadBytes
 
 runExecutable
-  :: Paths -> WorkConfig -> Task -> T.Text -> T.Text -> CapabilityConfig -> BL.ByteString -> IO ()
-runExecutable paths config task leaseIdent worker capConfig payloadBytes = do
+  :: Paths -> WorkConfig -> Task -> LeaseId -> CapabilityConfig -> BL.ByteString -> IO ()
+runExecutable paths config task leaseIdent capConfig payloadBytes = do
   tempDir <- freshTempDir
   renewalFailure <- newEmptyMVar
   renewalThreadId <- forkIO
@@ -129,26 +152,24 @@ runExecutable paths config task leaseIdent worker capConfig payloadBytes = do
     `finally` (killThread renewalThreadId >> removeWorkerDirectory tempDir)
   renewalError <- tryReadMVar renewalFailure
   case renewalError of
-    Just message -> throwFailure (SpoolFailure 4
-      ("work: renewal failed: " <> message))
+    Just failure -> throwIO (withContext "work: renewal failed: " failure)
     Nothing -> case outcome of
-      RunFailure reason -> completeFailure paths (taskId task) leaseIdent reason True
+      RunFailure reason -> completeFailure paths (taskId task) leaseIdent reason Retry
       RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
-        Left _ -> completeFailure paths (taskId task) leaseIdent "output is not JSON" True
-        Right outputValue -> completeSuccess paths task leaseIdent worker outputValue
+        Left _ -> completeFailure paths (taskId task) leaseIdent "output is not JSON" Retry
+        Right outputValue -> completeSuccess paths task leaseIdent outputValue
 
 receiveTaskAttachments :: Paths -> Task -> FilePath -> IO ()
 receiveTaskAttachments paths task tempDir = do
   let workerAttachmentRoot = tempDir </> "attachments"
   forM_ (taskAttachments task) $ \attachment -> do
-    source <- either (throwFailure . SpoolFailure 70) pure
-      (SA.attachmentPath (attachmentsDir paths) (taskId task) attachment)
+    let source = SA.attachmentPath (attachmentsDir paths) (taskId task) attachment
     bracket (openBinaryFile source ReadMode) hClose $ \handle -> do
       received <- SA.receiveAttachment workerAttachmentRoot attachment handle
       case received of
-        Left message -> throwFailure (SpoolFailure 70
-          ("attachment verification failed for " <> T.unpack (taskId task)
-            <> ": " <> message))
+        Left message -> throwIO (corrupt
+          ("attachment verification failed for "
+            <> T.unpack (taskIdText (taskId task)) <> ": " <> message))
         Right () -> pure ()
 
 removeWorkerDirectory :: FilePath -> IO ()
@@ -158,27 +179,27 @@ removeWorkerDirectory directory = do
     Left exception -> ioError exception
     Right () -> pure ()
 
-renewalLoop :: Paths -> T.Text -> T.Text -> Int -> MVar String -> IO ()
+renewalLoop :: Paths -> TaskId -> LeaseId -> Int -> MVar SpoolError -> IO ()
 renewalLoop paths taskIdent leaseIdent renewSeconds failure = do
   threadDelay (renewSeconds * 1000000)
   result <- withLock paths (renewOne paths taskIdent leaseIdent)
   case result of
     Right () -> renewalLoop paths taskIdent leaseIdent renewSeconds failure
-    Left message -> putMVar failure message
+    Left refusal -> putMVar failure refusal
 
-completeSuccess :: Paths -> Task -> T.Text -> T.Text -> A.Value -> IO ()
-completeSuccess paths task leaseIdent _worker output = withLock paths $ do
+completeSuccess :: Paths -> Task -> LeaseId -> A.Value -> IO ()
+completeSuccess paths task leaseIdent output = withLock paths $ do
   result <- ackOne paths (taskId task) leaseIdent output
   case result of
-    Left message -> throwFailure (SpoolFailure 4 ("work: " <> message))
+    Left refusal -> throwIO (withContext "work: " refusal)
     Right _ -> pure ()
 
-completeFailure :: Paths -> T.Text -> T.Text -> T.Text -> Bool -> IO ()
+completeFailure :: Paths -> TaskId -> LeaseId -> T.Text -> Retry -> IO ()
 completeFailure paths taskIdent leaseIdent reason retry = withLock paths $ do
   result <- failLease paths taskIdent leaseIdent reason retry
   case result of
-    Left message -> throwFailure (SpoolFailure 4 ("work: " <> message))
-    Right _ -> pure ()
+    Left refusal -> throwIO (withContext "work: " refusal)
+    Right () -> pure ()
 
 freshTempDir :: IO FilePath
 freshTempDir = do

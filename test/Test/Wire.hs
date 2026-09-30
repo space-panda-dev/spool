@@ -11,14 +11,22 @@ import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.Either (isLeft, isRight)
 import Data.List (nub)
 import qualified Data.Text as T
-import Spool.Attachments (Attachment (..))
+import Spool.Attachments (Attachment (..), Sha256, mkSha256)
+import Spool.Types
+  ( Capability
+  , LeaseId
+  , TaskId
+  , mkCapability
+  , mkLeaseId
+  , mkTaskId
+  , storedWorkerName
+  )
 import Spool.Wire
   ( Lease (..)
   , Task (..)
   , canonical
   , encodeLease
   , encodeTask
-  , leaseMicros
   , parseAck
   , parseFail
   , parseFailureRecord
@@ -26,9 +34,6 @@ import Spool.Wire
   , parseLeaseRef
   , parseResultRecord
   , parseTask
-  , validateCapability
-  , validateLeaseId
-  , validateTaskId
   )
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
@@ -42,6 +47,7 @@ import Test.Tasty.QuickCheck
   , oneof
   , sized
   , resize
+  , suchThat
   , testProperty
   , (===)
   , (==>)
@@ -50,7 +56,6 @@ import Test.Tasty.QuickCheck
 tests :: TestTree
 tests = testGroup "wire"
   [ testGroup "task" taskTests
-  , testGroup "identifiers" identifierTests
   , testGroup "requests" requestTests
   , testGroup "records" recordTests
   , testGroup "canonical encoding" canonicalTests
@@ -81,29 +86,45 @@ value = sized go
 token :: String -> Gen T.Text
 token alphabet = T.pack <$> listOf1 (elements alphabet)
 
-taskIdentifier :: Gen T.Text
-taskIdentifier = token (['a' .. 'z'] <> ['A' .. 'Z'] <> ['0' .. '9'] <> "._")
+-- | Made through the checking functions, as every identifier is.  A text
+-- the grammar refuses would stop the suite here, not pass for an identifier.
+made :: (T.Text -> Either String a) -> T.Text -> a
+made make = either error id . make
 
-capability :: Gen T.Text
+taskIdentifier :: Gen TaskId
+taskIdentifier = made mkTaskId <$>
+  token (['a' .. 'z'] <> ['A' .. 'Z'] <> ['0' .. '9'] <> "._-")
+    `suchThat` (not . T.isInfixOf "--")
+
+capability :: Gen Capability
 capability = do
   name <- token (['a' .. 'z'] <> ['0' .. '9'] <> "._-")
   version <- token (['0' .. '9'] <> ".")
-  pure (name <> "@" <> version)
+  pure (made mkCapability (name <> "@" <> version))
+
+sha :: Char -> Sha256
+sha = made mkSha256 . T.replicate 64 . T.singleton
 
 task :: Gen Task
 task = Task <$> taskIdentifier <*> capability <*> value <*> attachments
   where
     attachments = elements
       [ []
-      , [Attachment (T.replicate 64 "a") 0]
-      , [Attachment (T.replicate 64 "a") 12, Attachment (T.replicate 64 "b") 9223372036854775807]
+      , [Attachment (sha 'a') 0]
+      , [Attachment (sha 'a') 12, Attachment (sha 'b') 9223372036854775807]
       ]
+
+taskOne :: TaskId
+taskOne = made mkTaskId "t"
+
+leaseOne :: LeaseId
+leaseOne = made mkLeaseId "lease_1_1_t"
 
 taskTests :: [TestTree]
 taskTests =
   [ testCase "the protocol's example is a task" $
       parseTask "{\"task_id\":\"task-one\",\"capability\":\"classify@1\",\"payload\":{\"anything\":\"opaque\"},\"attachments\":[]}"
-        @?= Right (Task "task-one" "classify@1"
+        @?= Right (Task (made mkTaskId "task-one") (made mkCapability "classify@1")
               (A.object ["anything" A..= ("opaque" :: T.Text)]) [])
   , testCase "a task written before attachments existed still reads" $
       fmap taskAttachments
@@ -132,14 +153,15 @@ taskTests =
       forAll task $ \original -> parseTask (encodeTask original) === Right original
   , testProperty "a lease carries its task's fields unchanged" $
       forAll task $ \original ->
-        let lease = Lease original "lease_1_1_t" "worker-one" "2026-09-29T12:00:00Z"
+        let lease = Lease original leaseOne (storedWorkerName "worker-one")
+              "2026-09-29T12:00:00Z"
             carried = do
               A.Object object <- A.decode (encodeLease lease)
               pure ( KM.lookup "task_id" object, KM.lookup "capability" object
                    , KM.lookup "payload" object, KM.lookup "attachments" object )
         in carried === Just
-             ( Just (A.String (taskId original))
-             , Just (A.String (taskCapability original))
+             ( Just (A.toJSON (taskId original))
+             , Just (A.toJSON (taskCapability original))
              , Just (taskPayload original)
              , Just (A.toJSON (taskAttachments original)) )
   ]
@@ -148,60 +170,30 @@ taskTests =
       assertBool "refused" (isLeft (parseTask bytes))
     hex = BLC.pack . replicate 64
 
-identifierTests :: [TestTree]
-identifierTests =
-  [ testGroup "task_id accepts" (map (good validateTaskId) ["a", "task-one", "A.b_c-9"])
-  , testGroup "task_id rejects"
-      (map (bad validateTaskId) ["", "a--b", "a/b", "../escape", "a b", "caf\233", "a\nb"])
-  , testGroup "capability accepts"
-      (map (good validateCapability) ["classify@1", "opaque.name@1.2", "a-b_c@0"])
-  , testGroup "capability rejects"
-      (map (bad validateCapability)
-        ["", "onlyname", "@1", "classify@", "bad name@1", "bad/name@1", "name@1-2", "a@b@c"])
-  , testGroup "lease_id accepts"
-      (map (good validateLeaseId) ["lease_1790717360482536_1_task-one"])
-  , testGroup "lease_id rejects"
-      (map (bad validateLeaseId) ["", "lease", "task_1_1_t", "lease_1--2", "lease_../x", "lease_a b"])
-  , testCase "a lease's time is read from its identifier" $
-      leaseMicros "lease_1790717360482536_1_task-one" @?= Just 1790717360482536
-  , testCase "a name that is not a lease has no time" $
-      leaseMicros "task-one" @?= Nothing
-  , testCase "a lease identifier without digits has no time" $
-      leaseMicros "lease_x" @?= Nothing
-  , testProperty "every generated task_id is one the grammar accepts" $
-      forAll taskIdentifier $ \ident ->
-        not ("--" `T.isInfixOf` ident) ==> isRight (validateTaskId ident)
-  ]
-  where
-    good check input = testCase (show input) $
-      assertBool "accepted" (isRight (check input))
-    bad check input = testCase (show input) $
-      assertBool "refused" (isLeft (check input))
-
 requestTests :: [TestTree]
 requestTests =
   [ testCase "ack carries its result whatever it is" $
       parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":null}"
-        @?= Right ("t", "lease_1_1_t", A.Null)
+        @?= Right (taskOne, leaseOne, A.Null)
   , testCase "ack without a result is refused" $
       assertBool "refused" $ isLeft $
         parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\"}"
   , testCase "fail carries its reason" $
       parseFail "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"reason\":\"exit 3\"}"
-        @?= Right ("t", "lease_1_1_t", "exit 3")
+        @?= Right (taskOne, leaseOne, "exit 3")
   , testCase "fail with an empty reason is refused" $
       assertBool "refused" $ isLeft $
         parseFail "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"reason\":\"\"}"
   , testCase "a lease reference is a task and a lease" $
       parseLeaseRef "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\"}"
-        @?= Right ("t", "lease_1_1_t")
+        @?= Right (taskOne, leaseOne)
   , testCase "a lease reference with a result is refused" $
       assertBool "refused" $ isLeft $
         parseLeaseRef "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":1}"
   , testCase "a fetch request names one digest" $
       parseFetchRequest
         ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\"}")
-        @?= Right ("t", "lease_1_1_t", T.replicate 64 "a")
+        @?= Right (taskOne, leaseOne, sha 'a')
   , testCase "a fetch request with a path for a digest is refused" $
       assertBool "refused" $ isLeft $ parseFetchRequest
         "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"../../etc/passwd\"}"

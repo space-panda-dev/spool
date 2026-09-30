@@ -7,7 +7,9 @@ module Main (main) where
 import qualified Test.Access
 import qualified Test.Attachments
 import qualified Test.Cli
+import qualified Test.Error
 import Test.Tasty (defaultMain, testGroup)
+import qualified Test.Types
 import qualified Test.Wire
 import qualified Test.WorkerConfig
 
@@ -18,6 +20,8 @@ main = do
     [ Test.Access.tests
     , attachments
     , Test.Cli.tests
+    , Test.Error.tests
+    , Test.Types.tests
     , Test.Wire.tests
     , Test.WorkerConfig.tests
     ]

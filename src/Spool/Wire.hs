@@ -9,14 +9,11 @@ module Spool.Wire
   , Lease (..)
   , PutStatus (..)
   , AckStatus (..)
-  , validateCapability
   , parseTask
   , parseAck
   , parseFail
   , parseFetchRequest
   , rejectUnknown
-  , validateTaskId
-  , validateLeaseId
   , encodeTask
   , encodePutResult
   , encodeLease
@@ -32,7 +29,6 @@ module Spool.Wire
   , parseFailureRecord
   , parseResultRecord
   , extractTextField
-  , leaseMicros
   , readInteger
   ) where
 
@@ -44,20 +40,31 @@ import qualified Data.ByteString.Lazy as BL
 import Data.List (sortOn)
 import qualified Data.Text as T
 import qualified Spool.Attachments as SA
+import Spool.Types
+  ( Capability
+  , LeaseId
+  , Retry (..)
+  , TaskId
+  , WorkerName
+  , mkCapability
+  , mkLeaseId
+  , mkTaskId
+  , retryFlag
+  )
 
 type Object = KM.KeyMap A.Value
 
 data Task = Task
-  { taskId :: T.Text
-  , taskCapability :: T.Text
+  { taskId :: TaskId
+  , taskCapability :: Capability
   , taskPayload :: A.Value
   , taskAttachments :: [SA.Attachment]
   } deriving (Eq, Show)
 
 data Lease = Lease
   { leaseTask :: Task
-  , leaseId :: T.Text
-  , leaseWorker :: T.Text
+  , leaseId :: LeaseId
+  , leaseWorker :: WorkerName
   , leaseTime :: T.Text
   } deriving (Eq, Show)
 
@@ -68,38 +75,14 @@ data AckStatus = Acked | AlreadyDone deriving (Eq, Show)
 objectKeys :: Object -> [T.Text]
 objectKeys = map K.toText . KM.keys
 
-validateCapability :: T.Text -> Either String ()
-validateCapability value = case T.breakOn "@" value of
-  (name, rest)
-    | T.null rest -> Left "capability must be of the form name@version"
-    | T.null name -> Left "capability name must be non-empty"
-    | T.null version -> Left "capability version must be non-empty"
-    | not (T.all validNameChar name) ->
-        Left "capability name must match [A-Za-z0-9._-]+"
-    | not (T.all validVersionChar version) ->
-        Left "capability version must match [A-Za-z0-9.]+"
-    | otherwise -> Right ()
-    where
-      version = T.drop 1 rest
-      validNameChar character = asciiAlphaNum character || character `elem` ("._-" :: String)
-      validVersionChar character = asciiAlphaNum character || character == '.'
-
-asciiAlphaNum :: Char -> Bool
-asciiAlphaNum character =
-  ('a' <= character && character <= 'z') ||
-  ('A' <= character && character <= 'Z') ||
-  ('0' <= character && character <= '9')
-
 parseTask :: BL.ByteString -> Either String Task
 parseTask bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
       rejectUnknown ["task_id", "capability", "payload", "attachments"] object
-      ident <- requiredText "task_id" object
-      validateTaskId ident
-      capability <- requiredText "capability" object
-      validateCapability capability
+      ident <- mkTaskId =<< requiredText "task_id" object
+      capability <- mkCapability =<< requiredText "capability" object
       payload <- case KM.lookup "payload" object of
         Nothing -> Left "task is missing payload"
         Just value' -> Right value'
@@ -111,48 +94,48 @@ parseTask bytes = do
       pure (Task ident capability payload attachments)
     _ -> Left "task must be a JSON object"
 
-parseAck :: BL.ByteString -> Either String (T.Text, T.Text, A.Value)
+parseAck :: BL.ByteString -> Either String (TaskId, LeaseId, A.Value)
 parseAck bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
       rejectUnknown ["task_id", "lease_id", "result"] object
-      ident <- requiredText "task_id" object
-      lease <- requiredText "lease_id" object
+      identText <- requiredText "task_id" object
+      leaseText <- requiredText "lease_id" object
       result <- case KM.lookup "result" object of
         Nothing -> Left "ack is missing result"
         Just value' -> Right value'
-      validateTaskId ident
-      validateLeaseId lease
+      ident <- mkTaskId identText
+      lease <- mkLeaseId leaseText
       pure (ident, lease, result)
     _ -> Left "ack must be a JSON object"
 
-parseFail :: BL.ByteString -> Either String (T.Text, T.Text, T.Text)
+parseFail :: BL.ByteString -> Either String (TaskId, LeaseId, T.Text)
 parseFail bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
       rejectUnknown ["task_id", "lease_id", "reason"] object
-      ident <- requiredText "task_id" object
-      lease <- requiredText "lease_id" object
+      identText <- requiredText "task_id" object
+      leaseText <- requiredText "lease_id" object
       reason <- requiredText "reason" object
-      validateTaskId ident
-      validateLeaseId lease
+      ident <- mkTaskId identText
+      lease <- mkLeaseId leaseText
       pure (ident, lease, reason)
     _ -> Left "fail must be a JSON object"
 
-parseFetchRequest :: BL.ByteString -> Either String (T.Text, T.Text, T.Text)
+parseFetchRequest :: BL.ByteString -> Either String (TaskId, LeaseId, SA.Sha256)
 parseFetchRequest bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
       rejectUnknown ["task_id", "lease_id", "sha256"] object
-      ident <- requiredText "task_id" object
-      lease <- requiredText "lease_id" object
-      digest <- requiredText "sha256" object
-      validateTaskId ident
-      validateLeaseId lease
-      _ <- SA.validateAttachments [SA.Attachment digest 0]
+      identText <- requiredText "task_id" object
+      leaseText <- requiredText "lease_id" object
+      digestText <- requiredText "sha256" object
+      ident <- mkTaskId identText
+      lease <- mkLeaseId leaseText
+      digest <- SA.mkSha256 digestText
       pure (ident, lease, digest)
     _ -> Left "fetch request must be a JSON object"
 
@@ -169,24 +152,6 @@ rejectUnknown allowed object =
   case filter (`notElem` allowed) (objectKeys object) of
     [] -> Right ()
     extras -> Left ("unknown fields: " <> T.unpack (T.intercalate ", " extras))
-
-validateTaskId :: T.Text -> Either String ()
-validateTaskId value
-  | T.null value = Left "task_id must be non-empty"
-  | T.isInfixOf "--" value = Left "task_id cannot contain --"
-  | T.all valid value = Right ()
-  | otherwise = Left "task_id must contain only ASCII letters, digits, '.', '_' or '-'"
-  where
-    valid character = asciiAlphaNum character || character `elem` ("._-" :: String)
-
-validateLeaseId :: T.Text -> Either String ()
-validateLeaseId value
-  | T.null value = Left "lease_id must be non-empty"
-  | T.isInfixOf "--" value = Left "lease_id cannot contain --"
-  | T.isPrefixOf "lease_" value && T.all valid (T.drop 6 value) = Right ()
-  | otherwise = Left "lease_id is invalid"
-  where
-    valid character = asciiAlphaNum character || character `elem` ("._-" :: String)
 
 encodeTask :: Task -> BL.ByteString
 encodeTask task = canonical (A.object
@@ -215,7 +180,7 @@ encodeLease lease = canonical (A.object
   , "attachments" .= taskAttachments (leaseTask lease)
   ])
 
-encodeAckResult :: T.Text -> AckStatus -> BL.ByteString
+encodeAckResult :: TaskId -> AckStatus -> BL.ByteString
 encodeAckResult ident result = canonical (A.object
   [ "task_id" .= ident
   , "status" .= case result of
@@ -223,36 +188,38 @@ encodeAckResult ident result = canonical (A.object
       AlreadyDone -> "already_done"
   ])
 
-encodeRenewResult :: T.Text -> BL.ByteString
+encodeRenewResult :: TaskId -> BL.ByteString
 encodeRenewResult ident = canonical (A.object
   [ "task_id" .= ident
   , "status" .= ("renewed" :: T.Text)
   ])
 
-encodeFailResult :: T.Text -> Bool -> BL.ByteString
-encodeFailResult ident retried = canonical (A.object
+encodeFailResult :: TaskId -> Retry -> BL.ByteString
+encodeFailResult ident retry = canonical (A.object
   [ "task_id" .= ident
-  , "status" .= (if retried then "failed_retry" else "failed" :: T.Text)
+  , "status" .= case retry of
+      Retry -> ("failed_retry" :: T.Text)
+      NoRetry -> "failed"
   ])
 
-encodeReclaimResult :: T.Text -> BL.ByteString
+encodeReclaimResult :: TaskId -> BL.ByteString
 encodeReclaimResult ident = canonical (A.object
   [ "task_id" .= ident
   , "status" .= ("reclaimed" :: T.Text)
   ])
 
-encodeFailedRecord :: Task -> T.Text -> T.Text -> T.Text -> T.Text -> Bool -> BL.ByteString
-encodeFailedRecord task leaseIdent worker failedAt reason retried = canonical (A.object
+encodeFailedRecord :: Task -> LeaseId -> WorkerName -> T.Text -> T.Text -> Retry -> BL.ByteString
+encodeFailedRecord task leaseIdent worker failedAt reason retry = canonical (A.object
   [ "task_id" .= taskId task
   , "lease_id" .= leaseIdent
   , "capability" .= taskCapability task
   , "worker" .= worker
   , "failed_at" .= failedAt
   , "reason" .= reason
-  , "retried" .= retried
+  , "retried" .= retryFlag retry
   ])
 
-encodeResultRecord :: Task -> T.Text -> T.Text -> T.Text -> A.Value -> BL.ByteString
+encodeResultRecord :: Task -> LeaseId -> WorkerName -> T.Text -> A.Value -> BL.ByteString
 encodeResultRecord task leaseIdent worker finishedAt output = canonical (A.object
   [ "task_id" .= taskId task
   , "lease_id" .= leaseIdent
@@ -287,16 +254,16 @@ joinComma :: [BL.ByteString] -> BL.ByteString
 joinComma [] = ""
 joinComma (firstValue : rest) = firstValue <> foldMap ("," <>) rest
 
-parseLeaseRef :: BL.ByteString -> Either String (T.Text, T.Text)
+parseLeaseRef :: BL.ByteString -> Either String (TaskId, LeaseId)
 parseLeaseRef bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
       rejectUnknown ["task_id", "lease_id"] object
-      ident <- requiredText "task_id" object
-      lease <- requiredText "lease_id" object
-      validateTaskId ident
-      validateLeaseId lease
+      identText <- requiredText "task_id" object
+      leaseText <- requiredText "lease_id" object
+      ident <- mkTaskId identText
+      lease <- mkLeaseId leaseText
       pure (ident, lease)
     _ -> Left "lease reference must be a JSON object"
 
@@ -341,23 +308,16 @@ validateRecordIdentity object = do
   lease <- requiredText "lease_id" object
   capability <- requiredText "capability" object
   _ <- requiredText "worker" object
-  validateTaskId ident
-  validateLeaseId lease
-  validateCapability capability
+  _ <- mkTaskId ident
+  _ <- mkLeaseId lease
+  _ <- mkCapability capability
+  pure ()
 
 extractTextField :: T.Text -> A.Value -> T.Text
 extractTextField key (A.Object object) = case KM.lookup (K.fromText key) object of
   Just (A.String value) -> value
   _ -> ""
 extractTextField _ _ = ""
-
-leaseMicros :: T.Text -> Maybe Integer
-leaseMicros value = case T.stripPrefix "lease_" value of
-  Nothing -> Nothing
-  Just rest -> readInteger (T.takeWhile isAsciiDigit rest)
-
-isAsciiDigit :: Char -> Bool
-isAsciiDigit character = '0' <= character && character <= '9'
 
 readInteger :: T.Text -> Maybe Integer
 readInteger value = case reads (T.unpack value) of

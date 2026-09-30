@@ -9,17 +9,23 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Either (isLeft)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Spool.Access
-  ( Grant (..)
+  ( Grant
+  , GrantId
   , RemoteCommand (..)
   , filterManagedGrantLine
+  , grantExpiresAt
+  , grantWorker
+  , mkGrantId
+  , mkPublicKey
   , parseGrantJSON
   , parseRemoteCommand
   , renderGrant
   , renderManagedAuthorizedKeyLine
   , validateGrant
-  , validatePublicKey
   )
+import Spool.Types (Retry (..), workerNameText)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck (Gen, elements, forAll, listOf, testProperty, vectorOf, (===))
@@ -39,8 +45,8 @@ acceptedCommands =
   , ("lease --count 9223372036854775807", RemoteLease (Just 9223372036854775807))
   , ("ack", RemoteAck)
   , ("renew", RemoteRenew)
-  , ("fail", RemoteFail True)
-  , ("fail --no-retry", RemoteFail False)
+  , ("fail", RemoteFail Retry)
+  , ("fail --no-retry", RemoteFail NoRetry)
   , ("fetch", RemoteFetch)
   ]
 
@@ -94,15 +100,18 @@ rejected (label, input) = testCase label $ case parseRemoteCommand input of
   Left _ -> pure ()
   Right command -> assertFailure ("escaped the parser as " <> show command)
 
-identifier :: T.Text
-identifier = "grant_0123456789abcdef0123456789abcdef"
+identifierText :: T.Text
+identifierText = "grant_0123456789abcdef0123456789abcdef"
+
+identifier :: GrantId
+identifier = either error id (mkGrantId identifierText)
 
 publicKey :: T.Text
 publicKey =
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 grantWith :: T.Text -> Maybe T.Text -> Either String Grant
-grantWith worker = validateGrant identifier "peer-one" worker "/srv/spool" publicKey
+grantWith worker = validateGrant identifierText "peer-one" worker "/srv/spool" publicKey
 
 grantRecord :: [TestTree]
 grantRecord =
@@ -116,8 +125,9 @@ grantRecord =
       parseGrantJSON (renderGrant grant) @?= Right grant
   , testCase "a worker name outside ASCII reads back whole" $ do
       grant <- either assertFailure pure (grantWith "\321" Nothing)
-      assertBool "the names differ" (grantWorker grant /= "A")
-      fmap grantWorker (parseGrantJSON (renderGrant grant)) @?= Right "\321"
+      assertBool "the names differ" (workerNameText (grantWorker grant) /= "A")
+      fmap (workerNameText . grantWorker) (parseGrantJSON (renderGrant grant))
+        @?= Right "\321"
   , testCase "an unknown field is refused" $
       assertBool "refused" $ isLeft $ parseGrantJSON
         "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"expires_at\":null,\"extra\":1}"
@@ -126,12 +136,26 @@ grantRecord =
         "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"expires_at\":null}"
   , testCase "a relative spool path is refused" $
       assertBool "refused" $ isLeft $
-        validateGrant identifier "peer-one" "worker-one" "srv/spool" publicKey Nothing
+        validateGrant identifierText "peer-one" "worker-one" "srv/spool" publicKey Nothing
+  , testCase "a worker name with a control character is refused" $
+      assertBool "refused" (isLeft (grantWith "one\ntwo" Nothing))
   , testCase "a key with a comment is refused" $
-      assertBool "refused" (isLeft (validatePublicKey (publicKey <> " someone@host")))
+      assertBool "refused" (isLeft (mkPublicKey (publicKey <> " someone@host")))
   , testCase "a key whose blob names another type is refused" $
-      assertBool "refused" $ isLeft $ validatePublicKey
+      assertBool "refused" $ isLeft $ mkPublicKey
         (T.replace "ssh-ed25519 " "ssh-rsa " publicKey)
+  , testGroup "a grant identifier outside its grammar is refused"
+      [ testCase (show text) (assertBool "refused" (isLeft (mkGrantId text)))
+      | text <-
+          [ ""
+          , "grant_"
+          , "grant_0123456789abcdef0123456789abcde"
+          , "grant_0123456789abcdef0123456789abcdef0"
+          , "grant_0123456789ABCDEF0123456789abcdef"
+          , "lease_0123456789abcdef0123456789abcdef"
+          , "../0123456789abcdef0123456789abcdef01"
+          ]
+      ]
   ]
 
 managedLine :: [TestTree]
@@ -142,8 +166,21 @@ managedLine =
         (renderManagedAuthorizedKeyLine "/usr/bin/spool" grant)
       line @?= BSC.pack
         ( "restrict,command=\"/usr/bin/spool remote --grant "
-            <> T.unpack identifier <> "\" " <> T.unpack publicKey
-            <> " spool-grant:" <> T.unpack identifier <> "\n" )
+            <> T.unpack identifierText <> "\" " <> T.unpack publicKey
+            <> " spool-grant:" <> T.unpack identifierText <> "\n" )
+  , testCase "an executable whose path is not ASCII keeps its name" $ do
+      grant <- either assertFailure pure (grantWith "worker-one" Nothing)
+      let executable = "/home/jos\233/bin/spool"
+          path = TE.encodeUtf8 (T.pack executable)
+      line <- either assertFailure pure
+        (renderManagedAuthorizedKeyLine executable grant)
+      assertBool "the path holds a character of more than one byte"
+        (BS.length path == length executable + 1)
+      assertBool "the line holds the path as UTF-8" (path `BS.isInfixOf` line)
+  , testCase "a path that is not canonical is refused" $ do
+      grant <- either assertFailure pure (grantWith "worker-one" Nothing)
+      assertBool "refused" $ isLeft $
+        renderManagedAuthorizedKeyLine "/usr/bin/../bin/spool" grant
   , testCase "removing the line leaves every other byte" $ do
       grant <- either assertFailure pure (grantWith "worker-one" Nothing)
       line <- either assertFailure pure

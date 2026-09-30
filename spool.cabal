@@ -38,17 +38,19 @@ library
     , Spool.Access
     , Spool.Attachments
     , Spool.Cli
-    , Spool.Failure
+    , Spool.Error
     , Spool.Files
     , Spool.Grants
     , Spool.Input
     , Spool.Store
+    , Spool.Types
     , Spool.Wire
     , Spool.Worker.Config
     , Spool.Worker.Run
   build-depends:
       aeson      >=2.2    && <2.4
     , bytestring >=0.11   && <0.13
+    , containers >=0.6    && <0.9
     , crypton    >=1.0    && <2.2
     , directory  >=1.3.8  && <1.4
     , filepath   >=1.4    && <1.6
@@ -74,12 +76,15 @@ test-suite spool-test
       Test.Access
     , Test.Attachments
     , Test.Cli
+    , Test.Error
+    , Test.Types
     , Test.Wire
     , Test.WorkerConfig
   build-depends:
       spool
     , aeson
     , bytestring
+    , containers
     , directory
     , filepath
     , process
