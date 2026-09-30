@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wall -Werror #-}
 
 -- | Pure validation and rendering for the SSH access boundary.
 --
@@ -7,7 +6,7 @@
 -- execute commands.  The executable wires these values into its filesystem
 -- transitions; keeping the byte grammar and record shapes here makes the
 -- trust boundary testable without an SSH server.
-module SpoolAccess
+module Spool.Access
   ( Grant (..)
   , RemoteCommand (..)
   , grantKeys

@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structure:
+    name: Repository structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check
+
+  flake:
+    name: Flake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # The pinned package set: the binary, the unit tests, and the
+      # integration suite, with warnings as errors.
+      - run: nix flake check -L
+
+  cabal:
+    name: Cabal (GHC ${{ matrix.ghc }})
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc: ['9.6', '9.8', '9.10', '9.12']
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: latest
+      # Whatever Hackage offers within the declared bounds, which the flake's
+      # pinned set never exercises.
+      - run: cabal build all --enable-tests -f werror --dry-run
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ matrix.ghc }}-${{ hashFiles('dist-newstyle/cache/plan.json') }}
+          restore-keys: cabal-${{ matrix.ghc }}-
+      - run: cabal build all --enable-tests -f werror
+      - run: cabal test all -f werror --test-show-details=direct
+      - run: SPOOL="$(cabal list-bin spool -f werror)" bash test.sh

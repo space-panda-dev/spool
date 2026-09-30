@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Say where the suite stopped. The trap also fires where a failure is expected
+# and errexit is off, so it speaks only while errexit is on.
+set -E
+trap 'if [[ $- == *e* ]]; then echo "test.sh: line $LINENO failed: $BASH_COMMAND" >&2; fi' ERR
+
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -18,7 +23,8 @@ if [[ -z ${SPOOL:-} ]]; then
     ghc_flags+=(-package-env "$SPOOL_GHC_PACKAGE_ENV")
   fi
   mkdir "$work/hs"
-  ghc "${ghc_flags[@]}" -outputdir "$work/hs" -o "$spool_binary" "$here/Spool.hs" >/dev/null
+  ghc "${ghc_flags[@]}" -i"$here/src" -outputdir "$work/hs" -o "$spool_binary" \
+    "$here/app/Main.hs" >/dev/null
 fi
 test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
 test "$($spool_binary --version)" = "spool 0.0.1"; check
@@ -499,11 +505,17 @@ printf '{"late":true}\n'
 SCRIPT
 chmod +x "$bin/wait-for-late-release"
 
+# The executables are given the tools this suite itself runs with, and
+# nothing else. A fixed /usr/bin:/bin has no cat inside a Nix sandbox on
+# Linux, where the tools live in the store.
+worker_path=$PATH
+
 worker_config() {
   # worker_config CAPABILITY EXEC TIMEOUT MAXBYTES [MAX_CONCURRENT] [MAX_OUTPUT_BYTES]
   jq -nc --arg cap "$1" --arg exec "$2" --argjson timeout "$3" --argjson maxbytes "$4" \
     --argjson concurrent "${5:-1}" --argjson maxoutput "${6:-65536}" \
-    '{max_concurrent: $concurrent, renew_seconds: 30, env: {PATH: "/usr/bin:/bin"},
+    --arg path "$worker_path" \
+    '{max_concurrent: $concurrent, renew_seconds: 30, env: {PATH: $path},
       capabilities: {($cap): {exec: $exec, args: [], timeout_seconds: $timeout,
         max_payload_bytes: $maxbytes, max_output_bytes: $maxoutput}}}'
 }
@@ -530,8 +542,8 @@ drain_pending() {
 show_config="$work/show-config.json"
 worker_config "classify@1" "$bin/echo-classify" 5 1024 > "$show_config"
 show_output=$("$spool_binary" work --config "$show_config" --show)
-echo "$show_output" | jq -e \
-  '.max_concurrent == 1 and .renew_seconds == 30 and .env.PATH == "/usr/bin:/bin"
+echo "$show_output" | jq -e --arg path "$worker_path" \
+  '.max_concurrent == 1 and .renew_seconds == 30 and .env.PATH == $path
    and .capabilities["classify@1"].exec == "'"$bin"'/echo-classify"
    and .capabilities["classify@1"].timeout_seconds == 5
    and .capabilities["classify@1"].max_payload_bytes == 1024
@@ -1062,7 +1074,7 @@ printf '%s\n' "$remote_attachment_ack" | remote_primary 'ack' >/dev/null
 
 # The remote command is an exact byte grammar.  Shell metacharacters,
 # whitespace variants, local-only operations, options, and non-canonical
-# counts never reach a handler.  The Cabal parser test covers NUL; these
+# counts never reach a handler.  The Cabal test suite covers NUL; these
 # environment values cover the bytes a shell can carry.
 remote_reject() {
   local requested=$1

@@ -14,16 +14,30 @@
         "x86_64-linux"
       ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
+      # The library, the executable, and the Cabal test suite, which runs as
+      # part of the build. Warnings are errors here and nowhere by default.
+      package = pkgs: pkgs.haskell.lib.enableCabalFlag
+        (pkgs.haskellPackages.callCabal2nix "spool" ./. { })
+        "werror";
     in {
       packages = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          spool = pkgs.haskell.lib.justStaticExecutables (
-            pkgs.haskellPackages.callCabal2nix "spool" ./. { }
-          );
+          spool = pkgs.haskell.lib.justStaticExecutables (package pkgs);
         in {
           inherit spool;
           default = spool;
+        }
+      );
+
+      devShells = forEachSystem (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.haskellPackages.shellFor {
+            packages = _: [ (package pkgs) ];
+            nativeBuildInputs = [ pkgs.cabal-install pkgs.jq ];
+          };
         }
       );
 
