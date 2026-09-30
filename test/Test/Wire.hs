@@ -8,25 +8,34 @@ import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
-import Data.Either (isLeft, isRight)
+import Data.Either (isLeft)
 import Data.List (nub)
 import qualified Data.Text as T
 import Spool.Attachments (Attachment (..), Sha256, mkSha256)
 import Spool.Types
   ( Capability
   , LeaseId
+  , Retry (..)
   , TaskId
   , mkCapability
   , mkLeaseId
   , mkTaskId
+  , storedTimestamp
   , storedWorkerName
   )
 import Spool.Wire
-  ( Lease (..)
+  ( Ack (..)
+  , Counts (..)
+  , FailRequest (..)
+  , FailureRecord (..)
+  , FetchRequest (..)
+  , Lease (..)
+  , LeaseRef (..)
+  , ResultRecord (..)
   , Task (..)
   , canonical
-  , encodeLease
-  , encodeTask
+  , encode
+  , encodeFailResult
   , parseAck
   , parseFail
   , parseFailureRecord
@@ -36,7 +45,7 @@ import Spool.Wire
   , parseTask
   )
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
+import Test.Tasty.HUnit (assertBool, testCase, (@?=))
 import Test.Tasty.QuickCheck
   ( Gen
   , arbitrary
@@ -150,13 +159,13 @@ taskTests =
       ( "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"attachments\":["
           <> "{\"sha256\":\"" <> hex 'a' <> "\",\"size\":1,\"name\":\"x\"}]}" )
   , testProperty "a written task reads back as the task it was written from" $
-      forAll task $ \original -> parseTask (encodeTask original) === Right original
+      forAll task $ \original -> parseTask (encode original) === Right original
   , testProperty "a lease carries its task's fields unchanged" $
       forAll task $ \original ->
         let lease = Lease original leaseOne (storedWorkerName "worker-one")
-              "2026-09-29T12:00:00Z"
+              (storedTimestamp "2026-09-29T12:00:00Z")
             carried = do
-              A.Object object <- A.decode (encodeLease lease)
+              A.Object object <- A.decode (encode lease)
               pure ( KM.lookup "task_id" object, KM.lookup "capability" object
                    , KM.lookup "payload" object, KM.lookup "attachments" object )
         in carried === Just
@@ -174,41 +183,76 @@ requestTests :: [TestTree]
 requestTests =
   [ testCase "ack carries its result whatever it is" $
       parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":null}"
-        @?= Right (taskOne, leaseOne, A.Null)
+        @?= Right (Ack reference A.Null)
   , testCase "ack without a result is refused" $
       assertBool "refused" $ isLeft $
         parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\"}"
   , testCase "fail carries its reason" $
       parseFail "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"reason\":\"exit 3\"}"
-        @?= Right (taskOne, leaseOne, "exit 3")
+        @?= Right (FailRequest reference "exit 3")
   , testCase "fail with an empty reason is refused" $
       assertBool "refused" $ isLeft $
         parseFail "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"reason\":\"\"}"
   , testCase "a lease reference is a task and a lease" $
       parseLeaseRef "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\"}"
-        @?= Right (taskOne, leaseOne)
+        @?= Right reference
   , testCase "a lease reference with a result is refused" $
       assertBool "refused" $ isLeft $
         parseLeaseRef "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":1}"
   , testCase "a fetch request names one digest" $
       parseFetchRequest
         ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\"}")
-        @?= Right (taskOne, leaseOne, sha 'a')
+        @?= Right (FetchRequest reference (sha 'a'))
   , testCase "a fetch request with a path for a digest is refused" $
       assertBool "refused" $ isLeft $ parseFetchRequest
         "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"../../etc/passwd\"}"
+  , testCase "a request whose lease is outside the grammar is refused" $
+      assertBool "refused" $ isLeft $
+        parseLeaseRef "{\"task_id\":\"t\",\"lease_id\":\"../x\"}"
+  , testCase "a missing field is what is reported when a field is missing" $
+      -- The task_id here is outside its grammar too; the absent lease_id is
+      -- found first, because no identifier is checked until every field is
+      -- known to be there.
+      parseLeaseRef "{\"task_id\":\"a--b\"}" @?= Left "missing lease_id"
+  , testCase "fail answers with what became of the task" $ do
+      encodeFailResult taskOne Retry @?= "{\"status\":\"failed_retry\",\"task_id\":\"t\"}"
+      encodeFailResult taskOne NoRetry @?= "{\"status\":\"failed\",\"task_id\":\"t\"}"
   ]
   where
     digest = BL.pack (replicate 64 0x61)
+    reference = LeaseRef taskOne leaseOne
 
 recordTests :: [TestTree]
 recordTests =
-  [ testCase "the protocol's result record reads, and yields its result" $
-      case parseResultRecord resultRecord of
-        Right (_, result) -> result @?= A.object ["anything" A..= ("opaque" :: T.Text)]
-        Left message -> assertFailure message
-  , testCase "the protocol's failure record reads" $
-      assertBool "accepted" (isRight (parseFailureRecord failureRecord))
+  [ testCase "the protocol's result record reads as its fields" $
+      parseResultRecord resultRecord @?= Right ResultRecord
+        { resultTask = made mkTaskId "task-one"
+        , resultLease = made mkLeaseId "lease_1_1_task-one"
+        , resultCapability = made mkCapability "classify@1"
+        , resultWorker = storedWorkerName "worker-one"
+        , resultFinishedAt = storedTimestamp "2026-09-29T12:00:00Z"
+        , resultValue = A.object ["anything" A..= ("opaque" :: T.Text)]
+        }
+  , testCase "the protocol's failure record reads as its fields" $
+      parseFailureRecord failureRecord @?= Right FailureRecord
+        { failureTask = made mkTaskId "task-one"
+        , failureLease = made mkLeaseId "lease_1_1_task-one"
+        , failureCapability = made mkCapability "classify@1"
+        , failureWorker = storedWorkerName "worker-one"
+        , failureFailedAt = storedTimestamp "2026-09-29T12:00:00Z"
+        , failureReason = "exit 3: failed"
+        , failureRetried = Retry
+        }
+  , testCase "a result record is written back as the bytes it was read from" $
+      fmap encode (parseResultRecord resultRecord) @?= Right (recanonical resultRecord)
+  , testCase "a failure record is written back as the bytes it was read from" $
+      fmap encode (parseFailureRecord failureRecord) @?= Right (recanonical failureRecord)
+  , testCase "a failure that was not retried reads as not retried" $
+      fmap failureRetried
+        (parseFailureRecord (replacing "retried" (A.Bool False) failureRecord))
+        @?= Right NoRetry
+  , testCase "the counters are written under their names" $
+      encode (Counts 1 0 3 2) @?= "{\"done\":3,\"failed\":2,\"leased\":0,\"pending\":1}"
   , testCase "a result record without its worker is corrupt" $
       assertBool "refused" (isLeft (parseResultRecord (without "worker" resultRecord)))
   , testCase "a failure record without its reason is corrupt" $
@@ -230,6 +274,7 @@ recordTests =
       _ -> error "the fixture is not a JSON object"
     without key = edit (KM.delete key)
     replacing key new = edit (KM.insert key new)
+    recanonical bytes = maybe (error "the fixture is not JSON") canonical (A.decode bytes)
 
 canonicalTests :: [TestTree]
 canonicalTests =

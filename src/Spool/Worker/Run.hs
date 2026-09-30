@@ -55,7 +55,7 @@ import Spool.Types
   , capabilityText
   , taskIdText
   )
-import Spool.Wire (Task (..), Lease (..), canonical)
+import Spool.Wire (Lease (..), LeaseRef (..), Task (..), canonical)
 import Spool.Worker.Config
   ( CapabilityConfig (..)
   , WorkConfig (..)
@@ -182,21 +182,21 @@ removeWorkerDirectory directory = do
 renewalLoop :: Paths -> TaskId -> LeaseId -> Int -> MVar SpoolError -> IO ()
 renewalLoop paths taskIdent leaseIdent renewSeconds failure = do
   threadDelay (renewSeconds * 1000000)
-  result <- withLock paths (renewOne paths taskIdent leaseIdent)
+  result <- withLock paths (renewOne paths (LeaseRef taskIdent leaseIdent))
   case result of
     Right () -> renewalLoop paths taskIdent leaseIdent renewSeconds failure
     Left refusal -> putMVar failure refusal
 
 completeSuccess :: Paths -> Task -> LeaseId -> A.Value -> IO ()
 completeSuccess paths task leaseIdent output = withLock paths $ do
-  result <- ackOne paths (taskId task) leaseIdent output
+  result <- ackOne paths (LeaseRef (taskId task) leaseIdent) output
   case result of
     Left refusal -> throwIO (withContext "work: " refusal)
     Right _ -> pure ()
 
 completeFailure :: Paths -> TaskId -> LeaseId -> T.Text -> Retry -> IO ()
 completeFailure paths taskIdent leaseIdent reason retry = withLock paths $ do
-  result <- failLease paths taskIdent leaseIdent reason retry
+  result <- failLease paths (LeaseRef taskIdent leaseIdent) reason retry
   case result of
     Left refusal -> throwIO (withContext "work: " refusal)
     Right () -> pure ()

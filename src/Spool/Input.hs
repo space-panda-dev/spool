@@ -7,24 +7,30 @@ module Spool.Input
   , inputLines
   ) where
 
-import qualified Data.Aeson as A
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
-import qualified Data.Text as T
 import Spool.Error (malformed, orThrow)
-import Spool.Types (LeaseId, TaskId)
-import Spool.Wire (Task, parseAck, parseFail, parseLeaseRef, parseTask)
+import Spool.Wire
+  ( Ack
+  , FailRequest
+  , LeaseRef
+  , Task
+  , parseAck
+  , parseFail
+  , parseLeaseRef
+  , parseTask
+  )
 
 parseTaskLine :: BL.ByteString -> IO Task
 parseTaskLine = orThrow malformed . parseTask
 
-parseAckLine :: BL.ByteString -> IO (TaskId, LeaseId, A.Value)
+parseAckLine :: BL.ByteString -> IO Ack
 parseAckLine = orThrow malformed . parseAck
 
-parseLeaseRefLine :: BL.ByteString -> IO (TaskId, LeaseId)
+parseLeaseRefLine :: BL.ByteString -> IO LeaseRef
 parseLeaseRefLine = orThrow malformed . parseLeaseRef
 
-parseFailLine :: BL.ByteString -> IO (TaskId, LeaseId, T.Text)
+parseFailLine :: BL.ByteString -> IO FailRequest
 parseFailLine = orThrow malformed . parseFail
 
 isBlank :: BL.ByteString -> Bool

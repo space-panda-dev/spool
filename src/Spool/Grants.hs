@@ -66,20 +66,23 @@ import Spool.Store
   , removeSidecars
   , leaseIdOfFile
   , leaseTasks
-  , ackLines
-  , renewLines
-  , failLines
+  , ackAll
+  , renewAll
+  , failAll
   , returnToPending
-  , fetchAttachmentBytes
+  , fetchFor
   )
-import Spool.Types
-  ( LeaseId
-  , TaskId
-  , WorkerName
-  , taskIdText
-  , workerNameText
+import Spool.Types (WorkerName, workerNameText)
+import Spool.Wire
+  ( Ack (..)
+  , FailRequest (..)
+  , FetchRequest (..)
+  , LeaseRef (..)
+  , ResultRecord (..)
+  , Task (..)
+  , canonical
+  , parseFetchRequest
   )
-import Spool.Wire (Task (..), parseFetchRequest, canonical, extractTextField)
 
 accountGrantPaths :: IO (FilePath, FilePath)
 accountGrantPaths = do
@@ -276,29 +279,27 @@ dispatchRemote paths worker operation = case operation of
     when (requested > toInteger (maxBound :: Int))
       (throwIO (malformed "lease count is too large for this host"))
     leaseTasks paths worker (fromInteger requested)
+  -- Every line is read, and every lease it names is checked against the
+  -- grant's worker, before any of them is applied.
   Access.RemoteAck -> do
-    linesIn <- inputLines
-    references <- mapM (fmap (\(ident, lease, _) -> (ident, lease)) . parseAckLine) linesIn
-    mapM_ (ensureRemoteAckOwner paths worker) references
-    ackLines paths linesIn
+    acks <- mapM parseAckLine =<< inputLines
+    mapM_ (ensureRemoteAckOwner paths worker . ackRef) acks
+    ackAll paths acks
   Access.RemoteRenew -> do
-    linesIn <- inputLines
-    references <- mapM parseLeaseRefLine linesIn
+    references <- mapM parseLeaseRefLine =<< inputLines
     mapM_ (ensureLiveLeaseOwner paths worker) references
-    renewLines paths linesIn
+    renewAll paths references
   Access.RemoteFail retry -> do
-    linesIn <- inputLines
-    references <- mapM (fmap (\(ident, lease, _) -> (ident, lease)) . parseFailLine) linesIn
-    mapM_ (ensureLiveLeaseOwner paths worker) references
-    failLines retry paths linesIn
+    requests <- mapM parseFailLine =<< inputLines
+    mapM_ (ensureLiveLeaseOwner paths worker . failRef) requests
+    failAll retry paths requests
   Access.RemoteFetch -> do
-    bytes <- BL.getContents
-    (ident, leaseIdent, _) <- orThrow malformed (parseFetchRequest bytes)
-    ensureLiveLeaseOwner paths worker (ident, leaseIdent)
-    fetchAttachmentBytes paths bytes
+    request <- orThrow malformed . parseFetchRequest =<< BL.getContents
+    ensureLiveLeaseOwner paths worker (fetchRef request)
+    fetchFor paths request
 
-ensureLiveLeaseOwner :: Paths -> WorkerName -> (TaskId, LeaseId) -> IO ()
-ensureLiveLeaseOwner paths worker (ident, leaseIdent) = do
+ensureLiveLeaseOwner :: Paths -> WorkerName -> LeaseRef -> IO ()
+ensureLiveLeaseOwner paths worker (LeaseRef ident leaseIdent) = do
   let path = leasedPath paths leaseIdent
   present <- fileExists path
   unless present (throwIO (stale "lease is unknown or stale"))
@@ -309,8 +310,8 @@ ensureLiveLeaseOwner paths worker (ident, leaseIdent) = do
   unless (owner == worker)
     (throwIO (stale "lease belongs to a different worker"))
 
-ensureRemoteAckOwner :: Paths -> WorkerName -> (TaskId, LeaseId) -> IO ()
-ensureRemoteAckOwner paths worker reference@(ident, leaseIdent) = do
+ensureRemoteAckOwner :: Paths -> WorkerName -> LeaseRef -> IO ()
+ensureRemoteAckOwner paths worker reference@(LeaseRef ident leaseIdent) = do
   live <- fileExists (leasedPath paths leaseIdent)
   if live
     then ensureLiveLeaseOwner paths worker reference
@@ -318,7 +319,6 @@ ensureRemoteAckOwner paths worker reference@(ident, leaseIdent) = do
       let path = resultPath paths leaseIdent
       present <- fileExists path
       unless present (throwIO (stale "lease is unknown or stale"))
-      (record, _) <- readResultRecordFile path
-      unless (extractTextField "task_id" record == taskIdText ident
-        && extractTextField "worker" record == workerNameText worker)
+      record <- readResultRecordFile path
+      unless (resultTask record == ident && resultWorker record == worker)
         (throwIO (stale "lease belongs to a different worker"))
