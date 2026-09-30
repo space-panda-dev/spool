@@ -33,6 +33,7 @@ module Spool.Wire
   , encodeAckResult
   , encodeRenewResult
   , encodeFailResult
+  , encodeStaleResult
   , encodeReclaimResult
     -- * Encoding
   , encode
@@ -324,23 +325,33 @@ encodePutResult task result = reply (taskId task) $ case result of
   PutInserted -> "inserted"
   PutExisting -> "existing"
 
-encodeAckResult :: TaskId -> AckStatus -> BL.ByteString
-encodeAckResult ident result = reply ident $ case result of
+encodeAckResult :: LeaseRef -> AckStatus -> BL.ByteString
+encodeAckResult reference result = answer reference $ case result of
   Acked -> "acked"
   AlreadyDone -> "already_done"
 
-encodeRenewResult :: TaskId -> BL.ByteString
-encodeRenewResult ident = reply ident "renewed"
+encodeRenewResult :: LeaseRef -> BL.ByteString
+encodeRenewResult reference = answer reference "renewed"
 
-encodeFailResult :: TaskId -> Retry -> BL.ByteString
-encodeFailResult ident retry = reply ident $ case retry of
+encodeFailResult :: LeaseRef -> Retry -> BL.ByteString
+encodeFailResult reference retry = answer reference $ case retry of
   Retry -> "failed_retry"
   NoRetry -> "failed"
+
+-- | The answer to a line whose lease is stale, unknown, another task's, or
+-- another worker's.  It does not say which.
+encodeStaleResult :: LeaseRef -> BL.ByteString
+encodeStaleResult reference = answer reference "stale"
 
 encodeReclaimResult :: TaskId -> BL.ByteString
 encodeReclaimResult ident = reply ident "reclaimed"
 
--- | What a transition answers: the task, and what became of it.
+-- | What a transition on a lease answers: the lease, and what became of it.
+answer :: LeaseRef -> T.Text -> BL.ByteString
+answer (LeaseRef ident leaseIdent) status = canonical (A.object
+  ["task_id" .= ident, "lease_id" .= leaseIdent, "status" .= status])
+
+-- | What a transition on a task answers: the task, and what became of it.
 reply :: TaskId -> T.Text -> BL.ByteString
 reply ident status = canonical (A.object ["task_id" .= ident, "status" .= status])
 

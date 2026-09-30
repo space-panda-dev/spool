@@ -36,6 +36,7 @@ import Spool.Wire
   , canonical
   , encode
   , encodeFailResult
+  , encodeStaleResult
   , parseAck
   , parseFail
   , parseFailureRecord
@@ -215,9 +216,13 @@ requestTests =
       -- found first, because no identifier is checked until every field is
       -- known to be there.
       parseLeaseRef "{\"task_id\":\"a--b\"}" @?= Left "missing lease_id"
-  , testCase "fail answers with what became of the task" $ do
-      encodeFailResult taskOne Retry @?= "{\"status\":\"failed_retry\",\"task_id\":\"t\"}"
-      encodeFailResult taskOne NoRetry @?= "{\"status\":\"failed\",\"task_id\":\"t\"}"
+  , testCase "an answer names the lease and what became of it" $ do
+      encodeFailResult reference Retry
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"failed_retry\",\"task_id\":\"t\"}"
+      encodeFailResult reference NoRetry
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"failed\",\"task_id\":\"t\"}"
+      encodeStaleResult reference
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"stale\",\"task_id\":\"t\"}"
   ]
   where
     digest = BL.pack (replicate 64 0x61)
