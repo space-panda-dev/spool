@@ -52,6 +52,7 @@ import Data.Time (getCurrentTime)
 import System.Directory (listDirectory, removeDirectoryRecursive, removeFile,
                          removePathForcibly, renameDirectory, renameFile)
 import System.FilePath (takeBaseName, (</>))
+import System.IO (IOMode (ReadMode), withBinaryFile)
 import System.IO.Error (isDoesNotExistError)
 import qualified Spool.Attachments as SA
 import Spool.Error
@@ -66,8 +67,16 @@ import Spool.Error
   )
 import Spool.Files
   ( Created (..)
-  , Paths (..)
+  , Paths
   , atomicCreate
+  , attachmentCleanupDir
+  , attachmentsDir
+  , doneDir
+  , failedDir
+  , leasedDir
+  , pendingDir
+  , resultsDir
+  , rootDir
   , atomicReplace
   , donePath
   , epochMicros
@@ -77,7 +86,7 @@ import Spool.Files
   , initialise
   , jsonFiles
   , leasedPath
-  , makePaths
+  , openSpool
   , pendingPath
   , renewedSidecarPath
   , resultPath
@@ -134,7 +143,7 @@ import Spool.Wire
 
 withStore :: FilePath -> (Paths -> IO ()) -> IO ()
 withStore directory action = do
-  let paths = makePaths directory
+  paths <- openSpool directory
   initialise paths
   withLock paths (recoverAttachmentState paths >> action paths)
 
@@ -243,7 +252,7 @@ equalTaskFile path wanted = (== wanted) <$> readTaskFile path
 
 readTaskFile :: FilePath -> IO Task
 readTaskFile path = do
-  bytes <- BL.readFile path
+  bytes <- readWhole path
   case parseTask bytes of
     Left message -> throwIO (corrupt
       ("corrupt task file " <> path <> ": " <> message))
@@ -251,7 +260,7 @@ readTaskFile path = do
 
 readFailureRecordFile :: FilePath -> IO FailureRecord
 readFailureRecordFile path = do
-  bytes <- BL.readFile path
+  bytes <- readWhole path
   case parseFailureRecord bytes of
     Left message -> throwIO (corrupt
       ("corrupt failure record " <> path <> ": " <> message))
@@ -259,11 +268,24 @@ readFailureRecordFile path = do
 
 readResultRecordFile :: FilePath -> IO ResultRecord
 readResultRecordFile path = do
-  bytes <- BL.readFile path
+  bytes <- readWhole path
   case parseResultRecord bytes of
     Left message -> throwIO (corrupt
       ("corrupt result record " <> path <> ": " <> message))
     Right value -> pure value
+
+-- | The bytes of a file, all read and the file closed before any is looked
+-- at, so that a record can be moved or removed as soon as it has been read.
+readWhole :: FilePath -> IO BL.ByteString
+readWhole path = BL.fromStrict <$> BS.readFile path
+
+-- | The one number a file holds, or nothing if that is not what it holds.
+readNumber :: FilePath -> IO (Maybe Integer)
+readNumber path = do
+  bytes <- BS.readFile path
+  pure $ case TE.decodeUtf8' bytes of
+    Left _ -> Nothing
+    Right text -> readInteger (T.strip text)
 
 -- Sidecars: a lease's worker (written once, as UTF-8) and its last renewal
 -- (rewritten on every renew). Neither has a ".json" extension, so jsonFiles
@@ -300,7 +322,7 @@ readRenewedSidecar paths leaseIdent = do
   if not exists
     then pure Nothing
     else do
-      value <- readInteger . T.strip . T.pack . BLC.unpack <$> BL.readFile path
+      value <- readNumber path
       case value of
         Just micros -> pure (Just micros)
         Nothing -> throwIO (corrupt
@@ -369,7 +391,7 @@ nextLeaseSerial :: Paths -> IO Integer
 nextLeaseSerial paths = do
   let path = rootDir paths </> ".lease-sequence"
   present <- fileExists path
-  current <- if present then readInteger . T.strip . T.pack <$> readFile path else pure (Just 0)
+  current <- if present then readNumber path else pure (Just 0)
   case current of
     Nothing -> throwIO (corrupt "corrupt lease sequence")
     Just value -> do
@@ -623,7 +645,11 @@ fetchFor paths (FetchRequest (LeaseRef ident leaseIdent) digest) = do
   case verified of
     Left message -> throwIO (corrupt
       ("corrupt attachment for " <> showTask ident <> ": " <> message))
-    Right () -> BL.readFile path >>= BL.putStr
+    Right () -> withBinaryFile path ReadMode copyToOutput
+  where
+    copyToOutput handle = do
+      chunk <- BS.hGetSome handle 65536
+      unless (BS.null chunk) (BS.putStr chunk >> copyToOutput handle)
 
 writeResultRecord
   :: Paths -> Task -> LeaseId -> WorkerName -> A.Value -> IO (Either SpoolError ())

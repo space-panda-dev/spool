@@ -466,6 +466,50 @@ printf '{"stubborn":true}\n'
 SCRIPT
 chmod +x "$bin/stubborn"
 
+cat > "$bin/ignores-stdin" <<'SCRIPT'
+#!/bin/sh
+# Never reads its payload, so a payload too big for the pipe stays unwritten.
+sleep 3
+printf '{"ignored":true}\n'
+SCRIPT
+chmod +x "$bin/ignores-stdin"
+
+leftover_pidfile="$work/leftover-pid"
+leftover_finished="$work/leftover-finished"
+cat > "$bin/leaves-one-behind" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+# Starts a process that ignores SIGTERM and holds this script's output open,
+# then answers and exits as if nothing were left running.
+sh -c 'trap "" TERM; echo \$\$ > "$leftover_pidfile"
+  i=0; while [ "\$i" -lt 150 ]; do sleep 0.1; i=\$((i + 1)); done
+  : > "$leftover_finished"' &
+i=0
+while [ ! -s "$leftover_pidfile" ] && [ "\$i" -lt 50 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"answered":true}\n'
+SCRIPT
+chmod +x "$bin/leaves-one-behind"
+
+interrupted_pidfile="$work/interrupted-pid"
+interrupted_asked="$work/interrupted-asked"
+cat > "$bin/runs-until-stopped" <<SCRIPT
+#!/bin/sh
+# Notes that it was asked to stop, and stops.
+trap ': > "$interrupted_asked"; exit 0' TERM
+cat >/dev/null
+echo \$\$ > "$interrupted_pidfile"
+i=0
+while [ "\$i" -lt 300 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"finished":true}\n'
+SCRIPT
+chmod +x "$bin/runs-until-stopped"
+
 cat > "$bin/big-output" <<'SCRIPT'
 #!/bin/sh
 cat >/dev/null
@@ -713,6 +757,77 @@ spoolw failures | jq -s --arg task work-stubborn -e \
    and (.[0].reason | test("timeout after 1 s"))' >/dev/null
 check
 drain_pending "work-stubborn"
+
+# The timeout holds while the payload is still being written. The program
+# never reads it and it is too big for the pipe, so the write cannot finish;
+# the run is timed out all the same, not held until the program lets go.
+head -c 200000 /dev/zero | tr '\0' 'x' > "$work/unread-data"
+jq -Rnc --rawfile data "$work/unread-data" \
+  '{task_id:"work-unread",capability:"unread@1",payload:{data:$data}}' \
+  | spoolw put >/dev/null
+worker_config "unread@1" "$bin/ignores-stdin" 1 1000000 > "$work/unread-config.json"
+spoolw work --worker w1 --config "$work/unread-config.json" --max-tasks 1
+spoolw failures | jq -s --arg task work-unread -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].retried == true
+   and (.[0].reason | test("timeout after 1 s"))' >/dev/null
+check
+drain_pending "work-unread"
+
+# A program that exits leaving a process behind has not ended. The process
+# ignores SIGTERM and holds the output open; it is killed, the run fails, and
+# the worker does not wait the 15 seconds the process meant to run.
+leftover_task='{"task_id":"work-leftover","capability":"leftover@1","payload":{}}'
+printf '%s\n' "$leftover_task" | spoolw put >/dev/null
+worker_config "leftover@1" "$bin/leaves-one-behind" 30 1024 > "$work/leftover-config.json"
+spoolw work --worker w1 --config "$work/leftover-config.json" --max-tasks 1
+test -s "$leftover_pidfile"; check
+test ! -e "$leftover_finished"; check
+if kill -0 "$(cat "$leftover_pidfile")" 2>/dev/null; then
+  echo "a process left behind by a capability outlived its run" >&2; exit 1
+fi
+check
+spoolw failures | jq -s --arg task work-leftover -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].retried == true
+   and (.[0].reason | test("still open"))' >/dev/null
+check
+spoolw results | jq -s --arg task work-leftover -e \
+  'map(select(.task_id == $task)) | length == 0' >/dev/null
+check
+drain_pending "work-leftover"
+
+# A worker told to stop takes its programs with it. It ends with the status
+# of the signal, the program is dead, its working directory is gone, and the
+# lease stands, for reclaim to return.
+spoolx() { "$spool_binary" --dir "$work/interrupted-work" "$@"; }
+spoolx init
+mkdir "$work/interrupted-tmp"
+printf '%s\n' '{"task_id":"work-interrupted","capability":"long@1","payload":{}}' \
+  | spoolx put >/dev/null
+worker_config "long@1" "$bin/runs-until-stopped" 60 1024 > "$work/interrupted-config.json"
+TMPDIR="$work/interrupted-tmp" "$spool_binary" --dir "$work/interrupted-work" \
+  work --worker stopped --config "$work/interrupted-config.json" --max-tasks 1 &
+interrupted_worker=$!
+i=0
+while [ ! -s "$interrupted_pidfile" ] && [ "$i" -lt 100 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+test -s "$interrupted_pidfile"; check
+test -n "$(ls -A "$work/interrupted-tmp")"; check
+kill -TERM "$interrupted_worker"
+set +e
+wait "$interrupted_worker"
+interrupted_exit=$?
+set -e
+test "$interrupted_exit" -eq 143; check
+test -e "$interrupted_asked"; check
+if kill -0 "$(cat "$interrupted_pidfile")" 2>/dev/null; then
+  echo "a capability outlived the worker that was told to stop" >&2; exit 1
+fi
+check
+test -z "$(ls -A "$work/interrupted-tmp")"; check
+spoolx status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 0' >/dev/null; check
+spoolx reclaim --older-than 0 | jq -e '.task_id == "work-interrupted"' >/dev/null; check
 
 # Output past max_output_bytes fails with retry and names the limit, rather
 # than growing the worker's memory to hold a runaway capability's output.

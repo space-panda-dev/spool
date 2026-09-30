@@ -40,16 +40,18 @@ import Spool.Error
   )
 import Spool.Files
   ( Created (..)
-  , Paths (..)
+  , Paths
   , atomicCreate
   , atomicReplace
   , fileExists
   , ignoreMissing
   , initialise
   , jsonFiles
+  , leasedDir
   , leasedPath
-  , makePaths
+  , openSpool
   , resultPath
+  , rootDir
   , withLock
   )
 import Spool.Input
@@ -250,7 +252,7 @@ runRemote requested = do
   command <- PosixEnv.getEnv "SSH_ORIGINAL_COMMAND"
   operation <- orThrow malformed
     (Access.parseRemoteCommand (fromMaybe BS.empty command))
-  let paths = makePaths (Access.grantSpool grant)
+  paths <- openSpool (Access.grantSpool grant)
   initialise paths
   withLock paths $ do
     current <- loadActiveRemoteGrant identifier path

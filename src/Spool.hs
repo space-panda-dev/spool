@@ -12,7 +12,7 @@ import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import Spool.Cli (Command (..), StoreCommand (..), parseCommand, parseWorkShow)
 import Spool.Error (SpoolError (..), exitStatus, report, retryable)
-import Spool.Files (Paths, initialise, makePaths, withLock)
+import Spool.Files (Paths, initialise, openSpool, withLock)
 import Spool.Grants (grantAccess, revokeAccess, runRemote)
 import Spool.Store
   ( ackTasks
@@ -58,7 +58,7 @@ run args = case args of
     (directory, command) <- either (throwIO . Usage) pure (parseCommand args)
     case command of
       Work worker configPath maxTasks -> do
-        let paths = makePaths directory
+        paths <- openSpool directory
         initialise paths
         withLock paths (recoverAttachmentState paths)
         runWork paths worker configPath maxTasks

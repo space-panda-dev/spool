@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The worker: runs leased tasks with the configured executables under
 -- Spool's own declared limits: concurrency, timeout, payload size, and
@@ -7,36 +6,88 @@
 -- executable can do to the machine it runs on -- there is no
 -- CPU/memory/file-size containment or sandbox. A capability owner who needs
 -- that wraps their executable (rlimits, a container, a VM) themselves.
+--
+-- Everything the worker starts, it holds in a scope that ends it: a task in
+-- the worker's, a program and the threads that feed and read it in the
+-- task's. However a scope is left, by finishing, by failing, or by the
+-- worker being told to stop, what it started is stopped first.
 module Spool.Worker.Run
   ( runWork
   ) where
 
-import Control.Concurrent (forkFinally, forkIO, killThread, threadDelay)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar,
-                                readMVar, modifyMVar_, takeMVar, tryPutMVar,
-                                tryReadMVar)
+import Control.Concurrent (myThreadId, threadDelay, throwTo)
+import Control.Concurrent.Async
+  ( Async
+  , AsyncCancelled (..)
+  , asyncWithUnmask
+  , cancel
+  , poll
+  , wait
+  , waitSTM
+  , withAsync
+  )
+import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar)
 import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
-import Control.Exception (IOException, SomeException, bracket, catch,
-                          displayException, finally, fromException, throwIO,
-                          toException, try)
-import Control.Monad (forM_, void)
+import Control.Concurrent.STM
+  ( STM
+  , atomically
+  , check
+  , orElse
+  , readTVar
+  , registerDelay
+  )
+import Control.Exception
+  ( IOException
+  , SomeException
+  , bracket
+  , bracketOnError
+  , catch
+  , displayException
+  , finally
+  , fromException
+  , mask_
+  , throwIO
+  , toException
+  , try
+  )
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.Aeson as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
 import Data.Unique (hashUnique, newUnique)
+import GHC.IO.Exception (IOErrorType (ResourceVanished))
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (Handle, IOMode (ReadMode), hClose, openBinaryFile)
-import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcess)
-import System.Process (CreateProcess (..), ProcessHandle, StdStream (CreatePipe),
-                       createProcess, getPid, proc, waitForProcess)
+import System.IO.Error (ioeGetErrorType)
+import System.Posix.Signals
+  ( Handler (Catch)
+  , Signal
+  , installHandler
+  , sigKILL
+  , sigTERM
+  , signalProcessGroup
+  )
+import System.Posix.Types (ProcessGroupID)
+import System.Process
+  ( CreateProcess (..)
+  , ProcessHandle
+  , StdStream (CreatePipe)
+  , createProcess
+  , getPid
+  , getProcessExitCode
+  , proc
+  , waitForProcess
+  )
+import System.Timeout (timeout)
 import qualified Spool.Attachments as SA
 import Spool.Error
   ( SpoolError
@@ -45,7 +96,7 @@ import Spool.Error
   , report
   , withContext
   )
-import Spool.Files (Paths (..), withLock, epochMicros)
+import Spool.Files (Paths, attachmentsDir, epochMicros, withLock)
 import Spool.Store (leaseUpTo, ackOne, renewOne, failLease)
 import Spool.Types
   ( LeaseId
@@ -65,57 +116,61 @@ import Spool.Worker.Config
 -- | The outcome of running a capability's executable to completion.
 data RunOutcome = RunSuccess BL.ByteString | RunFailure T.Text
 
-ignoreProcessRace :: IO () -> IO ()
-ignoreProcessRace action = action `catch` ignore
-  where
-    ignore :: IOException -> IO ()
-    ignore _ = pure ()
-
+-- | Lease tasks one at a time and run each in its own thread, as many at
+-- once as the configuration allows, until nothing is pending or the count
+-- asked for has been started. Then wait for what is running.
 runWork :: Paths -> WorkerName -> FilePath -> Maybe Int -> IO ()
 runWork paths worker configPath maxTasks = do
   config <- loadWorkConfig configPath
   slots <- newQSem (wcMaxConcurrent config)
-  completions <- newQSem 0
-  workerFailures <- newMVar ([] :: [SomeException])
-  launchedRef <- newIORef (0 :: Int)
-  let loop = do
-        launched <- readIORef launchedRef
-        if maybe False (launched >=) maxTasks
-          then pure ()
-          else do
-            waitQSem slots
-            leased <- withLock paths (leaseUpTo paths worker 1)
-            case leased of
-              [] -> signalQSem slots
-              (lease : _) -> do
-                writeIORef launchedRef (launched + 1)
-                _ <- forkFinally (runOneLease paths config lease) $ \outcome -> do
-                  case outcome of
-                    Left exception -> do
-                      held <- reported exception
-                      modifyMVar_ workerFailures (pure . (held :))
-                    Right () -> pure ()
-                  signalQSem slots
-                  signalQSem completions
-                loop
-  loop
-  final <- readIORef launchedRef
-  waitAll completions final
-  failures <- readMVar workerFailures
-  case reverse failures of
+  failures <- newMVar ([] :: [SomeException])
+  stoppedBySignal $ bracket (newIORef []) stopAll $ \running -> do
+    let -- A task's failure is said when it happens, while the others run
+        -- on. What is kept for the end is only its exit status, so the
+        -- entry point does not say it a second time. A task that is being
+        -- stopped has not failed.
+        record exception = case fromException exception of
+          Just AsyncCancelled -> throwIO exception
+          Nothing -> do
+            held <- case fromException exception of
+              Just failure -> do
+                report (failure :: SpoolError)
+                pure (toException (ExitFailure (exitStatus failure)))
+              Nothing -> pure exception
+            modifyMVar_ failures (pure . (held :))
+        start lease = mask_ $ do
+          task <- asyncWithUnmask $ \unmask ->
+            (unmask (runOneLease paths config lease) `catch` record)
+              `finally` signalQSem slots
+          atomicModifyIORef' running (\tasks -> (task : tasks, ()))
+        loop launched = unless (maybe False (launched >=) maxTasks) $ do
+          leased <- bracketOnError (waitQSem slots) (const (signalQSem slots)) $
+            \() -> do
+              leased <- withLock paths (leaseUpTo paths worker 1)
+              case leased of
+                lease : _ -> start lease >> pure True
+                [] -> signalQSem slots >> pure False
+          when leased (loop (launched + 1 :: Int))
+    loop 0
+    readIORef running >>= mapM_ wait
+  failed <- readMVar failures
+  case reverse failed of
     [] -> pure ()
-    exception : _ -> throwIO exception
+    first : _ -> throwIO first
   where
-    waitAll _ 0 = pure ()
-    waitAll sem n = waitQSem sem >> waitAll sem (n - 1 :: Int)
-    -- A task's failure is said when it happens, while the others run on.
-    -- What is kept for the end is only its exit status, so the entry point
-    -- does not say it a second time.
-    reported exception = case fromException exception of
-      Just failure -> do
-        report (failure :: SpoolError)
-        pure (toException (ExitFailure (exitStatus failure)))
-      Nothing -> pure exception
+    stopAll running = readIORef running >>= mapM_ cancel
+
+-- | Run an action so that SIGTERM ends it as an exception does, through
+-- every scope it is in, and not as the default does, on the spot and with
+-- its programs left running. The status is the one a shell gives a process
+-- that SIGTERM ended.
+stoppedBySignal :: IO a -> IO a
+stoppedBySignal action = do
+  self <- myThreadId
+  let stop = Catch (throwTo self (ExitFailure 143))
+  bracket (installHandler sigTERM stop Nothing)
+    (\previous -> installHandler sigTERM previous Nothing)
+    (const action)
 
 -- | Run one already-leased task to completion: refuse it outright if its
 -- capability or payload size fails the configuration's rules, otherwise
@@ -141,18 +196,17 @@ runOneLease paths config lease = do
 runExecutable
   :: Paths -> WorkConfig -> Task -> LeaseId -> CapabilityConfig -> BL.ByteString -> IO ()
 runExecutable paths config task leaseIdent capConfig payloadBytes = do
-  tempDir <- freshTempDir
-  renewalFailure <- newEmptyMVar
-  renewalThreadId <- forkIO
-    (renewalLoop paths (taskId task) leaseIdent (wcRenewSeconds config)
-      renewalFailure)
-  outcome <- (do
-      receiveTaskAttachments paths task tempDir
-      runCapability capConfig (wcEnv config) tempDir payloadBytes)
-    `finally` (killThread renewalThreadId >> removeWorkerDirectory tempDir)
-  renewalError <- tryReadMVar renewalFailure
-  case renewalError of
-    Just failure -> throwIO (withContext "work: renewal failed: " failure)
+  (outcome, renewal) <-
+    withAsync (renewalLoop paths (taskId task) leaseIdent (wcRenewSeconds config)) $
+      \renewing -> do
+        outcome <- bracket freshTempDir removeWorkerDirectory $ \tempDir -> do
+          receiveTaskAttachments paths task tempDir
+          runCapability capConfig (wcEnv config) tempDir payloadBytes
+        renewal <- poll renewing
+        pure (outcome, renewal)
+  case renewal of
+    Just (Right refusal) -> throwIO (withContext "work: renewal failed: " refusal)
+    Just (Left exception) -> throwIO exception
     Nothing -> case outcome of
       RunFailure reason -> completeFailure paths (taskId task) leaseIdent reason Retry
       RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
@@ -179,13 +233,15 @@ removeWorkerDirectory directory = do
     Left exception -> ioError exception
     Right () -> pure ()
 
-renewalLoop :: Paths -> TaskId -> LeaseId -> Int -> MVar SpoolError -> IO ()
-renewalLoop paths taskIdent leaseIdent renewSeconds failure = do
+-- | Renew the lease at each interval until a renewal is refused, and answer
+-- with the refusal. It ends no other way but by being stopped.
+renewalLoop :: Paths -> TaskId -> LeaseId -> Int -> IO SpoolError
+renewalLoop paths taskIdent leaseIdent renewSeconds = do
   threadDelay (renewSeconds * 1000000)
   result <- withLock paths (renewOne paths (LeaseRef taskIdent leaseIdent))
   case result of
-    Right () -> renewalLoop paths taskIdent leaseIdent renewSeconds failure
-    Left refusal -> putMVar failure refusal
+    Right () -> renewalLoop paths taskIdent leaseIdent renewSeconds
+    Left refusal -> pure refusal
 
 completeSuccess :: Paths -> Task -> LeaseId -> A.Value -> IO ()
 completeSuccess paths task leaseIdent output = withLock paths $ do
@@ -210,22 +266,26 @@ freshTempDir = do
   createDirectoryIfMissing True path
   pure path
 
--- | How long a run that has been sent SIGTERM may keep going before it is
--- sent SIGKILL.
+-- | How long a run is given to end once it should have: after SIGTERM,
+-- before SIGKILL; and after its program exits, for its output to close.
 terminationGraceSeconds :: Int
 terminationGraceSeconds = 5
 
--- | Run one capability executable with the given environment, cwd, and
--- stdin payload. It runs in its own process group (`create_group`), killed
--- (and reporting a timeout) if it outlives `capTimeoutSeconds`, or (and
--- reporting an overrun) if either stream's captured output outlives
--- `capMaxOutputBytes`. Killing the group, not just the immediate process,
--- reaches a descendant that would otherwise survive and keep the pipes
--- open. The kill is SIGTERM first; a program may ignore that, so one still
--- running `terminationGraceSeconds` later is sent SIGKILL, which it cannot.
-runCapability :: CapabilityConfig -> [(String, String)] -> FilePath -> BL.ByteString -> IO RunOutcome
-runCapability capConfig envPairs cwdPath payload = do
-  (Just hin, Just hout, Just herr, ph) <- createProcess (proc (capExec capConfig) (capArgs capConfig))
+-- | A program that has been started, and what is needed to end it.
+data Started = Started
+  { startedInput :: Handle
+  , startedOutput :: Handle
+  , startedErrors :: Handle
+  , startedProcess :: ProcessHandle
+  , startedGroup :: Maybe ProcessGroupID
+    -- ^ The program leads its own group, so the group's identifier is the
+    -- program's. It is taken at the start because it outlives the program:
+    -- a process the program left behind is still in the group.
+  }
+
+startProgram :: CapabilityConfig -> [(String, String)] -> FilePath -> IO Started
+startProgram capConfig envPairs cwdPath = do
+  started <- createProcess (proc (capExec capConfig) (capArgs capConfig))
     { cwd = Just cwdPath
     , env = Just envPairs
     , std_in = CreatePipe
@@ -233,88 +293,169 @@ runCapability capConfig envPairs cwdPath payload = do
     , std_err = CreatePipe
     , create_group = True
     }
-  inputResult <- try (BL.hPut hin payload >> hClose hin)
-    :: IO (Either IOException ())
-  -- The watchdog and both readers can each ask for the kill; the first
-  -- request wins and the terminator carries it out once. The child may exit
-  -- between a limit firing and a signal. That process race is the only
-  -- error intentionally ignored here.
-  killRequested <- newEmptyMVar
-  terminator <- forkIO $ do
-    takeMVar killRequested
-    ignoreProcessRace (signalGroup sigTERM ph)
-    threadDelay (terminationGraceSeconds * 1000000)
-    ignoreProcessRace (signalGroup sigKILL ph)
-  let limit = capMaxOutputBytes capConfig
-      kill = void (tryPutMVar killRequested ())
-  outVar <- newEmptyMVar
-  errVar <- newEmptyMVar
-  outputExceeded <- newIORef False
-  _ <- forkIO (readerThread limit outputExceeded kill hout outVar)
-  _ <- forkIO (readerThread limit outputExceeded kill herr errVar)
-  timedOut <- newIORef False
-  watchdog <- forkIO $ do
-    threadDelay (capTimeoutSeconds capConfig * 1000000)
-    writeIORef timedOut True
-    kill
-  exitCode <- waitForProcess ph
-  killThread watchdog
-  killThread terminator
-  outResult <- readMVar outVar
-  errResult <- readMVar errVar
-  outBytes <- either ioError pure outResult
-  errBytes <- either ioError pure errResult
-  isTimeout <- readIORef timedOut
-  isOutputExceeded <- readIORef outputExceeded
-  pure $ case inputResult of
-    Left exception -> RunFailure
-      ("could not write payload: " <> T.pack (displayException exception))
-    Right () | isTimeout ->
-      RunFailure ("timeout after " <> T.pack (show (capTimeoutSeconds capConfig)) <> " s")
-    Right () | isOutputExceeded ->
-      RunFailure ("output exceeds max_output_bytes " <> T.pack (show limit))
-    Right () -> case exitCode of
-      ExitSuccess -> RunSuccess (BL.fromStrict outBytes)
-      ExitFailure n -> RunFailure
-        ("exit " <> T.pack (show n) <> ": " <> decodeLenient (tailBytes 1000 errBytes))
+  case started of
+    (Just input, Just output, Just errors, process) -> do
+      group <- getPid process
+      pure (Started input output errors process group)
+    (_, _, _, process) -> do
+      -- Three pipes were asked for. Were one missing, the program would
+      -- still have been started, and must not be left running.
+      void (waitForProcess process)
+      throwIO (userError "a program was started without its three pipes")
 
--- | Send a signal to the negative of the child's pid, i.e. every process in
--- its group, not just the one Spool exec'd. `getPid` returns Nothing once
--- the process handle has already been reaped, which this treats as nothing
--- left to signal.
-signalGroup :: Signal -> ProcessHandle -> IO ()
-signalGroup signal ph = do
-  running <- getPid ph
-  case running of
-    Nothing -> pure ()
-    Just pid -> signalProcess signal (negate pid)
+-- | End a program however its run was left. One still running, because the
+-- run was stopped from outside, is asked to end and given the grace to do
+-- it. Then whatever is in its group is killed, the worker's ends of its
+-- pipes are closed, and it is reaped.
+stopProgram :: Started -> IO ()
+stopProgram started = do
+  status <- getProcessExitCode (startedProcess started)
+  when (status == Nothing) $ do
+    signalGroup sigTERM started
+    void (timeout (terminationGraceSeconds * 1000000)
+      (waitForProcess (startedProcess started)))
+  signalGroup sigKILL started
+  forM_ [startedInput started, startedOutput started, startedErrors started] $
+    \handle -> hClose handle `catch` ignored
+  void (waitForProcess (startedProcess started))
+  where
+    ignored :: IOException -> IO ()
+    ignored _ = pure ()
 
-readerThread
-  :: Int64 -> IORef Bool -> IO () -> Handle -> MVar (Either IOException BS.ByteString) -> IO ()
-readerThread limit exceededRef kill handle var = do
-  result <- try (readCapped limit exceededRef kill handle) :: IO (Either IOException BS.ByteString)
-  putMVar var result
+-- | Signal every process in the program's group, not just the one Spool
+-- started. A group with nothing left in it cannot be signalled, which is
+-- the one error ignored here.
+signalGroup :: Signal -> Started -> IO ()
+signalGroup signal started = forM_ (startedGroup started) $ \group ->
+  signalProcessGroup signal group `catch` gone
+  where
+    gone :: IOException -> IO ()
+    gone _ = pure ()
 
--- | Read a handle to EOF in chunks, stopping (and killing the process) the
--- moment the total exceeds `limit`, so a capability that writes without
--- bound cannot grow the worker's memory without bound either.
-readCapped :: Int64 -> IORef Bool -> IO () -> Handle -> IO BS.ByteString
-readCapped limit exceededRef kill handle = go [] 0
+-- | Why a run was stopped before its program exited.
+data Stopped = TimedOut | Overran
+
+-- | How a run ended.
+data Ended
+  = Exited ExitCode Captured Captured (Either IOException ())
+    -- ^ The program exited and its output closed: its status, what it wrote
+    -- to stdout and to stderr, and whether its payload could be written.
+  | StoppedFor Stopped
+  | LeftOpen
+    -- ^ The program exited and its output did not close: it left a process
+    -- behind.
+
+-- | What was read from a stream, or that it went past the limit.
+data Captured = Captured BS.ByteString | PastLimit
+
+-- | Run one capability executable with the given environment, cwd, and
+-- stdin payload. It runs in its own process group, and is stopped if it
+-- outlives `capTimeoutSeconds` or if either stream of its output goes past
+-- `capMaxOutputBytes`. Stopping it is SIGTERM to the group, then SIGKILL to
+-- whatever of the group is still running `terminationGraceSeconds` later.
+--
+-- The payload is written while the output is read and the clock runs, so a
+-- program that reads nothing cannot hold the run past its timeout. A program
+-- may close its input or exit without reading all of its payload; that is
+-- its choice and not a failure, and its status and output say how it did.
+runCapability :: CapabilityConfig -> [(String, String)] -> FilePath -> BL.ByteString -> IO RunOutcome
+runCapability capConfig envPairs cwdPath payload =
+  bracket (startProgram capConfig envPairs cwdPath) stopProgram $ \started ->
+    withAsync (try (feed (startedInput started))) $ \feeding ->
+    withAsync (readCapped limit (startedOutput started)) $ \readingOutput ->
+    withAsync (readCapped limit (startedErrors started)) $ \readingErrors ->
+    withAsync (waitForProcess (startedProcess started)) $ \exiting -> do
+      deadline <- registerDelay (capTimeoutSeconds capConfig * 1000000)
+      let -- The program has exited and nothing holds its pipes.
+          settled = do
+            status <- waitSTM exiting
+            output <- waitSTM readingOutput
+            errors <- waitSTM readingErrors
+            fed <- waitSTM feeding
+            pure (status, output, errors, fed)
+          pastLimit = do
+            output <- pollCaptured readingOutput
+            errors <- pollCaptured readingErrors
+            check (any isPastLimit [output, errors])
+          stopFor reason = do
+            signalGroup sigTERM started
+            ended <- within terminationGraceSeconds settled
+            unless (isJust ended) $ do
+              signalGroup sigKILL started
+              void (within terminationGraceSeconds settled)
+            pure (StoppedFor reason)
+      first <- atomically $
+        (Left TimedOut <$ (readTVar deadline >>= check))
+          `orElse` (Left Overran <$ pastLimit)
+          `orElse` (Right <$> waitSTM exiting)
+      ended <- case first of
+        Left reason -> stopFor reason
+        Right _ -> do
+          closed <- within terminationGraceSeconds settled
+          case closed of
+            Just (status, output, errors, fed) -> pure (Exited status output errors fed)
+            Nothing -> do
+              signalGroup sigKILL started
+              void (within terminationGraceSeconds settled)
+              pure LeftOpen
+      pure (outcomeOf ended)
+  where
+    limit = capMaxOutputBytes capConfig
+    feed input = (BL.hPut input payload >> hClose input) `catch` closedByProgram input
+    closedByProgram input exception
+      | ioeGetErrorType exception == ResourceVanished =
+          hClose input `catch` (\again -> const (pure ()) (again :: IOException))
+      | otherwise = throwIO exception
+    outcomeOf ended = case ended of
+      Exited _ _ _ (Left exception) -> RunFailure
+        ("could not write payload: " <> T.pack (displayException exception))
+      StoppedFor TimedOut -> timedOut
+      StoppedFor Overran -> overran
+      Exited _ output errors _ | any isPastLimit [Just output, Just errors] -> overran
+      LeftOpen -> RunFailure
+        ("output still open " <> T.pack (show terminationGraceSeconds)
+          <> " s after exit: the program left a process running")
+      Exited ExitSuccess (Captured output) _ _ -> RunSuccess (BL.fromStrict output)
+      Exited (ExitFailure n) _ (Captured errors) _ -> RunFailure
+        ("exit " <> T.pack (show n) <> ": " <> decodeLenient (tailBytes 1000 errors))
+      -- Every stream past its limit was answered above.
+      Exited _ _ _ _ -> overran
+    timedOut = RunFailure
+      ("timeout after " <> T.pack (show (capTimeoutSeconds capConfig)) <> " s")
+    overran = RunFailure
+      ("output exceeds max_output_bytes " <> T.pack (show limit))
+
+isPastLimit :: Maybe Captured -> Bool
+isPastLimit (Just PastLimit) = True
+isPastLimit _ = False
+
+-- | What a reader has captured, if it has finished.
+pollCaptured :: Async Captured -> STM (Maybe Captured)
+pollCaptured thread = (Just <$> waitSTM thread) `orElse` pure Nothing
+
+-- | Wait for something for so many seconds, and no longer.
+within :: Int -> STM a -> IO (Maybe a)
+within seconds awaited = do
+  expired <- registerDelay (seconds * 1000000)
+  atomically $
+    (Just <$> awaited) `orElse` (Nothing <$ (readTVar expired >>= check))
+
+-- | Read a handle to its end in chunks, stopping the moment the total goes
+-- past `limit`, so a capability that writes without bound cannot grow the
+-- worker's memory without bound either.
+readCapped :: Int64 -> Handle -> IO Captured
+readCapped limit handle = go [] 0
   where
     chunkSize = 65536
     go chunks total = do
       chunk <- BS.hGetSome handle chunkSize
       if BS.null chunk
-        then pure (BS.concat (reverse chunks))
+        then pure (Captured (BS.concat (reverse chunks)))
         else do
           let total' = total + fromIntegral (BS.length chunk)
-              chunks' = chunk : chunks
           if total' > limit
-            then do
-              writeIORef exceededRef True
-              kill
-              pure (BS.concat (reverse chunks'))
-            else go chunks' total'
+            then pure PastLimit
+            else go (chunk : chunks) total'
 
 tailBytes :: Int -> BS.ByteString -> BS.ByteString
 tailBytes n bytes = BS.drop (max 0 (BS.length bytes - n)) bytes

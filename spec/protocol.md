@@ -255,6 +255,7 @@ expose reclaim.
 | 5 | grant missing, revoked, or expired |
 | 70 | corrupt durable state |
 | 75 | retryable filesystem failure |
+| 143 | `work`: stopped by SIGTERM |
 
 ## Workers
 
@@ -285,7 +286,22 @@ or overrun capability may have spawned children of its own.
 
 Killing a run sends its process group SIGTERM. A program may ignore that, so
 a run still going 5 seconds later is sent SIGKILL. The limit on wall-clock
-time is therefore enforced within `timeout_seconds` plus 5 seconds.
+time is therefore enforced within `timeout_seconds` plus 5 seconds. The clock
+runs from the program's start, while its payload is being written: a program
+that does not read its payload is timed out like any other.
+
+A program may exit, or close its input, without reading all of its payload.
+That is not a failure; its exit status and its output say how it did.
+
+A run has ended when its program has exited and its output has closed. A
+program that exits leaving a process behind, holding its output open, has
+not ended: 5 seconds after the program exits, whatever is left of its
+process group is sent SIGKILL and the run is a failure, retried.
+
+`work` sent SIGTERM stops: it leases nothing more, every run is killed as
+above, each run's working directory is deleted, and `work` exits 143. It
+reports nothing for the tasks it was running. Their leases stand, for
+`reclaim` to return.
 
 With attachments, `work` fetches and verifies every
 declared attachment into `attachments/SHA256` below the fresh working

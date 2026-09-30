@@ -24,7 +24,7 @@ module Spool.Attachments
   , attemptRemoveWorkerDirectory
   ) where
 
-import Control.Exception (IOException, bracket, onException, try)
+import Control.Exception (IOException, bracketOnError, onException, try)
 import Control.Monad (forM_, unless, when)
 import Crypto.Hash (Context, Digest, SHA256, hashFinalize, hashInit,
                     hashUpdate)
@@ -40,8 +40,8 @@ import qualified Data.Text as T
 import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive,
                          removeFile, renameDirectory, renameFile)
 import System.FilePath ((</>))
-import System.IO (Handle, IOMode (ReadMode), hClose, hFlush,
-                  openBinaryFile, openBinaryTempFile)
+import System.IO (Handle, IOMode (ReadMode), hClose, openBinaryTempFile,
+                  withBinaryFile)
 import System.IO.Error (isDoesNotExistError)
 import Spool.Types (TaskId, taskIdText)
 
@@ -145,9 +145,8 @@ isStagingLeftover name =
 -- Existing destination directories are never removed or overwritten.
 stageAttachments :: FilePath -> FilePath -> TaskId
                  -> [Attachment] -> IO (Either String ())
-stageAttachments attachmentRoot sourceRoot task attachments = do
-  validated <- pure (validateAttachments attachments)
-  case validated of
+stageAttachments attachmentRoot sourceRoot task attachments =
+  case validateAttachments attachments of
     Left message -> pure (Left message)
     Right [] -> pure (Right ())
     Right declarations -> do
@@ -185,67 +184,49 @@ stageFiles temporary sourceRoot declarations = do
 -- caller supplies a handle connected to the fetch response.  The destination
 -- is renamed only after both digest and size match the declaration.
 receiveAttachment :: FilePath -> Attachment -> Handle -> IO (Either String ())
-receiveAttachment workerAttachmentRoot attachment source = do
-  validated <- pure (validateAttachment attachment)
-  case validated of
+receiveAttachment workerAttachmentRoot attachment source =
+  case validateAttachment attachment of
     Left message -> pure (Left message)
     Right () -> do
       createDirectoryIfMissing True workerAttachmentRoot
-      let destination = workerAttachmentRoot </> digestName attachment
-      (temporary, handle) <- openBinaryTempFile workerAttachmentRoot ".spool-attachment-receive"
-      result <- try (receiveInto handle source)
-      hClose handle
-      case result of
-        Left (exception :: IOException) -> do
-          discardTemporary temporary
-          ioError exception
-        Right checked -> case checked of
-          Left message -> do
-            discardTemporary temporary
-            pure (Left message)
-          Right () -> do
-            published <- try (renameFile temporary destination)
-            case published of
-              Left (exception :: IOException) -> do
-                discardTemporary temporary
-                ioError exception
-              Right () -> pure (Right ())
-  where
-    receiveInto handle sourceHandle = do
-      (context, size) <- copyStream sourceHandle handle hashInit 0
-      hFlush handle
-      pure (verifyDigest attachment context size)
+      verifiedInto workerAttachmentRoot ".spool-attachment-receive"
+        (workerAttachmentRoot </> digestName attachment) attachment source
 
 -- | Check an existing file without copying it.
 verifyAttachmentFile :: Attachment -> FilePath -> IO (Either String ())
-verifyAttachmentFile attachment path = do
-  validated <- pure (validateAttachment attachment)
-  case validated of
+verifyAttachmentFile attachment path =
+  case validateAttachment attachment of
     Left message -> pure (Left message)
-    Right () -> withBinaryFile path $ \handle -> do
+    Right () -> withBinaryFile path ReadMode $ \handle -> do
       (context, size) <- hashStream handle hashInit 0
       pure (verifyDigest attachment context size)
 
 copyVerified :: Attachment -> FilePath -> FilePath -> FilePath -> IO (Either String ())
-copyVerified attachment source temporary destination = do
-  sourceHandle <- openBinaryFile source ReadMode
-  (temporaryFile, destinationHandle) <- openBinaryTempFile temporary ".spool-attachment-copy"
-  result <- try $ do
-    (context, size) <- copyStream sourceHandle destinationHandle hashInit 0
-    hFlush destinationHandle
-    pure (verifyDigest attachment context size)
-  hClose sourceHandle
-  hClose destinationHandle
-  case result of
-    Left (exception :: IOException) -> do
-      discardTemporary temporaryFile
-      ioError exception
-    Right (Left message) -> do
-      discardTemporary temporaryFile
-      pure (Left message)
-    Right (Right ()) -> do
-      renameFile temporaryFile destination
-      pure (Right ())
+copyVerified attachment source temporary destination =
+  withBinaryFile source ReadMode $
+    verifiedInto temporary ".spool-attachment-copy" destination attachment
+
+-- | Copy a stream into a temporary file in this directory, and give the file
+-- its name only if the bytes match the declaration. However this is left,
+-- the temporary file is closed, and it is gone unless it was given its name.
+verifiedInto
+  :: FilePath -> String -> FilePath -> Attachment -> Handle
+  -> IO (Either String ())
+verifiedInto directory template destination attachment source =
+  bracketOnError (openBinaryTempFile directory template) abandon $
+    \(temporary, handle) -> do
+      (context, size) <- copyStream source handle hashInit 0
+      hClose handle
+      case verifyDigest attachment context size of
+        Left message -> discardTemporary temporary >> pure (Left message)
+        Right () -> renameFile temporary destination >> pure (Right ())
+  where
+    abandon (temporary, handle) = do
+      closed <- try (hClose handle)
+      case closed of
+        Left (_ :: IOException) -> pure ()
+        Right () -> pure ()
+      discardTemporary temporary
 
 -- | Remove a temporary file on the way out of a failure.  The failure already
 -- in hand is the one to report, so a refusal here must not replace it.  The
@@ -257,9 +238,6 @@ discardTemporary path = do
   case result of
     Left (_ :: IOException) -> pure ()
     Right () -> pure ()
-
-withBinaryFile :: FilePath -> (Handle -> IO a) -> IO a
-withBinaryFile path action = bracket (openBinaryFile path ReadMode) hClose action
 
 hashStream :: Handle -> Context SHA256 -> Int64 -> IO (Context SHA256, Int64)
 hashStream handle context size = do
