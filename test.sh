@@ -436,11 +436,11 @@ jq 'del(.reason)' "$work/validated-records/failed/$validate_failure_lease.json" 
 mv "$work/bad-failure.json" "$work/validated-records/failed/$validate_failure_lease.json"
 expect_exit 70 spoolv failures
 
-# A fail interrupted after its record was written leaves the lease standing
-# beside that record. The state is rebuilt from the real writer's own files:
-# the lease is set aside, failed for real, then put back. Finishing it with
-# the same reason and retry choice completes the transition; a different
-# reason or choice is refused and cannot pass for having been recorded.
+# The record is the commit. A fail interrupted after its record was written
+# leaves the lease standing beside that record; the next command, whatever it
+# is, finishes the fail before it does anything. The state is rebuilt from the
+# real writer's own files: the lease is set aside, failed for real, then put
+# back. A repeat of the fail afterwards finds no lease and is stale.
 spoolf() { "$spool_binary" --dir "$work/interrupted-fail" "$@"; }
 spoolf init
 printf '%s\n' '{"task_id":"interrupted-fail","capability":"validate@1","payload":{}}' \
@@ -452,28 +452,88 @@ cp "$work/interrupted-fail/leased/$interrupted_lease.json" \
   "$work/interrupted-fail/leased/$interrupted_lease.worker" "$work/interrupted-saved/"
 first_fail=$(jq -nc --arg lease "$interrupted_lease" \
   '{task_id:"interrupted-fail",lease_id:$lease,reason:"first reason"}')
-other_fail=$(jq -nc --arg lease "$interrupted_lease" \
-  '{task_id:"interrupted-fail",lease_id:$lease,reason:"other reason"}')
-test "$first_fail" != "$other_fail"; check
 printf '%s\n' "$first_fail" | spoolf fail | jq -e '.status == "failed_retry"' >/dev/null; check
 cp "$work/interrupted-saved/$interrupted_lease.json" \
   "$work/interrupted-saved/$interrupted_lease.worker" "$work/interrupted-fail/leased/"
-rm "$work/interrupted-fail/pending/interrupted-fail.json"
-spoolf status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 1' >/dev/null; check
-set +e
-printf '%s\n' "$other_fail" | spoolf fail >/dev/null 2>&1
-other_reason_exit=$?
-printf '%s\n' "$first_fail" | spoolf fail --no-retry >/dev/null 2>&1
-other_choice_exit=$?
-set -e
-test "$other_reason_exit" -eq 4; check
-test "$other_choice_exit" -eq 4; check
-spoolf status --json | jq -e '.pending == 0 and .leased == 1 and .failed == 1' >/dev/null; check
-printf '%s\n' "$first_fail" | spoolf fail | jq -e '.status == "failed_retry"' >/dev/null; check
+rm -f "$work/interrupted-fail/pending/interrupted-fail.json"
+test -f "$work/interrupted-fail/leased/$interrupted_lease.json"; check
+test -f "$work/interrupted-fail/failed/$interrupted_lease.json"; check
+# Any command finishes it: here, status, which changes nothing itself.
 spoolf status --json | jq -e '.pending == 1 and .leased == 0 and .failed == 1' >/dev/null; check
+test ! -e "$work/interrupted-fail/leased/$interrupted_lease.worker"; check
+set +e
+printf '%s\n' "$first_fail" | spoolf fail > "$work/interrupted-repeat.out" 2>/dev/null
+repeat_fail_exit=$?
+set -e
+test "$repeat_fail_exit" -eq 4; check
+jq -e '.status == "stale"' "$work/interrupted-repeat.out" >/dev/null; check
 spoolf failures | jq -s --arg lease "$interrupted_lease" -e \
   'length == 1 and .[0].lease_id == $lease and .[0].reason == "first reason"
    and .[0].retried == true' >/dev/null; check
+# The same, for a fail that was not to be retried: the task stays failed.
+printf '%s\n' '{"task_id":"interrupted-final","capability":"validate@1","payload":{}}' \
+  | spoolf put >/dev/null
+spoolf lease --worker interrupted --count 2 > "$work/interrupted-final.jsonl"
+final_lease=$(jq -r 'select(.task_id == "interrupted-final").lease_id' "$work/interrupted-final.jsonl")
+test -n "$final_lease"; check
+cp "$work/interrupted-fail/leased/$final_lease.json" \
+  "$work/interrupted-fail/leased/$final_lease.worker" "$work/interrupted-saved/"
+jq -nc --arg lease "$final_lease" '{task_id:"interrupted-final",lease_id:$lease,reason:"final"}' \
+  | spoolf fail --no-retry >/dev/null
+cp "$work/interrupted-saved/$final_lease.json" \
+  "$work/interrupted-saved/$final_lease.worker" "$work/interrupted-fail/leased/"
+# reclaim finishes the fail first, so it finds only the other lease to return.
+spoolf reclaim --older-than 0 > "$work/interrupted-reclaim.out"
+jq -s -e '. == [{task_id:"interrupted-fail", status:"reclaimed"}]' \
+  "$work/interrupted-reclaim.out" >/dev/null; check
+spoolf status --json | jq -e '.pending == 1 and .leased == 0 and .failed == 2' >/dev/null; check
+test ! -e "$work/interrupted-fail/attachments/task-interrupted-final"; check
+
+# An ack interrupted after its result was written is finished the same way,
+# and reclaim never returns a task whose result is recorded. This task has an
+# attachment, which the finished ack deletes.
+spoolk() { "$spool_binary" --dir "$work/interrupted-ack" "$@"; }
+spoolk init
+ack_source="$work/interrupted-ack-source"
+mkdir -p "$ack_source"
+printf 'interrupted ack bytes\n' > "$ack_source/body"
+if command -v sha256sum >/dev/null 2>&1; then
+  ack_digest=$(sha256sum "$ack_source/body" | awk '{print $1}')
+else
+  ack_digest=$(shasum -a 256 "$ack_source/body" | awk '{print $1}')
+fi
+ack_size=$(wc -c < "$ack_source/body" | tr -d ' ')
+mv -f "$ack_source/body" "$ack_source/$ack_digest"
+jq -nc --arg digest "$ack_digest" --argjson size "$ack_size" \
+  '{task_id:"interrupted-ack",capability:"validate@1",payload:{},attachments:[{sha256:$digest,size:$size}]}' \
+  | spoolk put --attachments "$ack_source" >/dev/null
+test -f "$work/interrupted-ack/attachments/task-interrupted-ack/$ack_digest"; check
+spoolk lease --worker interrupted > "$work/interrupted-ack-lease.jsonl"
+ack_lease=$(jq -r '.lease_id' "$work/interrupted-ack-lease.jsonl")
+mkdir "$work/interrupted-ack-saved"
+cp "$work/interrupted-ack/leased/$ack_lease.json" \
+  "$work/interrupted-ack/leased/$ack_lease.worker" "$work/interrupted-ack-saved/"
+cp -R "$work/interrupted-ack/attachments/task-interrupted-ack" "$work/interrupted-ack-saved/"
+ack_line=$(jq -nc --arg lease "$ack_lease" '{task_id:"interrupted-ack",lease_id:$lease,result:{ok:true}}')
+printf '%s\n' "$ack_line" | spoolk ack | jq -e '.status == "acked"' >/dev/null; check
+cp "$work/interrupted-ack-saved/$ack_lease.json" \
+  "$work/interrupted-ack-saved/$ack_lease.worker" "$work/interrupted-ack/leased/"
+cp -R "$work/interrupted-ack-saved/task-interrupted-ack" "$work/interrupted-ack/attachments/"
+rm -f "$work/interrupted-ack/done/$ack_lease.json"
+test -f "$work/interrupted-ack/results/$ack_lease.json"; check
+spoolk reclaim --older-than 0 > "$work/interrupted-ack-reclaim.out"
+test ! -s "$work/interrupted-ack-reclaim.out"; check
+spoolk status --json | jq -e '.pending == 0 and .leased == 0 and .done == 1' >/dev/null; check
+test ! -e "$work/interrupted-ack/attachments/task-interrupted-ack"; check
+spoolk results | jq -s -e 'length == 1 and .[0].result == {ok:true}' >/dev/null; check
+printf '%s\n' "$ack_line" | spoolk ack | jq -e '.status == "already_done"' >/dev/null; check
+set +e
+jq -nc --arg lease "$ack_lease" '{task_id:"interrupted-ack",lease_id:$lease,result:{ok:false}}' \
+  | spoolk ack > "$work/interrupted-ack-other.out" 2>/dev/null
+other_result_exit=$?
+set -e
+test "$other_result_exit" -eq 4; check
+jq -e '.status == "stale"' "$work/interrupted-ack-other.out" >/dev/null; check
 
 # results and failures are listed oldest first, by when each was recorded.
 # The leases are resolved in the reverse of the order they were taken, so the

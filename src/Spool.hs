@@ -22,7 +22,7 @@ import Spool.Store
   , leaseTasks
   , putTasks
   , reclaimTasks
-  , recoverAttachmentState
+  , recover
   , renewTasks
   , resultsCommand
   , statusTasks
@@ -60,7 +60,7 @@ run args = case args of
       Work worker configPath maxTasks -> do
         paths <- openSpool directory
         initialise paths
-        withLock paths (recoverAttachmentState paths)
+        withLock paths (recover paths)
         runWork paths worker configPath maxTasks
       WorkShow configPath -> runWorkShow configPath
       Store transition -> withStore directory (runStoreCommand transition)

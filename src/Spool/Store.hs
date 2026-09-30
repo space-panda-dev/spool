@@ -11,7 +11,7 @@
 -- ".json" names) never sees them.
 module Spool.Store
   ( withStore
-  , recoverAttachmentState
+  , recover
   , putTasks
   , readTaskFile
   , readResultRecordFile
@@ -147,11 +147,39 @@ withStore :: FilePath -> (Paths -> IO ()) -> IO ()
 withStore directory action = do
   paths <- openSpool directory
   initialise paths
-  withLock paths (recoverAttachmentState paths >> action paths)
+  withLock paths (recover paths >> action paths)
+
+-- | Bring the spool into line with its records before any command acts on
+-- it. Recovery runs under the transition lock, so it cannot race a
+-- compliant put or resolution.
+recover :: Paths -> IO ()
+recover paths = do
+  finishCommitted paths
+  recoverAttachmentState paths
+
+-- | Finish every transition whose record is written and whose lease still
+-- stands. The record is the commit: an ack has happened once its result is
+-- recorded and a fail once its failure is, and the steps after the record
+-- only bring the rest of the spool into line. A crash between the record
+-- and those steps leaves them to be done here, before reclaim or anything
+-- else can see a lease whose transition has happened.
+finishCommitted :: Paths -> IO ()
+finishCommitted paths = do
+  files <- jsonFiles (leasedDir paths)
+  forM_ files $ \path -> do
+    leaseIdent <- leaseIdOfFile path
+    acked <- fileExists (resultPath paths leaseIdent)
+    failed <- fileExists (failedPath paths leaseIdent)
+    when (acked || failed) $ do
+      task <- readTaskFile path
+      if acked
+        then completeAck paths task leaseIdent
+        else do
+          record <- readFailureRecordFile (failedPath paths leaseIdent)
+          completeFail paths task leaseIdent (failureRetried record)
 
 -- | Finish interrupted attachment deletion and remove spool-owned copies for
--- tasks which no longer have a pending or leased state. Recovery runs under
--- the transition lock, so it cannot race a compliant put or resolution.
+-- tasks which no longer have a pending or leased state.
 recoverAttachmentState :: Paths -> IO ()
 recoverAttachmentState paths = do
   cleanupNames <- listDirectory (attachmentCleanupDir paths)
@@ -446,24 +474,18 @@ ackOne paths (LeaseRef ident leaseIdent) output = do
           stored <- writeResultRecord paths task leaseIdent worker output
           case stored of
             Left failure -> pure (Left failure)
-            Right () -> do
-              moved <- try (renameFile source (donePath paths leaseIdent))
-                :: IO (Either IOException ())
-              case moved of
-                Right () -> do
-                  removeSidecars paths leaseIdent
-                  tombstoneAndDelete paths (taskId task)
-                  pure (Right Acked)
-                Left exception
-                  | isDoesNotExistError exception -> do
-                      done <- findDoneLease paths ident leaseIdent
-                      doneResult paths leaseIdent output done
-                  | otherwise -> throwIO (retryable
-                      ("could not move leased task to done: "
-                        <> displayException exception))
+            Right () -> Right Acked <$ completeAck paths task leaseIdent
     else do
       done <- findDoneLease paths ident leaseIdent
       doneResult paths leaseIdent output done
+
+-- | The steps after an ack's commit: the lease moves to done, its sidecars
+-- go, and the task's attachments go.
+completeAck :: Paths -> Task -> LeaseId -> IO ()
+completeAck paths task leaseIdent = do
+  renameFile (leasedPath paths leaseIdent) (donePath paths leaseIdent)
+  removeSidecars paths leaseIdent
+  tombstoneAndDelete paths (taskId task)
 
 -- | How a task that is done relates to the lease a caller named.
 data DoneUnder
@@ -552,12 +574,17 @@ failLease paths (LeaseRef ident leaseIdent) reason retry = do
           stored <- writeFailureRecord paths task leaseIdent worker reason retry
           case stored of
             Left failure -> pure (Left failure)
-            Right () -> do
-              when (retry == Retry) (returnToPending paths task)
-              removeFile source
-              removeSidecars paths leaseIdent
-              when (retry == NoRetry) (tombstoneAndDelete paths (taskId task))
-              pure (Right ())
+            Right () -> Right () <$ completeFail paths task leaseIdent retry
+
+-- | The steps after a fail's commit: the task goes back to pending if it is
+-- to be retried, the lease and its sidecars go, and for a task left failed
+-- its attachments go.
+completeFail :: Paths -> Task -> LeaseId -> Retry -> IO ()
+completeFail paths task leaseIdent retry = do
+  when (retry == Retry) (returnToPending paths task)
+  removeFile (leasedPath paths leaseIdent)
+  removeSidecars paths leaseIdent
+  when (retry == NoRetry) (tombstoneAndDelete paths (taskId task))
 
 -- | Record a failure once. A record already there belongs to a fail that was
 -- interrupted before it removed the lease: the same reason and retry choice

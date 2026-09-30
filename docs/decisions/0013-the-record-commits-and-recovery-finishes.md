@@ -1,6 +1,6 @@
 # 0013. The record commits the transition, and recovery finishes it
 
-Status: proposed
+Status: accepted
 
 `ack` writes a result record and then moves the lease to done. `fail` writes
 a failure record, returns the task to pending if it is to be retried, and

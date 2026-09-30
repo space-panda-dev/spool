@@ -74,13 +74,23 @@ A task is **pending**, **leased**, **done**, or **failed**.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
   or, with `--no-retry`, moves it to failed. A lease has at most one failure
-  record. Where a record is already stored for a live lease, repeating the
-  same reason and retry choice completes the fail; a different reason or
-  choice is a stale-lease error and cannot replace the stored record.
+  record.
 - `reclaim --older-than SECONDS` returns to pending every lease whose later of
   lease time and last renewal is older than that. The old lease ID is dead.
 
 A lease ID that is not the task's current lease acts on nothing.
+
+Under
+[ADR 0013](../docs/decisions/0013-the-record-commits-and-recovery-finishes.md),
+the record is the commit. An `ack` has happened once its result record is
+written, and a `fail` once its failure record is; the steps after the record
+only bring the rest of the spool into line. Before any command acts, the
+spool finishes every transition whose record is written and whose lease
+still stands, so a crash between the record and those steps loses nothing
+and `reclaim` never returns a task whose result is recorded. A worker that
+repeats such an `ack` or `fail` afterwards is answered as for any repeat:
+`already_done` for the same result, `stale` for a different one or for a
+`fail`.
 
 Under [ADR 0011](../docs/decisions/0011-a-lease-id-is-opaque-to-its-holder.md),
 a `lease_id` is `lease_` followed by one or more of ASCII letters, digits,
