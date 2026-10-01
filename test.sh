@@ -27,7 +27,7 @@ if [[ -z ${SPOOL:-} ]]; then
     "$here/app/Main.hs" >/dev/null
 fi
 test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
-test "$($spool_binary --version)" = "spool 0.0.1"; check
+test "$($spool_binary --version)" = "spool 0.0.2"; check
 
 spool() { "$spool_binary" --dir "$work/spool" "$@"; }
 
