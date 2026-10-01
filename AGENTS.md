@@ -30,6 +30,10 @@ document is linked from somewhere, every decision record is indexed, cited
 invariants exist and cite a decision, the protocol's version matches
 `spec/VERSION`, and every file has a licence in `REUSE.toml`.
 
+`nix/spool.nix` is cabal2nix's reading of `spool.cabal`; after changing the
+cabal file, run `cabal2nix . > nix/spool.nix` and commit both. The flake check
+fails when they disagree.
+
 `nix flake check -L` builds the static binary with warnings as errors and runs
 the unit tests in `test/` and the integration suite in `test.sh`. CI runs the
 same on Linux and macOS, and builds against Hackage with each supported
