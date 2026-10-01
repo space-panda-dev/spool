@@ -1,6 +1,6 @@
 # 0016. A grant that may put may read what came of it
 
-Status: proposed
+Status: accepted
 
 [ADR 0015](0015-a-grant-may-let-its-holder-put.md) lets a grant put tasks
 through the remote command. The results of those tasks, and the failures,

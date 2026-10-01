@@ -1456,9 +1456,15 @@ remote_reject '--count 1'
 # malformed, and the attachments form is never a remote word.
 expect_exit 5 remote_primary 'put' </dev/null
 remote_reject 'put --attachments x'
-remote_reject 'results'
-remote_reject 'failures'
-remote_reject 'status'
+# results, failures, and status are remote words for a grant that may put
+# (ADR 0016); this one may not, so each is denied, and a word with anything
+# more is never a word.
+expect_exit 5 remote_primary 'results' </dev/null
+expect_exit 5 remote_primary 'failures' </dev/null
+expect_exit 5 remote_primary 'status' </dev/null
+expect_exit 5 remote_primary 'status --json' </dev/null
+remote_reject 'status --text'
+remote_reject 'results --json'
 remote_reject 'reclaim --older-than 0'
 remote_reject 'grant --worker other'
 remote_reject 'revoke --grant grant_deadbeef'
@@ -1675,6 +1681,17 @@ set -e
 test "$remote_put_denied" -eq 5; check
 test ! -s "$work/remote-put-denied.out"; check
 spoolg status --json | jq -e --argjson n "$pending_before_remote_put" '.pending == $n + 2' >/dev/null; check
+# A grant that may put reads what came of the tasks; one that may not is
+# denied. Both read nothing on stdin: a word with input still answers.
+"$bin/fake-ssh" "$putter_grant" status </dev/null | grep -E '^pending=[0-9]+ leased=[0-9]+ done=[0-9]+ failed=[0-9]+$' >/dev/null; check
+"$bin/fake-ssh" "$putter_grant" 'status --json' </dev/null \
+  | jq -e --argjson n "$pending_before_remote_put" '.pending == $n + 2' >/dev/null; check
+diff <("$bin/fake-ssh" "$putter_grant" results </dev/null) <(spoolg results); check
+diff <(printf 'ignored\n' | "$bin/fake-ssh" "$putter_grant" failures) <(spoolg failures); check
+for word in results failures status 'status --json'; do
+  expect_exit 5 "$bin/fake-ssh" "$reader_grant" "$word" </dev/null
+  test ! -s "$work/exit.stdout"; check
+done
 # A task with attachments cannot come this way.
 set +e
 jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \

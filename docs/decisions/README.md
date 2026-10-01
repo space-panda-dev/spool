@@ -24,4 +24,4 @@ document and the implementation say nothing of it until it is accepted.
 | [0013](0013-the-record-commits-and-recovery-finishes.md) | The record commits the transition, and recovery finishes it |
 | [0014](0014-durable-means-through-a-power-loss.md) | Durable means through a power loss |
 | [0015](0015-a-grant-may-let-its-holder-put.md) | A grant may let its holder put |
-| [0016](0016-a-grant-that-may-put-may-read-what-came-of-it.md) | Proposed: a grant that may put may read what came of it |
+| [0016](0016-a-grant-that-may-put-may-read-what-came-of-it.md) | A grant that may put may read what came of it |

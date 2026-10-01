@@ -71,6 +71,9 @@ import Spool.Store
   , removeSidecars
   , leaseIdOfFile
   , leaseTasks
+  , resultsCommand
+  , failuresCommand
+  , statusTasks
   , answerEach
   , ackStep
   , renewStep
@@ -286,6 +289,10 @@ dispatchRemote paths grant operation = case operation of
   Access.RemotePut
     | Access.grantPut grant -> putTasks paths Nothing
     | otherwise -> throwIO (grantRefused "grant does not permit put")
+  -- Reading what came of the tasks goes with having put them (ADR 0016).
+  Access.RemoteResults -> reading (resultsCommand paths)
+  Access.RemoteFailures -> reading (failuresCommand paths)
+  Access.RemoteStatus format -> reading (statusTasks paths format)
   Access.RemoteLease count -> do
     let requested = fromMaybe 1 count
     when (requested > toInteger (maxBound :: Int))
@@ -308,6 +315,9 @@ dispatchRemote paths grant operation = case operation of
     fetchFor paths request
   where
     worker = Access.grantWorker grant
+    reading command
+      | Access.grantPut grant = command
+      | otherwise = throwIO (grantRefused "grant does not permit reading the spool")
     ownedLive = liveLeaseOwned paths worker
     ownedAck ack = ackOwned paths worker (ackRef ack)
     -- Act on an item only if its lease is the grant's worker's.

@@ -322,6 +322,10 @@ fail
 fail --no-retry
 fetch
 put
+results
+failures
+status
+status --json
 ```
 
 `N` is decimal from 1 through 9223372036854775807 with no sign or leading
@@ -335,8 +339,12 @@ defined above on stdin and writes verified raw bytes to stdout; a request for
 a lease that is not the worker's is exit 4. `put` takes and answers the same
 lines as it does locally, for a grant whose `put` is true; for one whose
 `put` is false it is exit 5 and the lines are not read. A task put this way
-may declare no attachments; one that does is exit 2. Requested command words
-never contain task IDs, lease IDs, digests, paths, or a claimed worker.
+may declare no attachments; one that does is exit 2. Under
+[ADR 0016](../docs/decisions/0016-a-grant-that-may-put-may-read-what-came-of-it.md),
+`results`, `failures`, and `status` write what they write locally, for a
+grant whose `put` is true, and are exit 5 for one whose `put` is false; they
+read nothing on stdin. Requested command words never contain task IDs, lease
+IDs, digests, paths, or a claimed worker.
 
 ### Remote worker
 
