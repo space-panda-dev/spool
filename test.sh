@@ -1454,7 +1454,7 @@ remote_reject 'lease extra'
 remote_reject '--count 1'
 # put is a remote word (ADR 0015); this grant may not, so it is denied, not
 # malformed, and the attachments form is never a remote word.
-expect_exit 5 remote_primary 'put'
+expect_exit 5 remote_primary 'put' </dev/null
 remote_reject 'put --attachments x'
 remote_reject 'results'
 remote_reject 'failures'
