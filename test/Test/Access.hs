@@ -26,7 +26,7 @@ import Spool.Access
   , renderManagedAuthorizedKeyLine
   , validateGrant
   )
-import Spool.Types (Retry (..), workerNameText)
+import Spool.Types (Retry (..), StatusFormat (..), workerNameText)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck (Gen, elements, forAll, listOf, testProperty, vectorOf, (===))
@@ -50,6 +50,10 @@ acceptedCommands =
   , ("fail --no-retry", RemoteFail NoRetry)
   , ("fetch", RemoteFetch)
   , ("put", RemotePut)
+  , ("results", RemoteResults)
+  , ("failures", RemoteFailures)
+  , ("status", RemoteStatus StatusText)
+  , ("status --json", RemoteStatus StatusJson)
   ]
 
 rejectedCommands :: [(String, BS.ByteString)]
@@ -74,9 +78,8 @@ rejectedCommands =
   , ("glob", "lease*")
   , ("option injection", "lease --worker other")
   , ("put with a word", "put --attachments x")
-  , ("local results", "results")
-  , ("local failures", "failures")
-  , ("local status", "status")
+  , ("status with another option", "status --text")
+  , ("results with an option", "results --json")
   , ("local reclaim", "reclaim --older-than 0")
   , ("local grant", "grant --worker other")
   , ("local revoke", "revoke --grant grant_deadbeef")

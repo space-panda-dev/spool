@@ -44,7 +44,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time (UTCTime, defaultTimeLocale, formatTime, parseTimeM)
 import System.FilePath (isAbsolute, normalise, splitDirectories, (</>))
 import Spool.Canonical (encode)
-import Spool.Types (Retry (..), WorkerName, mkWorkerName, validatePeer)
+import Spool.Types (Retry (..), StatusFormat (..), WorkerName, mkWorkerName, validatePeer)
 
 -- | @grant_@ and then 32 lower-case hexadecimal characters.
 newtype GrantId = GrantId T.Text
@@ -145,6 +145,9 @@ data RemoteCommand
   | RemoteFail Retry
   | RemoteFetch
   | RemotePut
+  | RemoteResults
+  | RemoteFailures
+  | RemoteStatus StatusFormat
   deriving (Eq, Show)
 
 grantKeys :: [T.Text]
@@ -313,6 +316,10 @@ parseRemoteCommand bytes
   | bytes == "fail --no-retry" = Right (RemoteFail NoRetry)
   | bytes == "fetch" = Right RemoteFetch
   | bytes == "put" = Right RemotePut
+  | bytes == "results" = Right RemoteResults
+  | bytes == "failures" = Right RemoteFailures
+  | bytes == "status" = Right (RemoteStatus StatusText)
+  | bytes == "status --json" = Right (RemoteStatus StatusJson)
   | Just suffix <- BS.stripPrefix "lease --count " bytes = do
       count <- parseCount suffix
       pure (RemoteLease (Just count))
