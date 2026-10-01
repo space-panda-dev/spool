@@ -344,6 +344,17 @@ uses a positive threshold greater than its workers' renewal interval plus the
 maximum renewal delay it intends to tolerate. The remote command does not
 expose reclaim.
 
+## Durability
+
+Under
+[ADR 0014](../docs/decisions/0014-durable-means-through-a-power-loss.md),
+when a command answers, what it answers for is on the disk. A file is synced
+before it is given its name; a directory is synced after a name is added to
+it, removed from it, or moved into or out of it; and a command answers a line
+only after the syncs of that line's transition. A spool on a file system that
+does not honour a sync is as durable as that file system, and Spool does not
+detect this.
+
 ## Exit codes
 
 | Code | Meaning |

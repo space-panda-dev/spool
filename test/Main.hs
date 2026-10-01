@@ -8,6 +8,7 @@ import qualified Test.Access
 import qualified Test.Attachments
 import qualified Test.Cli
 import qualified Test.Error
+import qualified Test.Files
 import Test.Tasty (defaultMain, testGroup)
 import qualified Test.Types
 import qualified Test.Wire
@@ -21,6 +22,7 @@ main = do
     , attachments
     , Test.Cli.tests
     , Test.Error.tests
+    , Test.Files.tests
     , Test.Types.tests
     , Test.Wire.tests
     , Test.WorkerConfig.tests

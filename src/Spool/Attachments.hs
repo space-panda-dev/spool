@@ -38,11 +38,12 @@ import Data.Int (Int64)
 import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import qualified Data.Text as T
 import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive,
-                         removeFile, renameDirectory, renameFile)
+                         removeFile)
 import System.FilePath ((</>))
 import System.IO (Handle, IOMode (ReadMode), hClose, openBinaryTempFile,
                   withBinaryFile)
 import System.IO.Error (isDoesNotExistError)
+import Spool.Files (syncHandle, syncedRename, syncedRenameDirectory)
 import Spool.Types (TaskId, taskIdText)
 
 -- | A SHA-256 digest as a declaration carries it: 64 lower-case hexadecimal
@@ -163,7 +164,7 @@ stageAttachments attachmentRoot sourceRoot task attachments =
           removeDirectoryRecursive temporary
           pure (Left message)
         Right () -> do
-          renameDirectory temporary destination
+          syncedRenameDirectory temporary destination
             `onException` removeDirectoryRecursive temporary
           pure (Right ())
 
@@ -216,10 +217,10 @@ verifiedInto directory template destination attachment source =
   bracketOnError (openBinaryTempFile directory template) abandon $
     \(temporary, handle) -> do
       (context, size) <- copyStream source handle hashInit 0
-      hClose handle
+      syncHandle handle
       case verifyDigest attachment context size of
         Left message -> discardTemporary temporary >> pure (Left message)
-        Right () -> renameFile temporary destination >> pure (Right ())
+        Right () -> syncedRename temporary destination >> pure (Right ())
   where
     abandon (temporary, handle) = do
       closed <- try (hClose handle)

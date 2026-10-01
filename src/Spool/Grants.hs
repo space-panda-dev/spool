@@ -21,7 +21,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time (getCurrentTime)
 import Numeric (showHex)
 import System.Directory (createDirectoryIfMissing, canonicalizePath,
-                         getHomeDirectory, removeFile, renameFile)
+                         getHomeDirectory, removeFile)
 import System.Environment (getExecutablePath)
 import System.FilePath (takeBaseName, takeDirectory, (</>))
 import System.IO (IOMode (ReadMode), hClose, openBinaryFile)
@@ -52,6 +52,8 @@ import Spool.Files
   , openSpool
   , resultPath
   , rootDir
+  , syncedRemove
+  , syncedRename
   , withLock
   )
 import Spool.Input
@@ -214,7 +216,7 @@ revokeAccess paths requested = do
     then fmap Just (readGrantRecord corrupt activePath
       >>= checked "grant filename does not match its record")
     else pure Nothing
-  when active (renameFile activePath tombstonePath)
+  when active (syncedRename activePath tombstonePath)
   tombstoned <- fileExists tombstonePath
   grant <- case activeGrant of
     Just value -> pure (Just value)
@@ -226,7 +228,7 @@ revokeAccess paths requested = do
   case grant of
     Just value -> reclaimWorkerLeases paths (Access.grantWorker value)
     Nothing -> pure ()
-  when tombstoned (removeFile tombstonePath)
+  when tombstoned (syncedRemove tombstonePath)
   BLC.putStrLn (canonical (A.object
     [ "grant_id" .= identifier
     , "status" .= ("revoked" :: T.Text)
@@ -241,7 +243,7 @@ reclaimWorkerLeases paths worker = do
     when (owner == worker) $ do
       task <- readTaskFile path
       returnToPending paths task
-      removeFile path
+      syncedRemove path
       removeSidecars paths leaseIdent
 
 runRemote :: T.Text -> IO ()
