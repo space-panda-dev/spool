@@ -8,6 +8,8 @@ module Spool
 import Control.Exception (Handler (..), IOException, catches, displayException,
                           throwIO)
 import qualified Data.Text as T
+import Data.Version (showVersion)
+import Paths_spool (version)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import Spool.Cli (Command (..), StoreCommand (..), parseCommand, parseWorkShow)
@@ -50,7 +52,7 @@ filesystemFailure exception =
 
 run :: [String] -> IO ()
 run args = case args of
-  ["--version"] -> putStrLn "spool 0.0.1"
+  ["--version"] -> putStrLn ("spool " <> showVersion version)
   ["remote", "--grant", identifier] -> runRemote (T.pack identifier)
   ("work" : rest) | "--show" `elem` rest && "--dir" `notElem` args ->
     either (throwIO . Usage) runWorkShow (parseWorkShow rest)

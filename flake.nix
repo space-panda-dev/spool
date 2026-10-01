@@ -50,7 +50,7 @@
             nativeBuildInputs = [ pkgs.coreutils ];
           } ''
             test -x ${spool}/bin/spool
-            test "$(${spool}/bin/spool --version)" = "spool 0.0.1"
+            test "$(${spool}/bin/spool --version)" = "spool 0.0.2"
             touch "$out"
           '';
 

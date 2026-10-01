@@ -1,6 +1,6 @@
 # Spool protocol
 
-Version: 0.0.1
+Version: 0.0.2
 Status: draft
 
 The protocol a spool and its workers follow. It is dedicated to the public
