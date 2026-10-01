@@ -68,9 +68,10 @@ import Spool.Store
   , removeSidecars
   , leaseIdOfFile
   , leaseTasks
-  , ackAll
-  , renewAll
-  , failAll
+  , answerEach
+  , ackStep
+  , renewStep
+  , failStep
   , returnToPending
   , fetchFor
   )
@@ -281,46 +282,62 @@ dispatchRemote paths worker operation = case operation of
     when (requested > toInteger (maxBound :: Int))
       (throwIO (malformed "lease count is too large for this host"))
     leaseTasks paths worker (fromInteger requested)
-  -- Every line is read, and every lease it names is checked against the
-  -- grant's worker, before any of them is applied.
+  -- Every line is read before any is acted on. A line whose lease is not
+  -- the grant's worker's is answered stale, and the others are acted on.
   Access.RemoteAck -> do
     acks <- mapM parseAckLine =<< inputLines
-    mapM_ (ensureRemoteAckOwner paths worker . ackRef) acks
-    ackAll paths acks
+    answerEach ackRef (ownedAck `before` ackStep paths) acks
   Access.RemoteRenew -> do
     references <- mapM parseLeaseRefLine =<< inputLines
-    mapM_ (ensureLiveLeaseOwner paths worker) references
-    renewAll paths references
+    answerEach id (ownedLive `before` renewStep paths) references
   Access.RemoteFail retry -> do
     requests <- mapM parseFailLine =<< inputLines
-    mapM_ (ensureLiveLeaseOwner paths worker . failRef) requests
-    failAll retry paths requests
+    answerEach failRef ((ownedLive . failRef) `before` failStep retry paths) requests
   Access.RemoteFetch -> do
     request <- orThrow malformed . parseFetchRequest =<< BL.getContents
-    ensureLiveLeaseOwner paths worker (fetchRef request)
+    either throwIO pure =<< ownedLive (fetchRef request)
     fetchFor paths request
+  where
+    ownedLive = liveLeaseOwned paths worker
+    ownedAck ack = ackOwned paths worker (ackRef ack)
+    -- Act on an item only if its lease is the grant's worker's.
+    before owned step item = do
+      allowed <- owned item
+      case allowed of
+        Left refusal -> pure (Left refusal)
+        Right () -> step item
 
-ensureLiveLeaseOwner :: Paths -> WorkerName -> LeaseRef -> IO ()
-ensureLiveLeaseOwner paths worker (LeaseRef ident leaseIdent) = do
+-- | Whether a live lease is this worker's to act on.
+liveLeaseOwned :: Paths -> WorkerName -> LeaseRef -> IO (Either SpoolError ())
+liveLeaseOwned paths worker (LeaseRef ident leaseIdent) = do
   let path = leasedPath paths leaseIdent
   present <- fileExists path
-  unless present (throwIO (stale "lease is unknown or stale"))
-  task <- readTaskFile path
-  unless (taskId task == ident)
-    (throwIO (stale "lease does not belong to task_id"))
-  owner <- readWorkerSidecar paths leaseIdent
-  unless (owner == worker)
-    (throwIO (stale "lease belongs to a different worker"))
+  if not present
+    then pure (Left (stale "lease is unknown or stale"))
+    else do
+      task <- readTaskFile path
+      if taskId task /= ident
+        then pure (Left (stale "lease does not belong to task_id"))
+        else do
+          owner <- readWorkerSidecar paths leaseIdent
+          pure $ if owner == worker
+            then Right ()
+            else Left (stale "lease belongs to a different worker")
 
-ensureRemoteAckOwner :: Paths -> WorkerName -> LeaseRef -> IO ()
-ensureRemoteAckOwner paths worker reference@(LeaseRef ident leaseIdent) = do
+-- | Whether a lease is this worker's to acknowledge: live and its own, or
+-- already done by it, so that repeating an acknowledgement is allowed.
+ackOwned :: Paths -> WorkerName -> LeaseRef -> IO (Either SpoolError ())
+ackOwned paths worker reference@(LeaseRef ident leaseIdent) = do
   live <- fileExists (leasedPath paths leaseIdent)
   if live
-    then ensureLiveLeaseOwner paths worker reference
+    then liveLeaseOwned paths worker reference
     else do
       let path = resultPath paths leaseIdent
       present <- fileExists path
-      unless present (throwIO (stale "lease is unknown or stale"))
-      record <- readResultRecordFile path
-      unless (resultTask record == ident && resultWorker record == worker)
-        (throwIO (stale "lease belongs to a different worker"))
+      if not present
+        then pure (Left (stale "lease is unknown or stale"))
+        else do
+          record <- readResultRecordFile path
+          pure $ if resultTask record == ident && resultWorker record == worker
+            then Right ()
+            else Left (stale "lease belongs to a different worker")

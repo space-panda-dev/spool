@@ -190,6 +190,43 @@ second_ack=$(jq -nc --arg task "$second_task" --arg lease "$second_lease" \
   '{task_id:$task,lease_id:$lease,result:{accepted:true}}')
 printf '%s\n' "$second_ack" | spool ack | jq -e '.status == "acked"' >/dev/null; check
 
+# Every line is read before any is acted on, and every line is answered in
+# order, a stale one too. A malformed line acts on nothing.
+printf '%s\n%s\n' \
+  '{"task_id":"batch-a","capability":"classify@1","payload":{}}' \
+  '{"task_id":"batch-b","capability":"classify@1","payload":{}}' \
+  | spool put >/dev/null
+spool lease --worker batcher --count 2 > "$work/batch-leases.jsonl"
+batch_a_lease=$(jq -r 'select(.task_id == "batch-a").lease_id' "$work/batch-leases.jsonl")
+batch_b_lease=$(jq -r 'select(.task_id == "batch-b").lease_id' "$work/batch-leases.jsonl")
+test -n "$batch_a_lease" && test -n "$batch_b_lease"; check
+done_before_batch=$(spool status --json | jq -r '.done')
+batch_a_ack=$(jq -nc --arg lease "$batch_a_lease" '{task_id:"batch-a",lease_id:$lease,result:1}')
+batch_b_ack=$(jq -nc --arg lease "$batch_b_lease" '{task_id:"batch-b",lease_id:$lease,result:2}')
+set +e
+printf '%s\n%s\n' "$batch_a_ack" '{"task_id":"batch-b","lease_id":"lease_1_1_batch-b"}' \
+  | spool ack > "$work/batch-malformed.out" 2>/dev/null
+batch_malformed_exit=$?
+set -e
+test "$batch_malformed_exit" -eq 2; check
+test ! -s "$work/batch-malformed.out"; check
+spool status --json | jq -e --argjson n "$done_before_batch" '.done == $n' >/dev/null; check
+set +e
+printf '%s\n%s\n%s\n' \
+  '{"task_id":"batch-a","lease_id":"lease_1_1_batch-a","result":0}' "$batch_a_ack" "$batch_b_ack" \
+  | spool ack > "$work/batch.out" 2>/dev/null
+batch_exit=$?
+set -e
+test "$batch_exit" -eq 4; check
+jq -s -e --arg a "$batch_a_lease" --arg b "$batch_b_lease" \
+  '. == [ {task_id:"batch-a", lease_id:"lease_1_1_batch-a", status:"stale"}
+        , {task_id:"batch-a", lease_id:$a, status:"acked"}
+        , {task_id:"batch-b", lease_id:$b, status:"acked"} ]' "$work/batch.out" >/dev/null; check
+spool status --json | jq -e --argjson n "$done_before_batch" '.done == $n + 2' >/dev/null; check
+# Every answer names its lease, including one that was already done.
+printf '%s\n' "$batch_b_ack" | spool ack \
+  | jq -e --arg b "$batch_b_lease" '.lease_id == $b and .status == "already_done"' >/dev/null; check
+
 # A reclaimed lease must be re-leasable, and the old token remains fenced.
 reclaim_task='{"task_id":"task-reclaim","capability":"classify@1","payload":{"input":"reclaim"}}'
 printf '%s\n' "$reclaim_task" | spool put >/dev/null
@@ -1265,9 +1302,9 @@ wrong_worker_exit=$?
 set -e
 test "$wrong_worker_exit" -eq 4; check
 
-# Every lease a remote request names is checked before any line is applied.
-# One line for another worker's lease refuses the whole request, and the
-# grant's own lease, named first in the same request, is left as it was.
+# Every line of a remote request is answered. A line for another worker's
+# lease is answered stale and does nothing; the grant's own lease in the same
+# request is acted on. The request then exits 4.
 printf '%s\n' '{"task_id":"remote-batch","capability":"remote@1","payload":{}}' \
   | spoolg put >/dev/null
 remote_primary 'lease' > "$work/remote-batch-lease.jsonl"
@@ -1279,18 +1316,33 @@ foreign_batch_ack=$(jq -nc --arg lease "$other_worker_lease" \
   '{task_id:"other-worker",lease_id:$lease,result:{foreign:true}}')
 test "$own_batch_ack" != "$foreign_batch_ack"; check
 set +e
-printf '%s\n%s\n' "$own_batch_ack" "$foreign_batch_ack" \
+printf '%s\n%s\n' "$foreign_batch_ack" "$own_batch_ack" \
   | remote_primary 'ack' > "$work/remote-batch.out" 2>/dev/null
 remote_batch_exit=$?
 set -e
 test "$remote_batch_exit" -eq 4; check
-test ! -s "$work/remote-batch.out"; check
+jq -s -e --arg own "$remote_batch_lease" --arg foreign "$other_worker_lease" \
+  '. == [ {task_id:"other-worker", lease_id:$foreign, status:"stale"}
+        , {task_id:"remote-batch", lease_id:$own, status:"acked"} ]' \
+  "$work/remote-batch.out" >/dev/null; check
 spoolg results | jq -s -e \
-  'map(select(.task_id == "remote-batch" or .task_id == "other-worker")) | length == 0' \
+  'map(select(.task_id == "remote-batch")) | length == 1 and .[0].result == {own:true}' \
   >/dev/null; check
-test -f "$work/grant-spool/leased/$remote_batch_lease.json"; check
-printf '%s\n' "$own_batch_ack" | remote_primary 'ack' \
-  | jq -e '.status == "acked"' >/dev/null; check
+test -f "$work/grant-spool/leased/$other_worker_lease.json"; check
+# A malformed line anywhere in a request acts on nothing.
+printf '%s\n' '{"task_id":"remote-batch-two","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_primary 'lease' > "$work/remote-batch-two.jsonl"
+set +e
+printf '%s\n%s\n' "$(jq -c '{task_id, lease_id, result: {}}' "$work/remote-batch-two.jsonl")" \
+  '{not json' | remote_primary 'ack' > "$work/remote-batch-two.out" 2>/dev/null
+remote_malformed_exit=$?
+set -e
+test "$remote_malformed_exit" -eq 2; check
+test ! -s "$work/remote-batch-two.out"; check
+test -f "$work/grant-spool/leased/$(jq -r '.lease_id' "$work/remote-batch-two.jsonl").json"; check
+jq -c '{task_id, lease_id, result: {}}' "$work/remote-batch-two.jsonl" \
+  | remote_primary 'ack' | jq -e '.status == "acked"' >/dev/null; check
 
 # Remote fetch emits only the verified bytes and uses the grant-bound worker.
 remote_attachment=$(jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \

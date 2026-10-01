@@ -20,14 +20,15 @@ module Spool.Store
   , leaseIdOfFile
   , leaseTasks
   , leaseUpTo
+  , answerEach
   , ackTasks
-  , ackAll
+  , ackStep
   , ackOne
   , renewTasks
-  , renewAll
+  , renewStep
   , renewOne
   , failTasks
-  , failAll
+  , failStep
   , failLease
   , returnToPending
   , failuresCommand
@@ -134,6 +135,7 @@ import Spool.Wire
   , encodePutResult
   , encodeReclaimResult
   , encodeRenewResult
+  , encodeStaleResult
   , parseFailureRecord
   , parseFetchRequest
   , parseResultRecord
@@ -179,9 +181,8 @@ tombstoneAndDelete paths ident = do
 
 putTasks :: Paths -> Maybe FilePath -> IO ()
 putTasks paths sourceDirectory = do
-  linesIn <- inputLines
-  forM_ linesIn $ \line -> do
-    task <- parseTaskLine line
+  tasks <- inputLines >>= mapM parseTaskLine
+  forM_ tasks $ \task -> do
     result <- putOne paths sourceDirectory task
     BLC.putStrLn (encodePutResult task result)
 
@@ -401,36 +402,35 @@ nextLeaseSerial paths = do
       atomicReplace path (BLC.pack (show next <> "\n"))
       pure next
 
--- | Apply one transition to each of these, in order. A lease that is stale
--- is reported and the ones after it still run; the command then ends as
--- stale. Anything else that goes wrong ends the command where it happens.
-forEach :: (a -> IO (Either SpoolError BL.ByteString)) -> [a] -> IO ()
-forEach step items = do
+-- | Apply one transition to each of these, in order, and answer each on
+-- stdout in that order. A lease that is stale is answered so, said on
+-- stderr, and the ones after it still run; the command then ends as stale.
+-- Anything else that goes wrong ends the command where it happens.
+answerEach
+  :: (a -> LeaseRef) -> (a -> IO (Either SpoolError BL.ByteString)) -> [a] -> IO ()
+answerEach reference step items = do
   refused <- foldM one False items
   when refused (throwIO (stale "one or more leases were stale or unknown"))
   where
     one hadRefusal item = do
       result <- step item
       case result of
-        Left failure -> report failure >> pure True
+        Left failure -> do
+          report failure
+          BLC.putStrLn (encodeStaleResult (reference item))
+          pure True
         Right reply -> BLC.putStrLn reply >> pure hadRefusal
 
--- A command reads its lines one at a time, so a line is applied before the
--- next is read, and a malformed line stops the command with the lines
--- before it already applied. The remote command reads every line before it
--- applies any, because it checks who owns each lease first; it uses the
--- forms that take what it has already read.
+-- Every command reads and checks all of its lines before it acts on any, so
+-- a malformed line stops it with nothing done.
 
 ackTasks :: Paths -> IO ()
-ackTasks paths = inputLines >>= forEach (\line -> parseAckLine line >>= ackStep paths)
-
-ackAll :: Paths -> [Ack] -> IO ()
-ackAll paths = forEach (ackStep paths)
+ackTasks paths =
+  inputLines >>= mapM parseAckLine >>= answerEach ackRef (ackStep paths)
 
 ackStep :: Paths -> Ack -> IO (Either SpoolError BL.ByteString)
 ackStep paths ack =
-  fmap (encodeAckResult (refTask (ackRef ack)))
-    <$> ackOne paths (ackRef ack) (ackResult ack)
+  fmap (encodeAckResult (ackRef ack)) <$> ackOne paths (ackRef ack) (ackResult ack)
 
 ackOne :: Paths -> LeaseRef -> A.Value -> IO (Either SpoolError AckStatus)
 ackOne paths (LeaseRef ident leaseIdent) output = do
@@ -504,14 +504,11 @@ findDoneLease paths ident leaseIdent = do
 
 renewTasks :: Paths -> IO ()
 renewTasks paths =
-  inputLines >>= forEach (\line -> parseLeaseRefLine line >>= renewStep paths)
-
-renewAll :: Paths -> [LeaseRef] -> IO ()
-renewAll paths = forEach (renewStep paths)
+  inputLines >>= mapM parseLeaseRefLine >>= answerEach id (renewStep paths)
 
 renewStep :: Paths -> LeaseRef -> IO (Either SpoolError BL.ByteString)
 renewStep paths reference =
-  fmap (const (encodeRenewResult (refTask reference))) <$> renewOne paths reference
+  fmap (const (encodeRenewResult reference)) <$> renewOne paths reference
 
 renewOne :: Paths -> LeaseRef -> IO (Either SpoolError ())
 renewOne paths (LeaseRef ident leaseIdent) = do
@@ -530,14 +527,11 @@ renewOne paths (LeaseRef ident leaseIdent) = do
 
 failTasks :: Retry -> Paths -> IO ()
 failTasks retry paths =
-  inputLines >>= forEach (\line -> parseFailLine line >>= failStep retry paths)
-
-failAll :: Retry -> Paths -> [FailRequest] -> IO ()
-failAll retry paths = forEach (failStep retry paths)
+  inputLines >>= mapM parseFailLine >>= answerEach failRef (failStep retry paths)
 
 failStep :: Retry -> Paths -> FailRequest -> IO (Either SpoolError BL.ByteString)
 failStep retry paths request =
-  fmap (const (encodeFailResult (refTask (failRef request)) retry))
+  fmap (const (encodeFailResult (failRef request) retry))
     <$> failLease paths (failRef request) (failReason request) retry
 
 -- | Move a leased task to failed/, recording why, and (with retry) put an

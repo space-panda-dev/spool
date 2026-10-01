@@ -1,6 +1,6 @@
 # 0012. Every line is read first, and every line is answered
 
-Status: proposed
+Status: accepted
 
 `put`, `ack`, `renew`, and `fail` take many lines. Two things about them are
 undecided, and the implementation decides each differently by accident.

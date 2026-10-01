@@ -125,11 +125,25 @@ Whatever a command has to say about a failure goes to stderr as text, one
 line beginning `spool: `. stderr is for a person; nothing in it is part of
 the protocol, and its wording may change.
 
-`put`, `ack`, `renew`, `fail`, and `reclaim` answer on stdout with one line
-for each task they acted on, in the order they acted:
+Under
+[ADR 0012](../docs/decisions/0012-every-line-is-read-first-and-answered.md),
+a command given lines on stdin reads and checks every line before it acts on
+any. A malformed line is exit 2 with nothing acted on, whether it is the first
+line or the last.
+
+`put` and `reclaim` answer on stdout with one line for each task they acted
+on, in the order they acted:
 
 ```json
 {"task_id":"task-one","status":"inserted"}
+```
+
+`ack`, `renew`, and `fail` answer every line given, in the order given, and
+every answer names the lease it answers:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","status":"acked"}
+{"task_id":"task-two","lease_id":"lease_...","status":"stale"}
 ```
 
 | Command | `status` | Meaning |
@@ -141,7 +155,13 @@ for each task they acted on, in the order they acted:
 | `renew` | `renewed` | the lease will not be reclaimed yet |
 | `fail` | `failed_retry` | the task is pending again |
 | `fail --no-retry` | `failed` | the task is failed |
+| `ack`, `renew`, `fail` | `stale` | nothing was done: see below |
 | `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
+
+`stale` answers a lease that is stale, unknown, another task's, or, through
+the remote command, another worker's; and an `ack` whose result differs from
+the one already stored. The answer does not say which. The command acts on
+the lines that are not stale, and then exits 4 if any was.
 
 `init` answers nothing.
 
@@ -159,9 +179,6 @@ line when nothing was pending:
 {"task_id":"task-one","lease_id":"lease_..."}
 {"task_id":"task-one","lease_id":"lease_...","reason":"why"}
 ```
-
-A line whose lease is stale or unknown gets no line on stdout. The lines
-after it are still acted on, and the command then exits 4.
 
 `results` emits one JSON object per acknowledged task, oldest first:
 
@@ -276,7 +293,9 @@ spool remote --grant GRANT_ID
 
 The grant record supplies the only spool directory and worker name. The peer
 cannot override either one. The remote command checks the grant before every
-invocation and checks that each referenced lease belongs to its fixed worker.
+invocation and checks that each referenced lease belongs to its fixed worker;
+a line whose lease does not is answered `stale`, and the other lines are acted
+on.
 
 `SSH_ORIGINAL_COMMAND` is parsed literally, never by a shell. It is at most 64
 ASCII bytes and exactly one of:
@@ -296,10 +315,10 @@ zero. Words use exactly one ASCII space. Empty input, NUL, non-ASCII, control
 bytes, other whitespace, shell metacharacters, quoting, escaping, extra words,
 and unknown options are malformed input with exit 2.
 
-`lease` uses the grant's worker. `ack`, `renew`, and `fail` carry their local
-JSONL stdin and output unchanged after the ownership check. `fetch` accepts
-the single JSON request defined above on stdin and writes verified raw bytes to
-stdout. Requested command words never contain task IDs, lease IDs, digests,
+`lease` uses the grant's worker. `ack`, `renew`, and `fail` take and answer
+the same lines as they do locally. `fetch` accepts the single JSON request
+defined above on stdin and writes verified raw bytes to stdout; a request for
+a lease that is not the worker's is exit 4. Requested command words never contain task IDs, lease IDs, digests,
 paths, or a claimed worker.
 
 ### Reclaim driver
