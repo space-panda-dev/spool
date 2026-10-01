@@ -61,7 +61,7 @@ import Spool.Input
   , inputLines
   )
 import Spool.Store
-  ( recoverAttachmentState
+  ( recover
   , readTaskFile
   , readResultRecordFile
   , readWorkerSidecar
@@ -258,7 +258,7 @@ runRemote requested = do
   withLock paths $ do
     current <- loadActiveRemoteGrant identifier path
     unless (Access.grantSpool current == rootDir paths) (throwIO noGrant)
-    recoverAttachmentState paths
+    recover paths
     dispatchRemote paths (Access.grantWorker current) operation
 
 -- | A peer learns that it has no grant, and never why.
