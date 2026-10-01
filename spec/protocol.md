@@ -262,7 +262,7 @@ The design defined by
 [ADR 0006](../docs/decisions/0006-grants-are-account-records.md) adds:
 
 ```sh
-spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--put] [--expires-at RFC3339]
+spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--put] [--expires-at RFC3339] [--executable PATH]
 spool --dir DIR revoke --grant GRANT_ID
 ```
 
@@ -282,7 +282,11 @@ records contain no execution or disclosure limits.
 
 `grant` writes one generated `restrict,command="..."` line to the dedicated
 account's `$HOME/.ssh/authorized_keys`; `revoke` removes that exact managed
-line and preserves unrelated lines. A managed key and worker are unique per
+line and preserves unrelated lines. The command names the program by
+absolute path: by default the granting binary's own canonical path, or the
+path given as `--executable`, which must be absolute and canonical. A path
+that is kept pointing at the installed binary outlives any one build of it,
+where the default names one build. A managed key and worker are unique per
 spool. Revocation first disables the record, then removes the line, then
 reclaims that worker's live leases. Repeating revoke changes nothing.
 

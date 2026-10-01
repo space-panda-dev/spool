@@ -94,6 +94,6 @@ runStoreCommand command paths = case command of
   Fetch -> fetchAttachment paths
   Reclaim age -> reclaimTasks paths age
   Status format -> statusTasks paths format
-  GrantCommand peer worker key put expiry ->
-    grantAccess paths peer worker key put expiry
+  GrantCommand peer worker key options ->
+    grantAccess paths peer worker key options
   RevokeCommand identifier -> revokeAccess paths identifier
