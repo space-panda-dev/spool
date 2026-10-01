@@ -15,6 +15,8 @@ than guessing.
   first field added to an envelope or a record makes every older reader
   refuse it. The answer has to come before that field does.
 - Is there a hard cancel for a running task?
+- How do an attachment's bytes reach the spool from another machine? A task
+  put through the remote command may declare none ([ADR 0015](decisions/0015-a-grant-may-let-its-holder-put.md)).
 - Should a worker stop a run when its lease is lost? A renewal that is
   refused is found only when the program finishes, so the program runs to
   the end of work that can no longer be acknowledged.

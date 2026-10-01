@@ -49,6 +49,7 @@ library
     , Spool.Types
     , Spool.Wire
     , Spool.Worker.Config
+    , Spool.Worker.Connection
     , Spool.Worker.Run
   build-depends:
       aeson      >=2.2    && <2.4

@@ -5,7 +5,13 @@
 module Test.Cli (tests) where
 
 import Data.Either (isLeft)
-import Spool.Cli (Command (..), StoreCommand (..), parseCommand, parseWorkShow)
+import Spool.Cli
+  ( Command (..)
+  , StoreCommand (..)
+  , parseCommand
+  , parseWorkShow
+  , parseWorkVia
+  )
 import Spool.Types
   ( Retry (..)
   , StatusFormat (..)
@@ -21,6 +27,21 @@ tests = testGroup "command line"
   , testGroup "rejects" (map rejected rejectedForms)
   , testCase "work --show needs no spool directory" $
       parseWorkShow ["--config", "c.json", "--show"] @?= Right "c.json"
+  , testGroup "work --via"
+      [ testCase "splits the transport command into a program and its arguments" $
+          parseWorkVia ["--via", "ssh -i key spool@host", "--config", "c.json"]
+            @?= Right (WorkVia ["ssh", "-i", "key", "spool@host"] "c.json" Nothing)
+      , testCase "takes --max-tasks and its options in any order" $
+          parseWorkVia ["--max-tasks", "3", "--config", "c.json", "--via", "fake-ssh"]
+            @?= Right (WorkVia ["fake-ssh"] "c.json" (Just 3))
+      , testCase "refuses an empty command" $
+          assertBool "refused" (isLeft (parseWorkVia ["--via", "  ", "--config", "c.json"]))
+      , testCase "refuses a missing config" $
+          assertBool "refused" (isLeft (parseWorkVia ["--via", "ssh host"]))
+      , testCase "refuses a worker name: the grant names the worker" $
+          assertBool "refused" $ isLeft $
+            parseWorkVia ["--via", "ssh host", "--config", "c.json", "--worker", "w"]
+      ]
   ]
 
 w :: WorkerName
@@ -50,10 +71,18 @@ acceptedForms =
     , Work w "c.json" (Just 2) )
   , (["work", "--config", "c.json", "--show"], WorkShow "c.json")
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"]
-    , Store (GrantCommand "p" w "k.pub" Nothing) )
+    , Store (GrantCommand "p" w "k.pub" False Nothing) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--expires-at", "2026-10-01T00:00:00Z"]
-    , Store (GrantCommand "p" w "k.pub" (Just "2026-10-01T00:00:00Z")) )
+    , Store (GrantCommand "p" w "k.pub" False (Just "2026-10-01T00:00:00Z")) )
+  , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub", "--put"]
+    , Store (GrantCommand "p" w "k.pub" True Nothing) )
+  , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
+      , "--put", "--expires-at", "2026-10-01T00:00:00Z"]
+    , Store (GrantCommand "p" w "k.pub" True (Just "2026-10-01T00:00:00Z")) )
+  , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
+      , "--expires-at", "2026-10-01T00:00:00Z", "--put"]
+    , Store (GrantCommand "p" w "k.pub" True (Just "2026-10-01T00:00:00Z")) )
   , (["revoke", "--grant", "g"], Store (RevokeCommand "g"))
   ]
 
@@ -75,6 +104,8 @@ rejectedForms =
   , ("work without a config", ["work", "--worker", "w"])
   , ("zero max-tasks", ["work", "--worker", "w", "--config", "c", "--max-tasks", "0"])
   , ("grant without a peer", ["grant", "--peer", "", "--worker", "w", "--key", "k"])
+  , ("grant with --put twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--put", "--put"])
+  , ("grant with an unknown option", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--pull"])
   ]
 
 accepted :: ([String], Command) -> TestTree

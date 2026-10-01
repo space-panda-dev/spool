@@ -64,6 +64,7 @@ import Spool.Input
   )
 import Spool.Store
   ( recover
+  , putTasks
   , readTaskFile
   , readResultRecordFile
   , readWorkerSidecar
@@ -102,8 +103,8 @@ prepareAccountPaths = do
   setFileMode (takeDirectory authorizedKeys) 0o700
   pure (grants, authorizedKeys)
 
-grantAccess :: Paths -> T.Text -> WorkerName -> FilePath -> Maybe T.Text -> IO ()
-grantAccess paths peer worker keyPath expiry = do
+grantAccess :: Paths -> T.Text -> WorkerName -> FilePath -> Bool -> Maybe T.Text -> IO ()
+grantAccess paths peer worker keyPath put expiry = do
   canonicalSpool <- canonicalizePath (rootDir paths)
   publicKey <- readCanonicalPublicKey keyPath
   (grants, authorizedKeys) <- prepareAccountPaths
@@ -114,7 +115,7 @@ grantAccess paths peer worker keyPath expiry = do
   identifier <- freshGrantId grants
   grant <- orThrow malformed (Access.validateGrant
     (Access.grantIdText identifier) peer (workerNameText worker) canonicalSpool
-    (Access.publicKeyText publicKey) expiry)
+    (Access.publicKeyText publicKey) put expiry)
   executablePath <- getExecutablePath >>= canonicalizePath
   managedLine <- orThrow malformed
     (Access.renderManagedAuthorizedKeyLine executablePath grant)
@@ -261,7 +262,7 @@ runRemote requested = do
     current <- loadActiveRemoteGrant identifier path
     unless (Access.grantSpool current == rootDir paths) (throwIO noGrant)
     recover paths
-    dispatchRemote paths (Access.grantWorker current) operation
+    dispatchRemote paths current operation
 
 -- | A peer learns that it has no grant, and never why.
 noGrant :: SpoolError
@@ -277,8 +278,14 @@ loadActiveRemoteGrant identifier path = do
   when (maybe False (now >=) (Access.grantExpiresAt grant)) (throwIO noGrant)
   pure grant
 
-dispatchRemote :: Paths -> WorkerName -> Access.RemoteCommand -> IO ()
-dispatchRemote paths worker operation = case operation of
+dispatchRemote :: Paths -> Access.Grant -> Access.RemoteCommand -> IO ()
+dispatchRemote paths grant operation = case operation of
+  -- A grant that may put reads the same lines put reads locally; one that
+  -- may not is denied before a line is read (ADR 0015). Attachments cannot
+  -- arrive this way, which putTasks says when a task declares one.
+  Access.RemotePut
+    | Access.grantPut grant -> putTasks paths Nothing
+    | otherwise -> throwIO (grantRefused "grant does not permit put")
   Access.RemoteLease count -> do
     let requested = fromMaybe 1 count
     when (requested > toInteger (maxBound :: Int))
@@ -300,6 +307,7 @@ dispatchRemote paths worker operation = case operation of
     either throwIO pure =<< ownedLive (fetchRef request)
     fetchFor paths request
   where
+    worker = Access.grantWorker grant
     ownedLive = liveLeaseOwned paths worker
     ownedAck ack = ackOwned paths worker (ackRef ack)
     -- Act on an item only if its lease is the grant's worker's.

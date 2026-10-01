@@ -120,6 +120,7 @@ spool --dir DIR fetch < attachment-request.json > attachment
 spool --dir DIR reclaim --older-than SECONDS
 spool --dir DIR status [--json]
 spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
+spool work --via COMMAND --config FILE [--max-tasks N]
 spool work --config FILE --show
 ```
 
@@ -261,7 +262,7 @@ The design defined by
 [ADR 0006](../docs/decisions/0006-grants-are-account-records.md) adds:
 
 ```sh
-spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--expires-at RFC3339]
+spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--put] [--expires-at RFC3339]
 spool --dir DIR revoke --grant GRANT_ID
 ```
 
@@ -269,13 +270,15 @@ spool --dir DIR revoke --grant GRANT_ID
 account's `$HOME/.spool/grants/` directory:
 
 ```json
-{"grant_id":"grant_0123456789abcdef0123456789abcdef","peer":"peer-one","worker":"worker-one","spool":"/absolute/spool","public_key":"ssh-ed25519 AAAA...","expires_at":"2026-10-01T00:00:00Z"}
+{"grant_id":"grant_0123456789abcdef0123456789abcdef","peer":"peer-one","worker":"worker-one","spool":"/absolute/spool","public_key":"ssh-ed25519 AAAA...","put":false,"expires_at":"2026-10-01T00:00:00Z"}
 ```
 
 `expires_at` is either a UTC RFC3339 timestamp or null. A grant is expired when
-the spool host's `now >= expires_at`. The remote command reads and validates
-the record on every request. Grant records contain no execution or disclosure
-limits.
+the spool host's `now >= expires_at`. Under
+[ADR 0015](../docs/decisions/0015-a-grant-may-let-its-holder-put.md), `put` is
+whether the holder may put tasks on the spool; `grant --put` makes it true.
+The remote command reads and validates the record on every request. Grant
+records contain no execution or disclosure limits.
 
 `grant` writes one generated `restrict,command="..."` line to the dedicated
 account's `$HOME/.ssh/authorized_keys`; `revoke` removes that exact managed
@@ -318,6 +321,7 @@ renew
 fail
 fail --no-retry
 fetch
+put
 ```
 
 `N` is decimal from 1 through 9223372036854775807 with no sign or leading
@@ -328,8 +332,26 @@ and unknown options are malformed input with exit 2.
 `lease` uses the grant's worker. `ack`, `renew`, and `fail` take and answer
 the same lines as they do locally. `fetch` accepts the single JSON request
 defined above on stdin and writes verified raw bytes to stdout; a request for
-a lease that is not the worker's is exit 4. Requested command words never contain task IDs, lease IDs, digests,
-paths, or a claimed worker.
+a lease that is not the worker's is exit 4. `put` takes and answers the same
+lines as it does locally, for a grant whose `put` is true; for one whose
+`put` is false it is exit 5 and the lines are not read. A task put this way
+may declare no attachments; one that does is exit 2. Requested command words
+never contain task IDs, lease IDs, digests, paths, or a claimed worker.
+
+### Remote worker
+
+`spool work --via COMMAND --config FILE` runs the worker on a machine that
+holds a grant. `COMMAND` is split on whitespace into a program and its
+arguments, typically `ssh -i KEY account@host`; Spool appends one remote
+word to it for each request and speaks the forced command's grammar over its
+stdin and stdout. The worker's name is the grant's, so there is no
+`--worker`; attachments arrive through `fetch`. Everything else is as for a
+local worker: the configuration, the limits, renewal, and what is done with
+a program's exit and output.
+
+A request the transport cannot carry, or that the spool denies, ends the
+worker with the status the spool gave, or 75 when the transport itself
+failed. Leases it held stand, for `reclaim` to return.
 
 ### Reclaim driver
 

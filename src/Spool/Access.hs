@@ -13,6 +13,7 @@ module Spool.Access
   , grantWorker
   , grantSpool
   , grantPublicKey
+  , grantPut
   , grantExpiresAt
   , GrantId
   , mkGrantId
@@ -131,6 +132,8 @@ data Grant = Grant
   , grantWorker :: WorkerName
   , grantSpool :: FilePath
   , grantPublicKey :: PublicKey
+  , grantPut :: Bool
+    -- ^ Whether the holder may put tasks on the spool (ADR 0015).
   , grantExpiresAt :: Maybe UTCTime
   } deriving (Eq, Show)
 
@@ -141,6 +144,7 @@ data RemoteCommand
   | RemoteRenew
   | RemoteFail Retry
   | RemoteFetch
+  | RemotePut
   deriving (Eq, Show)
 
 grantKeys :: [T.Text]
@@ -150,6 +154,7 @@ grantKeys = sort
   , "worker"
   , "spool"
   , "public_key"
+  , "put"
   , "expires_at"
   ]
 
@@ -164,6 +169,7 @@ instance ToJSON Grant where
     , "worker" .= grantWorker grant
     , "spool" .= grantSpool grant
     , "public_key" .= grantPublicKey grant
+    , "put" .= grantPut grant
     , "expires_at" .= fmap renderExpiry (grantExpiresAt grant)
     ]
     where
@@ -174,15 +180,16 @@ instance FromJSON Grant where
   parseJSON = A.withObject "grant" $ \object -> do
     let actual = sort (map K.toText (KM.keys object))
     if actual /= grantKeys
-      then fail "grant must contain exactly grant_id, peer, worker, spool, public_key, expires_at"
+      then fail "grant must contain exactly grant_id, peer, worker, spool, public_key, put, expires_at"
       else do
         identifier <- object .: "grant_id"
         peer <- object .: "peer"
         worker <- object .: "worker"
         spool <- object .: "spool"
         publicKey <- object .: "public_key"
+        put <- object .: "put"
         expiry <- object .: "expires_at"
-        case validateGrant identifier peer worker spool publicKey expiry of
+        case validateGrant identifier peer worker spool publicKey put expiry of
           Left message -> fail message
           Right grant -> pure grant
 
@@ -200,9 +207,10 @@ validateGrant
   -> T.Text
   -> FilePath
   -> T.Text
+  -> Bool
   -> Maybe T.Text
   -> Either String Grant
-validateGrant identifierText peer workerText spool publicKeyValue expiryText = do
+validateGrant identifierText peer workerText spool publicKeyValue put expiryText = do
   identifier <- mkGrantId identifierText
   validatePeer peer
   worker <- mkWorkerName workerText
@@ -217,6 +225,7 @@ validateGrant identifierText peer workerText spool publicKeyValue expiryText = d
     , grantWorker = worker
     , grantSpool = spool
     , grantPublicKey = publicKey
+    , grantPut = put
     , grantExpiresAt = expiry
     }
 
@@ -303,6 +312,7 @@ parseRemoteCommand bytes
   | bytes == "fail" = Right (RemoteFail Retry)
   | bytes == "fail --no-retry" = Right (RemoteFail NoRetry)
   | bytes == "fetch" = Right RemoteFetch
+  | bytes == "put" = Right RemotePut
   | Just suffix <- BS.stripPrefix "lease --count " bytes = do
       count <- parseCount suffix
       pure (RemoteLease (Just count))
