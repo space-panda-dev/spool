@@ -93,9 +93,11 @@ instance ToJSON Capability where
 instance ToJSONKey Capability where
   toJSONKey = toJSONKeyText capabilityText
 
--- | @lease_@ and then the characters of a task identifier.  A lease made here
--- is @lease_MICROS_SERIAL_TASK@; one a caller names need only fit the
--- grammar, and then either matches a lease on file or does not.
+-- | @lease_@ and then the characters of a name, at most 200 characters in
+-- all.  A lease made here is @lease_MICROS_SERIAL_TASK@, and that form is
+-- this spool's own: a holder gives the identifier back unchanged and reads
+-- nothing from it.  One a caller names need only fit the grammar, and then
+-- either matches a lease on file or does not.
 newtype LeaseId = LeaseId T.Text
   deriving (Eq, Ord, Show)
 
@@ -103,6 +105,7 @@ mkLeaseId :: T.Text -> Either String LeaseId
 mkLeaseId value
   | T.null value = Left "lease_id must be non-empty"
   | T.isInfixOf "--" value = Left "lease_id cannot contain --"
+  | T.length value > 200 = Left "lease_id must be at most 200 characters"
   | T.isPrefixOf "lease_" value && T.all tokenChar (T.drop 6 value) =
       Right (LeaseId value)
   | otherwise = Left "lease_id is invalid"

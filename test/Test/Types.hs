@@ -19,7 +19,7 @@ import Spool.Types
   , workerNameText
   )
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertBool, testCase, (@?=))
+import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck
   ( Gen
   , NonNegative (..)
@@ -55,6 +55,15 @@ tests = testGroup "identifiers"
       (map (good mkLeaseId) ["lease_1790717360482536_1_task-one", "lease_x"])
   , testGroup "lease_id rejects"
       (map (bad mkLeaseId) ["", "lease", "task_1_1_t", "lease_1--2", "lease_../x", "lease_a b"])
+  , testCase "a lease_id may be 200 characters and not 201" $ do
+      assertBool "200 accepted" (isRight (mkLeaseId ("lease_" <> T.replicate 194 "x")))
+      assertBool "201 refused" (isLeft (mkLeaseId ("lease_" <> T.replicate 195 "x")))
+  , testCase "a lease made here is never longer than a lease_id may be" $
+      -- The longest task_id, the largest time, and a large serial.
+      case mkTaskId (T.replicate 128 "t") of
+        Left message -> assertFailure message
+        Right task -> assertBool "fits" $ isRight $ mkLeaseId
+          (leaseIdText (newLeaseId 9223372036854775807 9223372036854775807 task))
   , testCase "a lease's time is read from its identifier" $
       fmap leaseStarted (mkLeaseId "lease_1790717360482536_1_task-one")
         @?= Right (Just 1790717360482536)

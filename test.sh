@@ -246,6 +246,34 @@ renew_ack=$(jq -nc --arg task "$renew_task_id" --arg lease "$renew_lease" \
   '{task_id:$task,lease_id:$lease,result:{renewed:true}}')
 printf '%s\n' "$renew_ack" | spool ack | jq -e '.status == "acked"' >/dev/null; check
 
+# A lease identifier a caller names is opaque: one that fits the grammar and
+# names no lease is stale (exit 4), whatever follows "lease_"; one outside the
+# grammar or longer than 200 characters is malformed (exit 2). The longest
+# that fits is named too: it must be answered, not fail on its file name.
+opaque_task='{"task_id":"task-opaque","capability":"classify@1","payload":{}}'
+printf '%s\n' "$opaque_task" | spool put >/dev/null
+for named in 'lease_x' 'lease_not-mine' "lease_$(printf 'x%.0s' {1..194})"; do
+  set +e
+  jq -nc --arg lease "$named" '{task_id:"task-opaque",lease_id:$lease}' \
+    | spool renew >/dev/null 2>&1
+  named_exit=$?
+  set -e
+  test "$named_exit" -eq 4; check
+done
+for outside in 'nolease_1' 'lease_a--b' 'lease_a/b' "lease_$(printf 'x%.0s' {1..195})"; do
+  set +e
+  jq -nc --arg lease "$outside" '{task_id:"task-opaque",lease_id:$lease}' \
+    | spool renew >/dev/null 2>&1
+  outside_exit=$?
+  set -e
+  test "$outside_exit" -eq 2; check
+done
+spool lease --worker opaque > "$work/opaque-lease.jsonl"
+jq -e '.task_id == "task-opaque" and (.lease_id | test("^lease_[A-Za-z0-9._-]+$"))
+  and (.leased_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))' "$work/opaque-lease.jsonl" >/dev/null; check
+jq -c '{task_id, lease_id, result: {opaque: true}}' "$work/opaque-lease.jsonl" \
+  | spool ack | jq -e '.status == "acked"' >/dev/null; check
+
 # A stale renew and fail are both fenced with exit 4.
 stale_renew_task='{"task_id":"task-stale-renew","capability":"classify@1","payload":{}}'
 printf '%s\n' "$stale_renew_task" | spool put >/dev/null

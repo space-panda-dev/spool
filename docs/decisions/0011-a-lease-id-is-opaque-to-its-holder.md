@@ -1,6 +1,6 @@
 # 0011. A lease identifier is opaque to its holder
 
-Status: proposed
+Status: accepted
 
 The protocol shows a lease identifier as `lease_...` and says nothing of what
 follows. The reference implementation writes the time of the lease, a serial
@@ -11,7 +11,9 @@ implementation's, and a worker cannot tell whether it may rely on it.
 ## Decision
 
 A `lease_id` is `lease_` followed by one or more of ASCII letters, digits,
-`.`, `_`, and `-`, without `--`, and is at most 255 characters.
+`.`, `_`, and `-`, without `--`, and is at most 200 characters. The longest
+the reference implementation makes is 171, and a file name has room for 200
+and what the spool adds to it.
 
 A worker is given a `lease_id` and gives it back unchanged. It reads nothing
 from it. A `lease_id` that fits the grammar and names no lease on file is a
