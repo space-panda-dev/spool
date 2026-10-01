@@ -7,7 +7,7 @@ module Test.Access (tests) where
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
-import Data.Either (isLeft)
+import Data.Either (isLeft, isRight)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Spool.Access
@@ -123,11 +123,18 @@ grantRecord =
         (grantWith "worker-one" (Just "2026-10-01T00:00:00Z"))
       assertBool "the grant has an expiry" (grantExpiresAt grant /= Nothing)
       parseGrantJSON (renderGrant grant) @?= Right grant
-  , testCase "a worker name outside ASCII reads back whole" $ do
-      grant <- either assertFailure pure (grantWith "\321" Nothing)
-      assertBool "the names differ" (workerNameText (grantWorker grant) /= "A")
+  , testCase "a worker name outside the grammar is refused" $
+      assertBool "refused" (isLeft (grantWith "\321" Nothing))
+  , testCase "a worker name is read back as it was written" $ do
+      grant <- either assertFailure pure (grantWith "worker.two_3-4" Nothing)
       fmap (workerNameText . grantWorker) (parseGrantJSON (renderGrant grant))
-        @?= Right "\321"
+        @?= Right "worker.two_3-4"
+  , testCase "a peer may be a label with spaces" $
+      assertBool "accepted" $ isRight $
+        validateGrant identifierText "Alice's laptop" "worker-one" "/srv/spool" publicKey Nothing
+  , testCase "a peer of 129 characters is refused" $
+      assertBool "refused" $ isLeft $
+        validateGrant identifierText (T.replicate 129 "p") "worker-one" "/srv/spool" publicKey Nothing
   , testCase "a record is written in canonical form" $ do
       grant <- either assertFailure pure
         (grantWith "worker-one" (Just "2026-10-01T00:00:00Z"))

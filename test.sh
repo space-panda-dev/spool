@@ -98,6 +98,41 @@ if printf '%s\n' '{"task_id":"cap-version-dash","capability":"name@1-2","payload
 fi
 check
 
+# Every name has a length. At the limit a task is put and leased; one past it
+# is malformed input. Without the limit a task can be put whose lease's file
+# name is longer than a file name may be, and then never leased.
+spooln() { "$spool_binary" --dir "$work/names" "$@"; }
+spooln init
+name_128=$(printf 'n%.0s' {1..128})
+name_129=$(printf 'n%.0s' {1..129})
+test "${#name_128}" -eq 128; check
+test "${#name_129}" -eq 129; check
+printf '{"task_id":"%s","capability":"c@1","payload":{}}\n' "$name_128" \
+  | spooln put | jq -e '.status == "inserted"' >/dev/null; check
+spooln lease --worker "$(printf 'w%.0s' {1..64})" \
+  | jq -e --arg task "$name_128" '.task_id == $task' >/dev/null; check
+set +e
+printf '{"task_id":"%s","capability":"c@1","payload":{}}\n' "$name_129" \
+  | spooln put >/dev/null 2>&1
+long_task_exit=$?
+printf '{"task_id":"t","capability":"%s@1","payload":{}}\n' "$(printf 'c%.0s' {1..127})" \
+  | spooln put >/dev/null 2>&1
+long_capability_exit=$?
+set -e
+test "$long_task_exit" -eq 2; check
+test "$long_capability_exit" -eq 2; check
+expect_exit 2 spooln lease --worker "$(printf 'w%.0s' {1..65})"
+expect_exit 2 spooln lease --worker 'two words'
+expect_exit 2 spooln lease --worker 'Ł'
+printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE' \
+  > "$work/names-key.pub"
+expect_exit 2 env HOME="$work/names-home" "$spool_binary" --dir "$work/names" grant \
+  --peer "$(printf 'p%.0s' {1..129})" --worker w --key "$work/names-key.pub"
+env HOME="$work/names-home" "$spool_binary" --dir "$work/names" grant \
+  --peer "$(printf 'p%.0s' {1..128})" --worker w --key "$work/names-key.pub" \
+  | jq -e '.peer | length == 128' >/dev/null; check
+spooln status --json | jq -e '.pending == 0 and .leased == 1' >/dev/null; check
+
 # Payloads are opaque JSON values, including null and arrays.  This separate
 # store keeps the boundary cases out of the lease-count assertions below.
 spoolb() { "$spool_binary" --dir "$work/boundaries" "$@"; }
@@ -1361,23 +1396,15 @@ expired_grant_id=$(jq -r '.grant_id' "$work/expired-grant.json")
 expect_exit 5 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
   "$spool_binary" remote --grant "$expired_grant_id"
 
-# A worker name survives the lease record whole. "Ł" (U+0141) and "A"
-# (U+0041) share their low byte, so a record that kept one byte per character
-# would hand the lease of one to the other. The wide name is set in the grant
-# record because JSON is UTF-8 whatever the locale; an argument is not.
-narrow_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC'
+# A worker is a name wherever it is read. A grant record whose worker is
+# outside the grammar denies its peer and is corrupt state to the owner, until
+# it is granted again under a name inside it. The record is edited because a
+# name outside the grammar cannot arrive as an argument.
 wide_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD'
-printf '%s\n' "$narrow_key" > "$work/narrow.pub"
 printf '%s\n' "$wide_key" > "$work/wide.pub"
-spoolg grant --peer narrow-peer --worker A --key "$work/narrow.pub" \
-  > "$work/narrow-grant.json"
-spoolg grant --peer wide-peer --worker wide-placeholder --key "$work/wide.pub" \
+spoolg grant --peer wide-peer --worker wide-worker --key "$work/wide.pub" \
   > "$work/wide-grant.json"
-narrow_grant_id=$(jq -r '.grant_id' "$work/narrow-grant.json")
 wide_grant_id=$(jq -r '.grant_id' "$work/wide-grant.json")
-jq -c '.worker = "Ł"' "$grant_home/.spool/grants/$wide_grant_id.json" \
-  > "$work/wide-grant-record.json"
-mv "$work/wide-grant-record.json" "$grant_home/.spool/grants/$wide_grant_id.json"
 remote_as() {
   local grant=$1 requested=$2
   HOME="$grant_home" SSH_ORIGINAL_COMMAND="$requested" \
@@ -1385,37 +1412,42 @@ remote_as() {
 }
 printf '%s\n' '{"task_id":"wide-worker","capability":"remote@1","payload":{}}' \
   | spoolg put >/dev/null
+cp "$grant_home/.spool/grants/$wide_grant_id.json" "$work/wide-grant-record.json"
+for outside in 'Ł' 'two words' '' 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww'; do
+  jq -c --arg worker "$outside" '.worker = $worker' "$work/wide-grant-record.json" \
+    > "$work/wide-grant-edited.json"
+  mv -f "$work/wide-grant-edited.json" "$grant_home/.spool/grants/$wide_grant_id.json"
+  expect_exit 5 remote_as "$wide_grant_id" 'lease'
+  expect_exit 70 env HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+    --peer another-peer --worker another-worker --key "$work/secondary.pub"
+done
+test "$(printf 'w%.0s' {1..65})" = 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww'; check
+cp "$work/wide-grant-record.json" "$grant_home/.spool/grants/$wide_grant_id.json"
+spoolg status >/dev/null; check
 remote_as "$wide_grant_id" 'lease' > "$work/wide-lease.jsonl"
-jq -e '.task_id == "wide-worker" and .worker == "Ł" and .worker != "A"' \
+jq -e '.task_id == "wide-worker" and .worker == "wide-worker"' \
   "$work/wide-lease.jsonl" >/dev/null; check
 wide_lease=$(jq -r '.lease_id' "$work/wide-lease.jsonl")
-wide_ref=$(jq -nc --arg lease "$wide_lease" '{task_id:"wide-worker",lease_id:$lease}')
 wide_ack=$(jq -nc --arg lease "$wide_lease" \
   '{task_id:"wide-worker",lease_id:$lease,result:{wide:true}}')
-set +e
-printf '%s\n' "$wide_ref" | remote_as "$narrow_grant_id" 'renew' >/dev/null 2>&1
-narrow_renew_exit=$?
-printf '%s\n' "$wide_ack" | remote_as "$narrow_grant_id" 'ack' >/dev/null 2>&1
-narrow_ack_exit=$?
-set -e
-test "$narrow_renew_exit" -eq 4; check
-test "$narrow_ack_exit" -eq 4; check
-printf '%s\n' "$wide_ref" | remote_as "$wide_grant_id" 'renew' \
-  | jq -e '.status == "renewed"' >/dev/null; check
 printf '%s\n' "$wide_ack" | remote_as "$wide_grant_id" 'ack' \
   | jq -e '.status == "acked"' >/dev/null; check
-spoolg results | jq -s -e \
-  'map(select(.task_id == "wide-worker")) | length == 1 and .[0].worker == "Ł"' \
-  >/dev/null; check
-# The completed lease stays fenced: a repeat of the same ack is a no-op for
-# its owner and still refused for the other worker.
-printf '%s\n' "$wide_ack" | remote_as "$wide_grant_id" 'ack' \
-  | jq -e '.status == "already_done"' >/dev/null; check
+
+# A worker sidecar holding what is not a name is corrupt durable state.
+printf '%s\n' '{"task_id":"bad-worker-name","capability":"remote@1","payload":{}}' \
+  | spoolg put >/dev/null
+remote_as "$wide_grant_id" 'lease' > "$work/bad-name-lease.jsonl"
+bad_name_lease=$(jq -r '.lease_id' "$work/bad-name-lease.jsonl")
+bad_name_ack=$(jq -nc --arg lease "$bad_name_lease" \
+  '{task_id:"bad-worker-name",lease_id:$lease,result:{}}')
+printf 'two words' > "$work/grant-spool/leased/$bad_name_lease.worker"
 set +e
-printf '%s\n' "$wide_ack" | remote_as "$narrow_grant_id" 'ack' >/dev/null 2>&1
-narrow_repeat_exit=$?
+printf '%s\n' "$bad_name_ack" | spoolg ack >/dev/null 2>&1
+bad_name_exit=$?
 set -e
-test "$narrow_repeat_exit" -eq 4; check
+test "$bad_name_exit" -eq 70; check
+printf 'wide-worker' > "$work/grant-spool/leased/$bad_name_lease.worker"
+printf '%s\n' "$bad_name_ack" | spoolg ack | jq -e '.status == "acked"' >/dev/null; check
 
 # A worker sidecar that is not UTF-8 is corrupt durable state, not a name.
 printf '%s\n' '{"task_id":"bad-worker-sidecar","capability":"remote@1","payload":{}}' \

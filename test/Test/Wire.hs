@@ -20,8 +20,8 @@ import Spool.Types
   , mkCapability
   , mkLeaseId
   , mkTaskId
+  , mkWorkerName
   , storedTimestamp
-  , storedWorkerName
   )
 import Spool.Wire
   ( Ack (..)
@@ -92,8 +92,9 @@ value = sized go
       ]
     text = T.pack <$> listOf (elements ("ab\"\\/ \n\233\321\128512" :: String))
 
+-- | A non-empty word of the alphabet, no longer than a name may be.
 token :: String -> Gen T.Text
-token alphabet = T.pack <$> listOf1 (elements alphabet)
+token alphabet = T.take 60 . T.pack <$> listOf1 (elements alphabet)
 
 -- | Made through the checking functions, as every identifier is.  A text
 -- the grammar refuses would stop the suite here, not pass for an identifier.
@@ -162,7 +163,7 @@ taskTests =
       forAll task $ \original -> parseTask (encode original) === Right original
   , testProperty "a lease carries its task's fields unchanged" $
       forAll task $ \original ->
-        let lease = Lease original leaseOne (storedWorkerName "worker-one")
+        let lease = Lease original leaseOne (made mkWorkerName "worker-one")
               (storedTimestamp "2026-09-29T12:00:00Z")
             carried = do
               A.Object object <- A.decode (encode lease)
@@ -229,7 +230,7 @@ recordTests =
         { resultTask = made mkTaskId "task-one"
         , resultLease = made mkLeaseId "lease_1_1_task-one"
         , resultCapability = made mkCapability "classify@1"
-        , resultWorker = storedWorkerName "worker-one"
+        , resultWorker = made mkWorkerName "worker-one"
         , resultFinishedAt = storedTimestamp "2026-09-29T12:00:00Z"
         , resultValue = A.object ["anything" A..= ("opaque" :: T.Text)]
         }
@@ -238,7 +239,7 @@ recordTests =
         { failureTask = made mkTaskId "task-one"
         , failureLease = made mkLeaseId "lease_1_1_task-one"
         , failureCapability = made mkCapability "classify@1"
-        , failureWorker = storedWorkerName "worker-one"
+        , failureWorker = made mkWorkerName "worker-one"
         , failureFailedAt = storedTimestamp "2026-09-29T12:00:00Z"
         , failureReason = "exit 3: failed"
         , failureRetried = Retry
@@ -257,6 +258,9 @@ recordTests =
       assertBool "refused" (isLeft (parseResultRecord (without "worker" resultRecord)))
   , testCase "a failure record without its reason is corrupt" $
       assertBool "refused" (isLeft (parseFailureRecord (without "reason" failureRecord)))
+  , testCase "a record whose worker is outside the grammar is corrupt" $
+      assertBool "refused" $ isLeft $ parseResultRecord
+        (replacing "worker" (A.String "two words") resultRecord)
   , testCase "a failure record whose retried is not a boolean is corrupt" $
       assertBool "refused" $ isLeft $ parseFailureRecord
         (replacing "retried" (A.String "yes") failureRecord)

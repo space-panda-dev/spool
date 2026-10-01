@@ -18,7 +18,7 @@ document and the implementation say nothing of it until it is accepted.
 | [0007](0007-remote-command-is-an-exact-byte-grammar.md) | The remote command is an exact byte grammar |
 | [0008](0008-reclaim-is-caller-driven.md) | Reclaim is caller-driven |
 | [0009](0009-status-counts-coordination-records.md) | Status counts coordination records, not an exclusive partition |
-| [0010](0010-names-have-one-grammar-and-a-length.md) | Proposed: names have one grammar and a length |
+| [0010](0010-names-have-one-grammar-and-a-length.md) | Names have one grammar and a length |
 | [0011](0011-a-lease-id-is-opaque-to-its-holder.md) | Proposed: a lease identifier is opaque to its holder |
 | [0012](0012-every-line-is-read-first-and-answered.md) | Proposed: every line is read first, and every line is answered |
 | [0013](0013-the-record-commits-and-recovery-finishes.md) | Proposed: the record commits the transition, and recovery finishes it |

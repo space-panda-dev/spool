@@ -13,9 +13,9 @@ import Spool.Types
   , mkLeaseId
   , mkTaskId
   , newLeaseId
+  , mkWorkerName
   , taskIdText
-  , workerNameFromArgument
-  , workerNameFromGrant
+  , validatePeer
   , workerNameText
   )
 import Test.Tasty (TestTree, testGroup)
@@ -40,6 +40,12 @@ tests = testGroup "identifiers"
       (map (bad mkTaskId) ["", "a--b", "a/b", "../escape", "a b", "caf\233", "a\nb"])
   , testCase "a task_id reads back as the text it was made from" $
       fmap taskIdText (mkTaskId "task-one") @?= Right "task-one"
+  , testCase "a task_id may be 128 characters and not 129" $ do
+      assertBool "128 accepted" (isRight (mkTaskId (T.replicate 128 "n")))
+      assertBool "129 refused" (isLeft (mkTaskId (T.replicate 129 "n")))
+  , testCase "a capability may be 128 characters and not 129" $ do
+      assertBool "128 accepted" (isRight (mkCapability (T.replicate 126 "c" <> "@1")))
+      assertBool "129 refused" (isLeft (mkCapability (T.replicate 127 "c" <> "@1")))
   , testGroup "capability accepts"
       (map (good mkCapability) ["classify@1", "opaque.name@1.2", "a-b_c@0"])
   , testGroup "capability rejects"
@@ -62,26 +68,28 @@ tests = testGroup "identifiers"
             let made = newLeaseId micros serial task
             in (mkLeaseId (leaseIdText made) === Right made)
                  .&&. (leaseStarted made === Just micros)
-  , testGroup "a worker named as an argument"
+  , testGroup "a worker"
       [ testCase "is kept as given" $
-          fmap workerNameText (workerNameFromArgument "worker-one") @?= Right "worker-one"
-      , testCase "may be outside ASCII" $
-          fmap workerNameText (workerNameFromArgument "\321") @?= Right "\321"
+          fmap workerNameText (mkWorkerName "worker-one") @?= Right "worker-one"
+      , testCase "may be 64 characters and not 65" $ do
+          assertBool "64 accepted" (isRight (mkWorkerName (T.replicate 64 "w")))
+          assertBool "65 refused" (isLeft (mkWorkerName (T.replicate 65 "w")))
       , testGroup "is refused when it is"
-          [ testCase label (assertBool "refused" (isLeft (workerNameFromArgument name)))
+          [ testCase label (assertBool "refused" (isLeft (mkWorkerName name)))
           | (label, name) <-
               [ ("empty", ""), ("two words", "two words"), ("tabbed", "a\tb")
-              , ("two lines", "a\nb"), ("ended by a return", "a\r") ]
+              , ("two lines", "a\nb"), ("outside ASCII", "\321")
+              , ("holding a slash", "a/b"), ("holding a NUL", "a\NULb") ]
           ]
       ]
-  , testGroup "a worker named in a grant"
-      [ testCase "is kept as given" $
-          fmap workerNameText (workerNameFromGrant "worker-one") @?= Right "worker-one"
-      , testCase "may hold a space, which an argument may not" $ do
-          assertBool "the grant rule accepts" (isRight (workerNameFromGrant "two words"))
-          assertBool "the argument rule refuses" (isLeft (workerNameFromArgument "two words"))
+  , testGroup "a peer"
+      [ testCase "may hold spaces and any printable character" $
+          validatePeer "Alice's laptop, 2nd floor \233" @?= Right ()
+      , testCase "may be 128 characters and not 129" $ do
+          assertBool "128 accepted" (isRight (validatePeer (T.replicate 128 "p")))
+          assertBool "129 refused" (isLeft (validatePeer (T.replicate 129 "p")))
       , testGroup "is refused when it is"
-          [ testCase label (assertBool "refused" (isLeft (workerNameFromGrant name)))
+          [ testCase label (assertBool "refused" (isLeft (validatePeer name)))
           | (label, name) <-
               [ ("empty", ""), ("two lines", "a\nb"), ("tabbed", "a\tb")
               , ("holding a delete", "a\DELb"), ("holding a NUL", "a\NULb") ]

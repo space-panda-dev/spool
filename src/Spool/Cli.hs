@@ -13,7 +13,7 @@ import Spool.Types
   ( Retry (..)
   , StatusFormat (..)
   , WorkerName
-  , workerNameFromArgument
+  , mkWorkerName
   )
 
 -- | What a command line names.  The two kinds are run differently, and the
@@ -98,10 +98,10 @@ store :: StoreCommand -> Either String Command
 store = Right . Store
 
 workerArgument :: String -> Either String WorkerName
-workerArgument = either (Left . ("spool: " <>)) Right . workerNameFromArgument
+workerArgument = either (Left . ("spool: " <>)) Right . mkWorkerName . T.pack
 
 grantCommand :: String -> String -> FilePath -> Maybe T.Text -> Either String Command
-grantCommand peer worker key expiry = case workerNameFromArgument worker of
+grantCommand peer worker key expiry = case mkWorkerName (T.pack worker) of
   Right name | not (null peer) -> store (GrantCommand (T.pack peer) name key expiry)
   _ -> Left "spool: grant requires non-empty peer and worker values"
 
