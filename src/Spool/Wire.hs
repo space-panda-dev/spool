@@ -11,11 +11,14 @@ module Spool.Wire
     Task (..)
   , Lease (..)
   , parseTask
+  , parseLease
     -- * What a worker sends
   , LeaseRef (..)
   , Ack (..)
   , FailRequest (..)
   , FetchRequest (..)
+  , Answer (..)
+  , parseAnswer
   , parseLeaseRef
   , parseAck
   , parseFail
@@ -48,6 +51,7 @@ import Data.Aeson (ToJSON (..), (.=))
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Aeson.Types as AT
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 import qualified Spool.Attachments as SA
@@ -109,20 +113,41 @@ data LeaseRef = LeaseRef
   , refLease :: LeaseId
   } deriving (Eq, Show)
 
+-- The requests are written as well as read: a worker on another machine
+-- sends them to its spool.
+
+instance ToJSON LeaseRef where
+  toJSON reference = A.object (referenceFields reference)
+
+referenceFields :: LeaseRef -> [AT.Pair]
+referenceFields reference =
+  ["task_id" .= refTask reference, "lease_id" .= refLease reference]
+
 data Ack = Ack
   { ackRef :: LeaseRef
   , ackResult :: A.Value
   } deriving (Eq, Show)
+
+instance ToJSON Ack where
+  toJSON ack = A.object (referenceFields (ackRef ack) <> ["result" .= ackResult ack])
 
 data FailRequest = FailRequest
   { failRef :: LeaseRef
   , failReason :: T.Text
   } deriving (Eq, Show)
 
+instance ToJSON FailRequest where
+  toJSON request =
+    A.object (referenceFields (failRef request) <> ["reason" .= failReason request])
+
 data FetchRequest = FetchRequest
   { fetchRef :: LeaseRef
   , fetchDigest :: SA.Sha256
   } deriving (Eq, Show)
+
+instance ToJSON FetchRequest where
+  toJSON request =
+    A.object (referenceFields (fetchRef request) <> ["sha256" .= fetchDigest request])
 
 -- | The record of an acknowledged task, kept until whoever put the task
 -- reads it.
@@ -211,6 +236,39 @@ parseTask = strictObject "task"
         A.Error message -> Left message
         A.Success declarations -> SA.validateAttachments declarations
     pure (Task ident capability payload attachments)
+
+-- | The lease envelope, as a worker reads it back from a spool.
+parseLease :: BL.ByteString -> Either String Lease
+parseLease = strictObject "lease"
+  [ "task_id", "capability", "lease_id", "worker", "leased_at", "payload"
+  , "attachments" ] $ \object -> do
+    ident <- mkTaskId =<< requiredText "task_id" object
+    capability <- mkCapability =<< requiredText "capability" object
+    leaseIdent <- mkLeaseId =<< requiredText "lease_id" object
+    worker <- mkWorkerName =<< requiredText "worker" object
+    leasedAt <- requiredText "leased_at" object
+    payload <- required "lease is missing payload" "payload" object
+    attachments <- case KM.lookup "attachments" object of
+      Nothing -> Left "missing attachments"
+      Just value -> case A.fromJSON value of
+        A.Error message -> Left message
+        A.Success declarations -> SA.validateAttachments declarations
+    pure (Lease (Task ident capability payload attachments) leaseIdent worker
+      (storedTimestamp leasedAt))
+
+-- | What a transition on a lease answered, as a worker reads it back.
+data Answer = Answer
+  { answerRef :: LeaseRef
+  , answerStatus :: T.Text
+  } deriving (Eq, Show)
+
+parseAnswer :: BL.ByteString -> Either String Answer
+parseAnswer = strictObject "answer" ["task_id", "lease_id", "status"] $ \object -> do
+  identText <- requiredText "task_id" object
+  leaseText <- requiredText "lease_id" object
+  status <- requiredText "status" object
+  reference <- leaseRef identText leaseText
+  pure (Answer reference status)
 
 parseLeaseRef :: BL.ByteString -> Either String LeaseRef
 parseLeaseRef = strictObject "lease reference" ["task_id", "lease_id"] $ \object -> do

@@ -66,7 +66,7 @@ import GHC.IO.Exception (IOErrorType (ResourceVanished))
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO (Handle, IOMode (ReadMode), hClose, openBinaryFile)
+import System.IO (Handle, hClose)
 import System.IO.Error (ioeGetErrorType)
 import System.Posix.Signals
   ( Handler (Catch)
@@ -96,13 +96,11 @@ import Spool.Error
   , report
   , withContext
   )
-import Spool.Files (Paths, attachmentsDir, epochMicros, withLock)
-import Spool.Store (leaseUpTo, ackOne, renewOne, failLease)
+import Spool.Files (epochMicros)
 import Spool.Types
   ( LeaseId
   , Retry (..)
   , TaskId
-  , WorkerName
   , capabilityText
   , taskIdText
   )
@@ -112,6 +110,7 @@ import Spool.Worker.Config
   , WorkConfig (..)
   , loadWorkConfig
   )
+import Spool.Worker.Connection (Connection (..))
 
 -- | The outcome of running a capability's executable to completion.
 data RunOutcome = RunSuccess BL.ByteString | RunFailure T.Text
@@ -119,8 +118,8 @@ data RunOutcome = RunSuccess BL.ByteString | RunFailure T.Text
 -- | Lease tasks one at a time and run each in its own thread, as many at
 -- once as the configuration allows, until nothing is pending or the count
 -- asked for has been started. Then wait for what is running.
-runWork :: Paths -> WorkerName -> FilePath -> Maybe Int -> IO ()
-runWork paths worker configPath maxTasks = do
+runWork :: Connection -> FilePath -> Maybe Int -> IO ()
+runWork spool configPath maxTasks = do
   config <- loadWorkConfig configPath
   slots <- newQSem (wcMaxConcurrent config)
   failures <- newMVar ([] :: [SomeException])
@@ -140,16 +139,16 @@ runWork paths worker configPath maxTasks = do
             modifyMVar_ failures (pure . (held :))
         start lease = mask_ $ do
           task <- asyncWithUnmask $ \unmask ->
-            (unmask (runOneLease paths config lease) `catch` record)
+            (unmask (runOneLease spool config lease) `catch` record)
               `finally` signalQSem slots
           atomicModifyIORef' running (\tasks -> (task : tasks, ()))
         loop launched = unless (maybe False (launched >=) maxTasks) $ do
           leased <- bracketOnError (waitQSem slots) (const (signalQSem slots)) $
             \() -> do
-              leased <- withLock paths (leaseUpTo paths worker 1)
+              leased <- leaseOne spool
               case leased of
-                lease : _ -> start lease >> pure True
-                [] -> signalQSem slots >> pure False
+                Just lease -> start lease >> pure True
+                Nothing -> signalQSem slots >> pure False
           when leased (loop (launched + 1 :: Int))
     loop 0
     readIORef running >>= mapM_ wait
@@ -175,32 +174,32 @@ stoppedBySignal action = do
 -- | Run one already-leased task to completion: refuse it outright if its
 -- capability or payload size fails the configuration's rules, otherwise
 -- run the mapped executable and ack or fail the lease with the result.
-runOneLease :: Paths -> WorkConfig -> Lease -> IO ()
-runOneLease paths config lease = do
+runOneLease :: Connection -> WorkConfig -> Lease -> IO ()
+runOneLease spool config lease = do
   let task = leaseTask lease
       leaseIdent = leaseId lease
       capability = taskCapability task
   case Map.lookup capability (wcCapabilities config) of
-    Nothing -> completeFailure paths (taskId task) leaseIdent
+    Nothing -> completeFailure spool (taskId task) leaseIdent
       ("capability " <> capabilityText capability
         <> " is not in the worker configuration") NoRetry
     Just capConfig -> do
       let payloadBytes = canonical (taskPayload task)
       if BL.length payloadBytes > capMaxPayloadBytes capConfig
-        then completeFailure paths (taskId task) leaseIdent
+        then completeFailure spool (taskId task) leaseIdent
           ("payload of " <> T.pack (show (BL.length payloadBytes))
             <> " bytes exceeds max_payload_bytes " <> T.pack (show (capMaxPayloadBytes capConfig)))
           NoRetry
-        else runExecutable paths config task leaseIdent capConfig payloadBytes
+        else runExecutable spool config task leaseIdent capConfig payloadBytes
 
 runExecutable
-  :: Paths -> WorkConfig -> Task -> LeaseId -> CapabilityConfig -> BL.ByteString -> IO ()
-runExecutable paths config task leaseIdent capConfig payloadBytes = do
+  :: Connection -> WorkConfig -> Task -> LeaseId -> CapabilityConfig -> BL.ByteString -> IO ()
+runExecutable spool config task leaseIdent capConfig payloadBytes = do
   (outcome, renewal) <-
-    withAsync (renewalLoop paths (taskId task) leaseIdent (wcRenewSeconds config)) $
+    withAsync (renewalLoop spool (taskId task) leaseIdent (wcRenewSeconds config)) $
       \renewing -> do
         outcome <- bracket freshTempDir removeWorkerDirectory $ \tempDir -> do
-          receiveTaskAttachments paths task tempDir
+          receiveTaskAttachments spool task leaseIdent tempDir
           runCapability capConfig (wcEnv config) tempDir payloadBytes
         renewal <- poll renewing
         pure (outcome, renewal)
@@ -208,17 +207,17 @@ runExecutable paths config task leaseIdent capConfig payloadBytes = do
     Just (Right refusal) -> throwIO (withContext "work: renewal failed: " refusal)
     Just (Left exception) -> throwIO exception
     Nothing -> case outcome of
-      RunFailure reason -> completeFailure paths (taskId task) leaseIdent reason Retry
+      RunFailure reason -> completeFailure spool (taskId task) leaseIdent reason Retry
       RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
-        Left _ -> completeFailure paths (taskId task) leaseIdent "output is not JSON" Retry
-        Right outputValue -> completeSuccess paths task leaseIdent outputValue
+        Left _ -> completeFailure spool (taskId task) leaseIdent "output is not JSON" Retry
+        Right outputValue -> completeSuccess spool task leaseIdent outputValue
 
-receiveTaskAttachments :: Paths -> Task -> FilePath -> IO ()
-receiveTaskAttachments paths task tempDir = do
+-- | Receive every declared attachment into the working directory, verified.
+receiveTaskAttachments :: Connection -> Task -> LeaseId -> FilePath -> IO ()
+receiveTaskAttachments spool task leaseIdent tempDir = do
   let workerAttachmentRoot = tempDir </> "attachments"
-  forM_ (taskAttachments task) $ \attachment -> do
-    let source = SA.attachmentPath (attachmentsDir paths) (taskId task) attachment
-    bracket (openBinaryFile source ReadMode) hClose $ \handle -> do
+  forM_ (taskAttachments task) $ \attachment ->
+    withAttachment spool (LeaseRef (taskId task) leaseIdent) attachment $ \handle -> do
       received <- SA.receiveAttachment workerAttachmentRoot attachment handle
       case received of
         Left message -> throwIO (corrupt
@@ -235,24 +234,24 @@ removeWorkerDirectory directory = do
 
 -- | Renew the lease at each interval until a renewal is refused, and answer
 -- with the refusal. It ends no other way but by being stopped.
-renewalLoop :: Paths -> TaskId -> LeaseId -> Int -> IO SpoolError
-renewalLoop paths taskIdent leaseIdent renewSeconds = do
+renewalLoop :: Connection -> TaskId -> LeaseId -> Int -> IO SpoolError
+renewalLoop spool taskIdent leaseIdent renewSeconds = do
   threadDelay (renewSeconds * 1000000)
-  result <- withLock paths (renewOne paths (LeaseRef taskIdent leaseIdent))
+  result <- renewLease spool (LeaseRef taskIdent leaseIdent)
   case result of
-    Right () -> renewalLoop paths taskIdent leaseIdent renewSeconds
+    Right () -> renewalLoop spool taskIdent leaseIdent renewSeconds
     Left refusal -> pure refusal
 
-completeSuccess :: Paths -> Task -> LeaseId -> A.Value -> IO ()
-completeSuccess paths task leaseIdent output = withLock paths $ do
-  result <- ackOne paths (LeaseRef (taskId task) leaseIdent) output
+completeSuccess :: Connection -> Task -> LeaseId -> A.Value -> IO ()
+completeSuccess spool task leaseIdent output = do
+  result <- ackLease spool (LeaseRef (taskId task) leaseIdent) output
   case result of
     Left refusal -> throwIO (withContext "work: " refusal)
-    Right _ -> pure ()
+    Right () -> pure ()
 
-completeFailure :: Paths -> TaskId -> LeaseId -> T.Text -> Retry -> IO ()
-completeFailure paths taskIdent leaseIdent reason retry = withLock paths $ do
-  result <- failLease paths (LeaseRef taskIdent leaseIdent) reason retry
+completeFailure :: Connection -> TaskId -> LeaseId -> T.Text -> Retry -> IO ()
+completeFailure spool taskIdent leaseIdent reason retry = do
+  result <- failLeaseWith spool (LeaseRef taskIdent leaseIdent) reason retry
   case result of
     Left refusal -> throwIO (withContext "work: " refusal)
     Right () -> pure ()

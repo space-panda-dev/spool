@@ -1292,9 +1292,9 @@ HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
   > "$work/grant.json"
 grant_id=$(jq -r '.grant_id' "$work/grant.json")
 jq -e --arg key "$primary_key" \
-  'keys == ["expires_at","grant_id","peer","public_key","spool","worker"]
+  'keys == ["expires_at","grant_id","peer","public_key","put","spool","worker"]
    and (.grant_id | test("^grant_[0-9a-f]{32}$"))
-   and .peer == "peer-one" and .worker == "granted-worker"
+   and .peer == "peer-one" and .worker == "granted-worker" and .put == false
    and .public_key == $key and .expires_at == null' "$work/grant.json" >/dev/null; check
 test -f "$grant_home/.spool/grants/$grant_id.json"; check
 grep -F "restrict,command=\"" "$grant_home/.ssh/authorized_keys" \
@@ -1452,7 +1452,10 @@ remote_reject 'lease --count 9223372036854775808'
 remote_reject 'lease --count 111111111111111111111'
 remote_reject 'lease extra'
 remote_reject '--count 1'
-remote_reject 'put'
+# put is a remote word (ADR 0015); this grant may not, so it is denied, not
+# malformed, and the attachments form is never a remote word.
+expect_exit 5 remote_primary 'put'
+remote_reject 'put --attachments x'
 remote_reject 'results'
 remote_reject 'failures'
 remote_reject 'status'
@@ -1605,6 +1608,160 @@ set -e
 test "$bad_sidecar_exit" -eq 70; check
 cp "$work/good-worker-sidecar" "$work/grant-spool/leased/$bad_sidecar_lease.worker"
 printf '%s\n' "$bad_sidecar_ack" | spoolg ack | jq -e '.status == "acked"' >/dev/null; check
+
+#############################################################################
+# Another machine: a grant that may put puts through the forced command, and
+# work --via runs the whole worker there, speaking the same grammar.
+#############################################################################
+
+# The transport stands in for "ssh -i KEY account@host": it is given the grant
+# to act as and the one remote word Spool appends, and runs the real forced
+# command with that word as SSH_ORIGINAL_COMMAND, stdin and stdout untouched.
+cat > "$bin/fake-ssh" <<SCRIPT
+#!/bin/sh
+grant=\$1
+word=\$2
+HOME="$grant_home" SSH_ORIGINAL_COMMAND="\$word" exec "$spool_binary" remote --grant "\$grant"
+SCRIPT
+chmod +x "$bin/fake-ssh"
+cat > "$bin/broken-ssh" <<'SCRIPT'
+#!/bin/sh
+echo "ssh: connect to host nowhere: no route" >&2
+exit 255
+SCRIPT
+chmod +x "$bin/broken-ssh"
+
+# Lists the attachments it was given, so a fetched attachment is proven to
+# have arrived whole and under its digest.
+cat > "$bin/list-attachments" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+if [ -d attachments ]; then
+  names=$(ls attachments | sed 's/.*/"&"/' | paste -sd, -)
+else
+  names=
+fi
+printf '{"attachments":[%s]}\n' "$names"
+SCRIPT
+chmod +x "$bin/list-attachments"
+
+putter_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAF'
+reader_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAG'
+printf '%s\n' "$putter_key" > "$work/putter.pub"
+printf '%s\n' "$reader_key" > "$work/reader.pub"
+spoolg grant --peer "the other laptop" --worker putter --key "$work/putter.pub" --put \
+  > "$work/putter-grant.json"
+spoolg grant --peer "a friend" --worker reader --key "$work/reader.pub" \
+  > "$work/reader-grant.json"
+jq -e '.put == true and .peer == "the other laptop"' "$work/putter-grant.json" >/dev/null; check
+jq -e '.put == false' "$work/reader-grant.json" >/dev/null; check
+putter_grant=$(jq -r '.grant_id' "$work/putter-grant.json")
+reader_grant=$(jq -r '.grant_id' "$work/reader-grant.json")
+
+# A grant that may put puts; one that may not is denied before a line is read.
+pending_before_remote_put=$(spoolg status --json | jq -r '.pending')
+printf '%s\n%s\n' \
+  '{"task_id":"remote-put-a","capability":"classify@1","payload":{"n":1}}' \
+  '{"task_id":"remote-put-b","capability":"attachments@1","payload":{}}' \
+  | "$bin/fake-ssh" "$putter_grant" put > "$work/remote-put.out"
+jq -s -e '. == [ {task_id:"remote-put-a", status:"inserted"}
+               , {task_id:"remote-put-b", status:"inserted"} ]' "$work/remote-put.out" >/dev/null; check
+spoolg status --json | jq -e --argjson n "$pending_before_remote_put" '.pending == $n + 2' >/dev/null; check
+set +e
+printf '%s\n' '{"task_id":"remote-put-denied","capability":"classify@1","payload":{}}' \
+  | "$bin/fake-ssh" "$reader_grant" put > "$work/remote-put-denied.out" 2>/dev/null
+remote_put_denied=$?
+set -e
+test "$remote_put_denied" -eq 5; check
+test ! -s "$work/remote-put-denied.out"; check
+spoolg status --json | jq -e --argjson n "$pending_before_remote_put" '.pending == $n + 2' >/dev/null; check
+# A task with attachments cannot come this way.
+set +e
+jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"remote-put-attached",capability:"attachments@1",payload:{},attachments:[{sha256:$digest,size:$size}]}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null 2>&1
+remote_put_attached=$?
+set -e
+test "$remote_put_attached" -eq 2; check
+
+# A task with an attachment, staged on the spool host, for the remote worker
+# to fetch.
+jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \
+  '{task_id:"remote-put-c",capability:"attachments@1",payload:{},attachments:[{sha256:$digest,size:$size}]}' \
+  | spoolg put --attachments "$attachment_source" >/dev/null
+
+# work --via runs the worker through the transport: three tasks are leased
+# under the grant's worker name, one fetches its attachment, and the results
+# land on the spool. No --worker is given; the grant names it.
+jq -nc --arg classify "$bin/echo-classify" --arg list "$bin/list-attachments" --arg path "$worker_path" \
+  '{max_concurrent: 2, renew_seconds: 30, env: {PATH: $path},
+    capabilities: {
+      "classify@1": {exec: $classify, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096},
+      "attachments@1": {exec: $list, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096}}}' \
+  > "$work/remote-worker.json"
+"$spool_binary" work --via "$bin/fake-ssh $putter_grant" --config "$work/remote-worker.json" --max-tasks 3
+spoolg results | jq -s --arg digest "$attachment_digest" -e '
+  (map(select(.task_id == "remote-put-a")) | length == 1 and .[0].worker == "putter"
+     and .[0].result == {echoed: {n: 1}}) and
+  (map(select(.task_id == "remote-put-b")) | length == 1 and .[0].result == {attachments: []}) and
+  (map(select(.task_id == "remote-put-c")) | length == 1 and .[0].worker == "putter"
+     and .[0].result == {attachments: [$digest]})' >/dev/null; check
+test ! -e "$work/grant-spool/attachments/task-remote-put-c"; check
+spoolg status --json | jq -e --argjson n "$pending_before_remote_put" '.pending == $n' >/dev/null; check
+
+# With nothing pending the remote worker exits 0, like a local one.
+"$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker.json"
+check
+
+# A failure on the remote worker is recorded on the spool, with its reason.
+printf '%s\n' '{"task_id":"remote-crash","capability":"crash@1","payload":{}}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+jq -c --arg crash "$bin/crash-three" \
+  '.capabilities["crash@1"] = {exec: $crash, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096}' \
+  "$work/remote-worker.json" > "$work/remote-worker-crash.json"
+"$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-crash.json" --max-tasks 1
+spoolg failures | jq -s --arg task remote-crash -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].worker == "reader" and .[0].retried == true
+   and (.[0].reason | test("exit 3"))' >/dev/null; check
+"$bin/fake-ssh" "$reader_grant" lease > "$work/remote-crash-lease.jsonl"
+jq -c '{task_id, lease_id, result: {drained: true}}' "$work/remote-crash-lease.jsonl" \
+  | "$bin/fake-ssh" "$reader_grant" ack >/dev/null
+
+# A lease reclaimed while the remote worker runs fences its acknowledgement:
+# the worker exits 4 and the spool keeps no result, as locally.
+printf '%s\n' '{"task_id":"remote-late","capability":"late@1","payload":{}}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+jq -c --arg late "$bin/wait-for-late-release" \
+  '.capabilities["late@1"] = {exec: $late, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096}' \
+  "$work/remote-worker.json" > "$work/remote-worker-late.json"
+rm -f "$late_start" "$late_release"
+set +e
+"$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-late.json" --max-tasks 1 &
+remote_late_worker=$!
+set -e
+i=0
+while [ ! -f "$late_start" ] && [ "$i" -lt 100 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+test -f "$late_start"; check
+spoolg reclaim --older-than 0 | jq -e '.task_id == "remote-late"' >/dev/null; check
+: > "$late_release"
+set +e
+wait "$remote_late_worker"
+remote_late_exit=$?
+set -e
+test "$remote_late_exit" -eq 4; check
+spoolg results | jq -s -e 'map(select(.task_id == "remote-late")) | length == 0' >/dev/null; check
+"$bin/fake-ssh" "$reader_grant" lease > "$work/remote-late-lease.jsonl"
+jq -c '{task_id, lease_id, result: {replacement: true}}' "$work/remote-late-lease.jsonl" \
+  | "$bin/fake-ssh" "$reader_grant" ack >/dev/null
+
+# A transport that cannot reach the spool ends the worker with 75; a grant
+# that has been revoked ends it with 5. Either way nothing is leased.
+expect_exit 75 "$spool_binary" work --via "$bin/broken-ssh anywhere" --config "$work/remote-worker.json"
+HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$reader_grant" >/dev/null
+expect_exit 5 "$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker.json"
 
 # Revoke disables access, removes only its managed line, and reclaims leases
 # for the fixed worker. The old lease remains fenced after return to pending.

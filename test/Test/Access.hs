@@ -16,6 +16,7 @@ import Spool.Access
   , RemoteCommand (..)
   , filterManagedGrantLine
   , grantExpiresAt
+  , grantPut
   , grantWorker
   , mkGrantId
   , mkPublicKey
@@ -48,6 +49,7 @@ acceptedCommands =
   , ("fail", RemoteFail Retry)
   , ("fail --no-retry", RemoteFail NoRetry)
   , ("fetch", RemoteFetch)
+  , ("put", RemotePut)
   ]
 
 rejectedCommands :: [(String, BS.ByteString)]
@@ -71,7 +73,7 @@ rejectedCommands =
   , ("substitution", "$(status)")
   , ("glob", "lease*")
   , ("option injection", "lease --worker other")
-  , ("local put", "put")
+  , ("put with a word", "put --attachments x")
   , ("local results", "results")
   , ("local failures", "failures")
   , ("local status", "status")
@@ -111,7 +113,7 @@ publicKey =
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 grantWith :: T.Text -> Maybe T.Text -> Either String Grant
-grantWith worker = validateGrant identifierText "peer-one" worker "/srv/spool" publicKey
+grantWith worker = validateGrant identifierText "peer-one" worker "/srv/spool" publicKey False
 
 grantRecord :: [TestTree]
 grantRecord =
@@ -131,26 +133,34 @@ grantRecord =
         @?= Right "worker.two_3-4"
   , testCase "a peer may be a label with spaces" $
       assertBool "accepted" $ isRight $
-        validateGrant identifierText "Alice's laptop" "worker-one" "/srv/spool" publicKey Nothing
+        validateGrant identifierText "Alice's laptop" "worker-one" "/srv/spool" publicKey False Nothing
   , testCase "a peer of 129 characters is refused" $
       assertBool "refused" $ isLeft $
-        validateGrant identifierText (T.replicate 129 "p") "worker-one" "/srv/spool" publicKey Nothing
+        validateGrant identifierText (T.replicate 129 "p") "worker-one" "/srv/spool" publicKey False Nothing
   , testCase "a record is written in canonical form" $ do
       grant <- either assertFailure pure
         (grantWith "worker-one" (Just "2026-10-01T00:00:00Z"))
       renderGrant grant @?= TE.encodeUtf8
         ( "{\"expires_at\":\"2026-10-01T00:00:00Z\",\"grant_id\":\"" <> identifierText
             <> "\",\"peer\":\"peer-one\",\"public_key\":\"" <> publicKey
-            <> "\",\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}" )
+            <> "\",\"put\":false,\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}" )
+  , testCase "a grant that may put reads back as one that may" $ do
+      grant <- either assertFailure pure
+        (validateGrant identifierText "peer-one" "worker-one" "/srv/spool" publicKey True Nothing)
+      assertBool "may put" (grantPut grant)
+      fmap grantPut (parseGrantJSON (renderGrant grant)) @?= Right True
+  , testCase "a record without put is refused" $
+      assertBool "refused" $ isLeft $ parseGrantJSON
+        "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"expires_at\":null}"
   , testCase "an unknown field is refused" $
       assertBool "refused" $ isLeft $ parseGrantJSON
-        "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"expires_at\":null,\"extra\":1}"
+        "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"put\":false,\"expires_at\":null,\"extra\":1}"
   , testCase "a missing field is refused" $
       assertBool "refused" $ isLeft $ parseGrantJSON
         "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"expires_at\":null}"
   , testCase "a relative spool path is refused" $
       assertBool "refused" $ isLeft $
-        validateGrant identifierText "peer-one" "worker-one" "srv/spool" publicKey Nothing
+        validateGrant identifierText "peer-one" "worker-one" "srv/spool" publicKey False Nothing
   , testCase "a worker name with a control character is refused" $
       assertBool "refused" (isLeft (grantWith "one\ntwo" Nothing))
   , testCase "a key with a comment is refused" $

@@ -5,6 +5,7 @@ module Spool.Cli
   , StoreCommand (..)
   , parseCommand
   , parseWorkShow
+  , parseWorkVia
   , usageText
   ) where
 
@@ -23,6 +24,9 @@ import Spool.Types
 data Command
   = Store StoreCommand
   | Work WorkerName FilePath (Maybe Int)
+  | WorkVia [String] FilePath (Maybe Int)
+    -- ^ A worker on another machine: the transport command's words, to
+    -- which one remote word is appended for each request.
   | WorkShow FilePath
   deriving (Eq, Show)
 
@@ -39,7 +43,7 @@ data StoreCommand
   | Failures
   | Results
   | Fetch
-  | GrantCommand T.Text WorkerName FilePath (Maybe T.Text)
+  | GrantCommand T.Text WorkerName FilePath Bool (Maybe T.Text)
   | RevokeCommand T.Text
   deriving (Eq, Show)
 
@@ -64,12 +68,8 @@ parseSubcommand ["fail", "--no-retry"] = store (Fail NoRetry)
 parseSubcommand ["failures"] = store Failures
 parseSubcommand ["results"] = store Results
 parseSubcommand ["fetch"] = store Fetch
-parseSubcommand ["grant", "--peer", peer, "--worker", worker, "--key", key] =
-  grantCommand peer worker key Nothing
-parseSubcommand
-    ["grant", "--peer", peer, "--worker", worker, "--key", key,
-     "--expires-at", expires] =
-  grantCommand peer worker key (Just (T.pack expires))
+parseSubcommand ("grant" : "--peer" : peer : "--worker" : worker : "--key" : key : options) =
+  grantCommand peer worker key options
 parseSubcommand ["revoke", "--grant", identifier] =
   store (RevokeCommand (T.pack identifier))
 parseSubcommand ["status"] = store (Status StatusText)
@@ -94,16 +94,44 @@ parseSubcommand ("work" : rest) = do
   Right (Work worker configPath maxTasks)
 parseSubcommand _ = Left usageText
 
+-- | The form that needs no spool directory: a worker reaching its spool
+-- through a transport command.  The command is one word, split on single
+-- spaces into a program and its arguments.
+parseWorkVia :: [String] -> Either String Command
+parseWorkVia = go Nothing Nothing Nothing
+  where
+    go (Just via) (Just c) mt [] = Right (WorkVia via c mt)
+    go _ _ _ [] = Left "spool: work --via requires --via COMMAND and --config FILE"
+    go _ c mt ("--via" : value : rest) = case words value of
+      [] -> Left "spool: --via requires a non-empty command"
+      transport -> go (Just transport) c mt rest
+    go v _ mt ("--config" : value : rest) = go v (Just value) mt rest
+    go v c _ ("--max-tasks" : value : rest) = case reads value of
+      [(number, "")] | number > 0 -> go v c (Just number) rest
+      _ -> Left "spool: --max-tasks requires a positive integer"
+    go _ _ _ _ = Left usageText
+
 store :: StoreCommand -> Either String Command
 store = Right . Store
 
 workerArgument :: String -> Either String WorkerName
 workerArgument = either (Left . ("spool: " <>)) Right . mkWorkerName . T.pack
 
-grantCommand :: String -> String -> FilePath -> Maybe T.Text -> Either String Command
-grantCommand peer worker key expiry = case mkWorkerName (T.pack worker) of
-  Right name | not (null peer) -> store (GrantCommand (T.pack peer) name key expiry)
+grantCommand :: String -> String -> FilePath -> [String] -> Either String Command
+grantCommand peer worker key options = case mkWorkerName (T.pack worker) of
+  Right name | not (null peer) -> do
+    (put, expiry) <- grantOptions False Nothing options
+    store (GrantCommand (T.pack peer) name key put expiry)
   _ -> Left "spool: grant requires non-empty peer and worker values"
+
+-- | The optional words of grant, in any order, each at most once.
+grantOptions :: Bool -> Maybe T.Text -> [String] -> Either String (Bool, Maybe T.Text)
+grantOptions put expiry words' = case words' of
+  [] -> Right (put, expiry)
+  "--put" : rest | not put -> grantOptions True expiry rest
+  "--expires-at" : value : rest | expiry == Nothing ->
+    grantOptions put (Just (T.pack value)) rest
+  _ -> Left usageText
 
 leaseCommand :: String -> String -> Either String Command
 leaseCommand worker count = do
@@ -132,4 +160,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--expires-at RFC3339]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --config FILE --show"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N]\n       spool work --config FILE --show"

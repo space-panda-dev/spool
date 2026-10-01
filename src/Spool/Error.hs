@@ -15,6 +15,7 @@ module Spool.Error
   , orThrow
   , withContext
   , exitStatus
+  , fromExitStatus
   , render
   , report
   ) where
@@ -78,6 +79,19 @@ exitStatus failure = case failure of
   SpoolError GrantRefused _ -> 5
   SpoolError Corrupt _ -> 70
   SpoolError Retryable _ -> 75
+
+-- | The failure a spool reports with this exit status, for a worker that
+-- reaches its spool through a transport and gets the status back. The
+-- message is what the spool said on stderr.
+fromExitStatus :: Int -> String -> Maybe SpoolError
+fromExitStatus status message = case status of
+  2 -> Just (malformed message)
+  3 -> Just (conflict message)
+  4 -> Just (stale message)
+  5 -> Just (grantRefused message)
+  70 -> Just (corrupt message)
+  75 -> Just (retryable message)
+  _ -> Nothing
 
 -- | The line for stderr, or nothing when there is nothing to say.
 render :: SpoolError -> Maybe String

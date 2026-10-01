@@ -23,3 +23,4 @@ document and the implementation say nothing of it until it is accepted.
 | [0012](0012-every-line-is-read-first-and-answered.md) | Every line is read first, and every line is answered |
 | [0013](0013-the-record-commits-and-recovery-finishes.md) | The record commits the transition, and recovery finishes it |
 | [0014](0014-durable-means-through-a-power-loss.md) | Durable means through a power loss |
+| [0015](0015-a-grant-may-let-its-holder-put.md) | A grant may let its holder put |
