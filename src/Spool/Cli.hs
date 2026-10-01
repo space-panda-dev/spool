@@ -3,6 +3,7 @@
 module Spool.Cli
   ( Command (..)
   , StoreCommand (..)
+  , GrantOptions (..)
   , parseCommand
   , parseWorkShow
   , parseWorkVia
@@ -43,7 +44,7 @@ data StoreCommand
   | Failures
   | Results
   | Fetch
-  | GrantCommand T.Text WorkerName FilePath Bool (Maybe T.Text)
+  | GrantCommand T.Text WorkerName FilePath GrantOptions
   | RevokeCommand T.Text
   deriving (Eq, Show)
 
@@ -120,17 +121,30 @@ workerArgument = either (Left . ("spool: " <>)) Right . mkWorkerName . T.pack
 grantCommand :: String -> String -> FilePath -> [String] -> Either String Command
 grantCommand peer worker key options = case mkWorkerName (T.pack worker) of
   Right name | not (null peer) -> do
-    (put, expiry) <- grantOptions False Nothing options
-    store (GrantCommand (T.pack peer) name key put expiry)
+    chosen <- grantOptions (GrantOptions False Nothing Nothing) options
+    store (GrantCommand (T.pack peer) name key chosen)
   _ -> Left "spool: grant requires non-empty peer and worker values"
 
+-- | What a grant may be given beyond its peer, worker, and key.
+data GrantOptions = GrantOptions
+  { grantOptionPut :: Bool
+  , grantOptionExpiry :: Maybe T.Text
+  , grantOptionExecutable :: Maybe FilePath
+    -- ^ The program the forced command runs, in place of this binary's own
+    -- canonical path. A stable path, such as a symlink kept pointing at the
+    -- installed binary, outlives the binary it points at.
+  } deriving (Eq, Show)
+
 -- | The optional words of grant, in any order, each at most once.
-grantOptions :: Bool -> Maybe T.Text -> [String] -> Either String (Bool, Maybe T.Text)
-grantOptions put expiry words' = case words' of
-  [] -> Right (put, expiry)
-  "--put" : rest | not put -> grantOptions True expiry rest
-  "--expires-at" : value : rest | expiry == Nothing ->
-    grantOptions put (Just (T.pack value)) rest
+grantOptions :: GrantOptions -> [String] -> Either String GrantOptions
+grantOptions options words' = case words' of
+  [] -> Right options
+  "--put" : rest | not (grantOptionPut options) ->
+    grantOptions options { grantOptionPut = True } rest
+  "--expires-at" : value : rest | grantOptionExpiry options == Nothing ->
+    grantOptions options { grantOptionExpiry = Just (T.pack value) } rest
+  "--executable" : value : rest | grantOptionExecutable options == Nothing && not (null value) ->
+    grantOptions options { grantOptionExecutable = Just value } rest
   _ -> Left usageText
 
 leaseCommand :: String -> String -> Either String Command
@@ -160,4 +174,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N]\n       spool work --config FILE --show"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N]\n       spool work --config FILE --show"

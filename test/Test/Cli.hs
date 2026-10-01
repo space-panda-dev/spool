@@ -7,6 +7,7 @@ module Test.Cli (tests) where
 import Data.Either (isLeft)
 import Spool.Cli
   ( Command (..)
+  , GrantOptions (..)
   , StoreCommand (..)
   , parseCommand
   , parseWorkShow
@@ -71,18 +72,21 @@ acceptedForms =
     , Work w "c.json" (Just 2) )
   , (["work", "--config", "c.json", "--show"], WorkShow "c.json")
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"]
-    , Store (GrantCommand "p" w "k.pub" False Nothing) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions False Nothing Nothing)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--expires-at", "2026-10-01T00:00:00Z"]
-    , Store (GrantCommand "p" w "k.pub" False (Just "2026-10-01T00:00:00Z")) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions False (Just "2026-10-01T00:00:00Z") Nothing)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub", "--put"]
-    , Store (GrantCommand "p" w "k.pub" True Nothing) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing Nothing)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--put", "--expires-at", "2026-10-01T00:00:00Z"]
-    , Store (GrantCommand "p" w "k.pub" True (Just "2026-10-01T00:00:00Z")) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True (Just "2026-10-01T00:00:00Z") Nothing)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--expires-at", "2026-10-01T00:00:00Z", "--put"]
-    , Store (GrantCommand "p" w "k.pub" True (Just "2026-10-01T00:00:00Z")) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True (Just "2026-10-01T00:00:00Z") Nothing)) )
+  , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
+      , "--executable", "/usr/local/bin/spool", "--put"]
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing (Just "/usr/local/bin/spool"))) )
   , (["revoke", "--grant", "g"], Store (RevokeCommand "g"))
   ]
 
@@ -105,6 +109,8 @@ rejectedForms =
   , ("zero max-tasks", ["work", "--worker", "w", "--config", "c", "--max-tasks", "0"])
   , ("grant without a peer", ["grant", "--peer", "", "--worker", "w", "--key", "k"])
   , ("grant with --put twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--put", "--put"])
+  , ("grant with --executable twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--executable", "/a", "--executable", "/b"])
+  , ("grant with an empty executable", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--executable", ""])
   , ("grant with an unknown option", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--pull"])
   ]
 

@@ -81,6 +81,7 @@ import Spool.Store
   , returnToPending
   , fetchFor
   )
+import Spool.Cli (GrantOptions (..))
 import Spool.Types (WorkerName, workerNameText)
 import Spool.Wire
   ( Ack (..)
@@ -106,8 +107,10 @@ prepareAccountPaths = do
   setFileMode (takeDirectory authorizedKeys) 0o700
   pure (grants, authorizedKeys)
 
-grantAccess :: Paths -> T.Text -> WorkerName -> FilePath -> Bool -> Maybe T.Text -> IO ()
-grantAccess paths peer worker keyPath put expiry = do
+grantAccess :: Paths -> T.Text -> WorkerName -> FilePath -> GrantOptions -> IO ()
+grantAccess paths peer worker keyPath options = do
+  let put = grantOptionPut options
+      expiry = grantOptionExpiry options
   canonicalSpool <- canonicalizePath (rootDir paths)
   publicKey <- readCanonicalPublicKey keyPath
   (grants, authorizedKeys) <- prepareAccountPaths
@@ -119,7 +122,13 @@ grantAccess paths peer worker keyPath put expiry = do
   grant <- orThrow malformed (Access.validateGrant
     (Access.grantIdText identifier) peer (workerNameText worker) canonicalSpool
     (Access.publicKeyText publicKey) put expiry)
-  executablePath <- getExecutablePath >>= canonicalizePath
+  -- The forced command names a program by absolute path. By default that is
+  -- this binary's own canonical path, which under a store such as Nix's is
+  -- one build of it; a path chosen by the owner, kept pointing at whatever
+  -- is installed, outlives the build.
+  executablePath <- case grantOptionExecutable options of
+    Just chosen -> pure chosen
+    Nothing -> getExecutablePath >>= canonicalizePath
   managedLine <- orThrow malformed
     (Access.renderManagedAuthorizedKeyLine executablePath grant)
   recordPath <- orThrow malformed (Access.grantRecordPath grants identifier)

@@ -1664,6 +1664,24 @@ jq -e '.put == false' "$work/reader-grant.json" >/dev/null; check
 putter_grant=$(jq -r '.grant_id' "$work/putter-grant.json")
 reader_grant=$(jq -r '.grant_id' "$work/reader-grant.json")
 
+# The forced command names the program the owner chose, when one is chosen;
+# a path that is not canonical is refused and no record is written.
+stable_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH'
+printf '%s\n' "$stable_key" > "$work/stable.pub"
+spoolg grant --peer "stable path" --worker stable --key "$work/stable.pub" \
+  --executable /usr/local/bin/spool > "$work/stable-grant.json"
+stable_grant=$(jq -r '.grant_id' "$work/stable-grant.json")
+grep -F "restrict,command=\"/usr/local/bin/spool remote --grant $stable_grant\" $stable_key spool-grant:$stable_grant" \
+  "$grant_home/.ssh/authorized_keys" >/dev/null; check
+grants_before_bad_executable=$(ls "$grant_home/.spool/grants" | wc -l | tr -d ' ')
+printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAI' > "$work/unstable.pub"
+expect_exit 2 env HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+  --peer "relative" --worker relative --key "$work/unstable.pub" --executable bin/spool
+expect_exit 2 env HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" grant \
+  --peer "dotted" --worker dotted --key "$work/unstable.pub" --executable /usr/local/../bin/spool
+test "$(ls "$grant_home/.spool/grants" | wc -l | tr -d ' ')" = "$grants_before_bad_executable"; check
+HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$stable_grant" >/dev/null
+
 # A grant that may put puts; one that may not is denied before a line is read.
 pending_before_remote_put=$(spoolg status --json | jq -r '.pending')
 printf '%s\n%s\n' \
