@@ -9,6 +9,7 @@ import qualified Test.Attachments
 import qualified Test.Cli
 import qualified Test.Error
 import qualified Test.Files
+import qualified Test.Store
 import Test.Tasty (defaultMain, testGroup)
 import qualified Test.Types
 import qualified Test.Wire
@@ -23,6 +24,7 @@ main = do
     , Test.Cli.tests
     , Test.Error.tests
     , Test.Files.tests
+    , Test.Store.tests
     , Test.Types.tests
     , Test.Wire.tests
     , Test.WorkerConfig.tests

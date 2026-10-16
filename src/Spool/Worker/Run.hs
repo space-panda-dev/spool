@@ -112,8 +112,15 @@ import Spool.Worker.Config
   )
 import Spool.Worker.Connection (Connection (..))
 
--- | The outcome of running a capability's executable to completion.
-data RunOutcome = RunSuccess BL.ByteString | RunFailure T.Text
+-- | The outcome of running a capability's executable to completion: a
+-- failure says whether the task is to be tried again.
+data RunOutcome = RunSuccess BL.ByteString | RunFailure Retry T.Text
+
+-- | Whether a program that exited with this status is to be tried again.
+-- Under ADR 0017, exit 65 (EX_DATAERR) says the task can never succeed.
+retryAfterExit :: Int -> Retry
+retryAfterExit 65 = NoRetry
+retryAfterExit _ = Retry
 
 -- | Lease tasks one at a time and run each in its own thread, as many at
 -- once as the configuration allows, until nothing is pending or the count
@@ -207,7 +214,7 @@ runExecutable spool config task leaseIdent capConfig payloadBytes = do
     Just (Right refusal) -> throwIO (withContext "work: renewal failed: " refusal)
     Just (Left exception) -> throwIO exception
     Nothing -> case outcome of
-      RunFailure reason -> completeFailure spool (taskId task) leaseIdent reason Retry
+      RunFailure retry reason -> completeFailure spool (taskId task) leaseIdent reason retry
       RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
         Left _ -> completeFailure spool (taskId task) leaseIdent "output is not JSON" Retry
         Right outputValue -> completeSuccess spool task leaseIdent outputValue
@@ -406,22 +413,22 @@ runCapability capConfig envPairs cwdPath payload =
           hClose input `catch` (\again -> const (pure ()) (again :: IOException))
       | otherwise = throwIO exception
     outcomeOf ended = case ended of
-      Exited _ _ _ (Left exception) -> RunFailure
+      Exited _ _ _ (Left exception) -> RunFailure Retry
         ("could not write payload: " <> T.pack (displayException exception))
       StoppedFor TimedOut -> timedOut
       StoppedFor Overran -> overran
       Exited _ output errors _ | any isPastLimit [Just output, Just errors] -> overran
-      LeftOpen -> RunFailure
+      LeftOpen -> RunFailure Retry
         ("output still open " <> T.pack (show terminationGraceSeconds)
           <> " s after exit: the program left a process running")
       Exited ExitSuccess (Captured output) _ _ -> RunSuccess (BL.fromStrict output)
-      Exited (ExitFailure n) _ (Captured errors) _ -> RunFailure
+      Exited (ExitFailure n) _ (Captured errors) _ -> RunFailure (retryAfterExit n)
         ("exit " <> T.pack (show n) <> ": " <> decodeLenient (tailBytes 1000 errors))
       -- Every stream past its limit was answered above.
       Exited _ _ _ _ -> overran
-    timedOut = RunFailure
+    timedOut = RunFailure Retry
       ("timeout after " <> T.pack (show (capTimeoutSeconds capConfig)) <> " s")
-    overran = RunFailure
+    overran = RunFailure Retry
       ("output exceeds max_output_bytes " <> T.pack (show limit))
 
 isPastLimit :: Maybe Captured -> Bool
