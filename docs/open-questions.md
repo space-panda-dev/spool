@@ -5,9 +5,6 @@ than guessing.
 
 ## Protocol
 
-- When may a done task and its result be deleted: once read, after a period,
-  or by the caller's command? A spool must not become an archive of finished
-  work.
 - How are large results returned? Results are small JSON; anything bigger is
   the capability's business until a real need says otherwise.
 - How is the protocol versioned, and how does a worker learn the version a
@@ -17,6 +14,11 @@ than guessing.
 - Is there a hard cancel for a running task?
 - How do an attachment's bytes reach the spool from another machine? A task
   put through the remote command may declare none ([ADR 0015](decisions/0015-a-grant-may-let-its-holder-put.md)).
+- How does a spool keep a binary older than its layout from using it? An
+  older binary ignores `.spool-layout` and files a done task under its lease
+  again, where `put` and `collect` do not look
+  ([ADR 0018](decisions/0018-finished-work-is-collected-or-ages-out.md)).
+  Tied to how the protocol is versioned, above.
 - Should a worker stop a run when its lease is lost? A renewal that is
   refused is found only when the program finishes, so the program runs to
   the end of work that can no longer be acknowledged.
