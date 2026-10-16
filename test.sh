@@ -1822,4 +1822,105 @@ test "$late_revoke_exit" -eq 4; check
 HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$grant_id" \
   | jq -e '.status == "revoked"' >/dev/null; check
 
-printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits (%d checks)\n' "$checks"
+#############################################################################
+# A worker that follows its spool (ADR 0019) waits for work instead of
+# stopping, asks again after a transport failure, and stops at SIGTERM or a
+# refusal.
+#############################################################################
+
+# Wait up to five seconds for a command to succeed.
+eventually() {
+  local i=0
+  until "$@"; do
+    i=$((i + 1))
+    test "$i" -lt 50 || return 1
+    sleep 0.1
+  done
+}
+result_for() { spoolfo results | jq -e --arg task "$1" 'select(.task_id == $task)' >/dev/null; }
+
+spoolfo() { "$spool_binary" --dir "$work/follow" "$@"; }
+spoolfo init
+worker_config "classify@1" "$bin/echo-classify" 5 1024 > "$work/follow-config.json"
+
+# A task put after the worker went idle is done by the same worker. It has
+# found nothing pending more than once before the second task is put.
+printf '%s\n' '{"task_id":"follow-first","capability":"classify@1","payload":{"n":1}}' | spoolfo put >/dev/null
+# The binary itself is started in the background, not a shell function
+# around it, so that the signal below reaches the worker and not a subshell.
+"$spool_binary" --dir "$work/follow" work --worker follower --config "$work/follow-config.json" \
+  --follow --idle-seconds 1 2>"$work/follow.stderr" &
+follower=$!
+eventually result_for follow-first; check
+sleep 1.5
+kill -0 "$follower"; check
+printf '%s\n' '{"task_id":"follow-later","capability":"classify@1","payload":{"n":2}}' | spoolfo put >/dev/null
+eventually result_for follow-later; check
+spoolfo results | jq -s -e 'map(select(.task_id == "follow-later")) | .[0].worker == "follower"
+  and .[0].result == {echoed: {n: 2}}' >/dev/null; check
+
+# SIGTERM ends a worker with the signal's status, having said nothing.
+kill -TERM "$follower"
+set +e
+wait "$follower"
+follower_exit=$?
+set -e
+test "$follower_exit" -eq 143; check
+test ! -s "$work/follow.stderr"; check
+# It ends one in the middle of a wait at once, not when the wait is over.
+# Its waits are 1, 2, then 4 seconds, so 3.5 seconds in it is 0.5 seconds
+# into a wait of 4.
+"$spool_binary" --dir "$work/follow" work --worker sleeper --config "$work/follow-config.json" \
+  --follow --idle-seconds 600 &
+long_follower=$!
+sleep 3.5
+stop_started=${EPOCHREALTIME/./}
+kill -TERM "$long_follower"
+set +e
+wait "$long_follower"
+long_follower_exit=$?
+set -e
+stop_took=$(( ${EPOCHREALTIME/./} - stop_started ))
+test "$long_follower_exit" -eq 143; check
+test "$stop_took" -lt 1000000; check
+spoolfo status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+
+# A transport that fails twice is said twice on stderr and asked again; the
+# third request reaches the spool and the task is done. Every pending task is
+# run, so the worker stops at its count.
+cat > "$bin/flaky-ssh" <<SCRIPT
+#!/bin/sh
+count=\$(cat "$work/flaky-count" 2>/dev/null || echo 0)
+count=\$((count + 1))
+echo "\$count" >| "$work/flaky-count"
+if [ "\$count" -le 2 ]; then
+  echo "ssh: connect to host spool-host: network is unreachable" >&2
+  exit 255
+fi
+exec "$bin/fake-ssh" "\$@"
+SCRIPT
+chmod +x "$bin/flaky-ssh"
+printf '%s\n' '{"task_id":"follow-flaky","capability":"classify@1","payload":{"n":3}}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+flaky_pending=$(spoolg status --json | jq -r '.pending')
+test "$flaky_pending" -ge 1; check
+"$spool_binary" work --via "$bin/flaky-ssh $putter_grant" --config "$work/remote-worker.json" \
+  --follow --idle-seconds 1 --max-tasks "$flaky_pending" 2>"$work/flaky.stderr"
+test "$(grep -c '^spool: work: lease failed, asking again in 1 s: transport .* exited 255$' "$work/flaky.stderr")" -eq 2; check
+spoolg results | jq -s -e 'map(select(.task_id == "follow-flaky")) | .[0].worker == "putter"
+  and .[0].result == {echoed: {n: 3}}' >/dev/null; check
+
+# A grant that has been revoked is refused, and a following worker stops at
+# once with the spool's status rather than waiting to ask again.
+# A worker that kept knocking would be cut off by the timeout's 124.
+expect_exit 5 timeout 10 "$spool_binary" work --via "$bin/fake-ssh $reader_grant" \
+  --config "$work/remote-worker.json" --follow --idle-seconds 1
+if grep -q 'asking again' "$work/exit.stderr"; then
+  echo "a refused grant was asked again" >&2; exit 1
+fi
+check
+
+# --idle-seconds belongs to --follow.
+expect_exit 2 spoolfo work --worker w --config "$work/follow-config.json" --idle-seconds 5
+
+printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits, following workers (%d checks)\n' "$checks"
