@@ -80,6 +80,7 @@
               pkgs.findutils
               pkgs.gnugrep
               pkgs.gnused
+              pkgs.gnutar
               pkgs.jq
             ];
           } ''

@@ -35,9 +35,12 @@ import Spool.Wire
   , Task (..)
   , canonical
   , encode
+  , encodeCollectResult
+  , encodeExpiredResult
   , encodeFailResult
   , encodeStaleResult
   , parseAck
+  , parseCollectRequest
   , parseFail
   , parseFailureRecord
   , parseFetchRequest
@@ -216,6 +219,23 @@ requestTests =
       -- found first, because no identifier is checked until every field is
       -- known to be there.
       parseLeaseRef "{\"task_id\":\"a--b\"}" @?= Left "missing lease_id"
+  , testCase "a collect request names one task" $
+      parseCollectRequest "{\"task_id\":\"t\"}" @?= Right taskOne
+  , testGroup "a collect request is refused when it"
+      [ testCase label (assertBool "refused" (isLeft (parseCollectRequest bytes)))
+      | (label, bytes) <-
+          [ ("has no task", "{}")
+          , ("names a lease too", "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\"}")
+          , ("names a task outside the grammar", "{\"task_id\":\"../t\"}")
+          , ("is not an object", "[\"t\"]")
+          ]
+      ]
+  , testCase "collect and gc answer the task and what became of it" $ do
+      map (encodeCollectResult taskOne) [minBound .. maxBound]
+        @?= [ "{\"status\":\"collected\",\"task_id\":\"t\"}"
+            , "{\"status\":\"not_finished\",\"task_id\":\"t\"}"
+            , "{\"status\":\"unknown\",\"task_id\":\"t\"}" ]
+      encodeExpiredResult taskOne @?= "{\"status\":\"expired\",\"task_id\":\"t\"}"
   , testCase "an answer names the lease and what became of it" $ do
       encodeFailResult reference Retry
         @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"failed_retry\",\"task_id\":\"t\"}"

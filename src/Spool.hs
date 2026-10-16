@@ -24,9 +24,11 @@ import Spool.Files (Paths, initialise, openSpool, withLock)
 import Spool.Grants (grantAccess, revokeAccess, runRemote)
 import Spool.Store
   ( ackTasks
+  , collectTasks
   , failTasks
   , failuresCommand
   , fetchAttachment
+  , gcTasks
   , leaseTasks
   , putTasks
   , reclaimTasks
@@ -93,6 +95,8 @@ runStoreCommand command paths = case command of
   Results -> resultsCommand paths
   Fetch -> fetchAttachment paths
   Reclaim age -> reclaimTasks paths age
+  Collect -> collectTasks paths
+  Gc age -> gcTasks paths age
   Status format -> statusTasks paths format
   GrantCommand peer worker key options ->
     grantAccess paths peer worker key options

@@ -4,18 +4,21 @@ module Spool.Input
   , parseAckLine
   , parseLeaseRefLine
   , parseFailLine
+  , parseCollectLine
   , inputLines
   ) where
 
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Spool.Error (malformed, orThrow)
+import Spool.Types (TaskId)
 import Spool.Wire
   ( Ack
   , FailRequest
   , LeaseRef
   , Task
   , parseAck
+  , parseCollectRequest
   , parseFail
   , parseLeaseRef
   , parseTask
@@ -32,6 +35,9 @@ parseLeaseRefLine = orThrow malformed . parseLeaseRef
 
 parseFailLine :: BL.ByteString -> IO FailRequest
 parseFailLine = orThrow malformed . parseFail
+
+parseCollectLine :: BL.ByteString -> IO TaskId
+parseCollectLine = orThrow malformed . parseCollectRequest
 
 isBlank :: BL.ByteString -> Bool
 isBlank = all (`elem` [' ', '\t', '\r', '\n']) . BLC.unpack

@@ -38,6 +38,8 @@ data StoreCommand
   | LeaseCommand WorkerName Int
   | Ack
   | Reclaim Integer
+  | Collect
+  | Gc Integer
   | Status StatusFormat
   | Renew
   | Fail Retry
@@ -82,10 +84,9 @@ parseSubcommand ["lease", "--worker", worker, "--count", count] =
   leaseCommand worker count
 parseSubcommand ["lease", "--count", count, "--worker", worker] =
   leaseCommand worker count
-parseSubcommand ["reclaim", "--older-than", age] =
-  case reads age of
-    [(seconds, "")] | seconds >= 0 -> store (Reclaim seconds)
-    _ -> Left "spool: --older-than requires a non-negative integer"
+parseSubcommand ["reclaim", "--older-than", age] = Store . Reclaim <$> olderThan age
+parseSubcommand ["collect"] = store Collect
+parseSubcommand ["gc", "--older-than", age] = Store . Gc <$> olderThan age
 parseSubcommand ("work" : "--config" : configPath : "--show" : []) =
   Right (WorkShow configPath)
 parseSubcommand ("work" : "--show" : "--config" : configPath : []) =
@@ -114,6 +115,12 @@ parseWorkVia = go Nothing Nothing Nothing
 
 store :: StoreCommand -> Either String Command
 store = Right . Store
+
+-- | A threshold in whole seconds, as reclaim and gc are given it.
+olderThan :: String -> Either String Integer
+olderThan age = case reads age of
+  [(seconds, "")] | seconds >= 0 -> Right seconds
+  _ -> Left "spool: --older-than requires a non-negative integer"
 
 workerArgument :: String -> Either String WorkerName
 workerArgument = either (Left . ("spool: " <>)) Right . mkWorkerName . T.pack
@@ -174,4 +181,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N]\n       spool work --config FILE --show"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|collect|gc --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N]\n       spool work --config FILE --show"

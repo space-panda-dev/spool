@@ -10,6 +10,8 @@ module Spool.Files
   , resultsDir
   , attachmentsDir
   , attachmentCleanupDir
+  , taskCleanupDir
+  , layoutPath
   , lockPath
   , openSpool
   , withLock
@@ -19,6 +21,7 @@ module Spool.Files
   , donePath
   , failedPath
   , resultPath
+  , taskCleanupPath
   , workerSidecarPath
   , renewedSidecarPath
   , jsonFiles
@@ -26,6 +29,7 @@ module Spool.Files
   , Created (..)
   , atomicCreate
   , atomicReplace
+  , createMarker
   , syncedRename
   , syncedRemove
   , syncedRenameDirectory
@@ -50,8 +54,9 @@ import System.IO (Handle, IOMode (AppendMode), hClose, hFlush, openBinaryTempFil
 import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus)
-import System.Posix.IO (OpenMode (ReadOnly), closeFd, defaultFileFlags, handleToFd,
-                        openFd)
+import System.Posix.IO (OpenFileFlags (creat, exclusive), OpenMode (ReadOnly, WriteOnly), closeFd,
+                        defaultFileFlags, handleToFd, openFd)
+import System.Posix.Types (Fd)
 import System.Posix.Unistd (fileSynchronise)
 import qualified Data.Text as T
 import Spool.Types (LeaseId, TaskId, leaseIdText, taskIdText)
@@ -65,6 +70,10 @@ data Paths = Paths
   , resultsDir :: FilePath
   , attachmentsDir :: FilePath
   , attachmentCleanupDir :: FilePath
+  , taskCleanupDir :: FilePath
+    -- ^ One empty marker for each finished task being deleted (ADR 0018).
+  , layoutPath :: FilePath
+    -- ^ Which layout the spool's files are in (ADR 0018).
   , lockPath :: FilePath
   , processLock :: MVar ()
     -- ^ Keeps this process's own threads from the lock file at once. See
@@ -106,18 +115,27 @@ spoolAt directory lock = Paths
   , resultsDir = directory </> "results"
   , attachmentsDir = directory </> "attachments"
   , attachmentCleanupDir = directory </> ".attachment-cleanup"
+  , taskCleanupDir = directory </> ".task-cleanup"
+  , layoutPath = directory </> ".spool-layout"
   , lockPath = directory </> ".spool.lock"
   , processLock = lock
   }
 
--- A pending task is filed under its own identifier. Everything that follows
--- a lease is filed under the lease's, which is what fences a stale worker.
-pendingPath :: Paths -> TaskId -> FilePath
-pendingPath paths ident = pendingDir paths </> T.unpack (taskIdText ident) <> ".json"
+-- A pending task and a done task are filed under the task's own identifier,
+-- so that a put looks for its task and at nothing else (ADR 0018). A lease,
+-- and the records of what came of it, are filed under the lease's, which is
+-- what fences a stale worker.
+pendingPath, donePath, taskCleanupPath :: Paths -> TaskId -> FilePath
+pendingPath paths = underTask (pendingDir paths) ".json"
+donePath paths = underTask (doneDir paths) ".json"
+taskCleanupPath paths = underTask (taskCleanupDir paths) ""
 
-leasedPath, donePath, failedPath, resultPath :: Paths -> LeaseId -> FilePath
+underTask :: FilePath -> String -> TaskId -> FilePath
+underTask directory extension ident =
+  directory </> T.unpack (taskIdText ident) <> extension
+
+leasedPath, failedPath, resultPath :: Paths -> LeaseId -> FilePath
 leasedPath paths = underLease (leasedDir paths) ".json"
-donePath paths = underLease (doneDir paths) ".json"
 failedPath paths = underLease (failedDir paths) ".json"
 resultPath paths = underLease (resultsDir paths) ".json"
 
@@ -133,7 +151,7 @@ initialise :: Paths -> IO ()
 initialise paths = mapM_ (createDirectoryIfMissing True)
   [rootDir paths, pendingDir paths, leasedDir paths, doneDir paths,
    failedDir paths, resultsDir paths, attachmentsDir paths,
-   attachmentCleanupDir paths]
+   attachmentCleanupDir paths, taskCleanupDir paths]
 
 jsonFiles :: FilePath -> IO [FilePath]
 jsonFiles directory = do
@@ -181,6 +199,20 @@ atomicReplace path bytes = do
   (BL.hPut handle bytes >> syncHandle handle >> renameFile temporary path)
     `finally` ignoreMissing (removeFile temporary)
   syncDirectory directory
+
+-- | Create an empty file, or leave the one already there alone, and sync
+-- the directory. A marker has no bytes to be torn, so it is made in place,
+-- and its directory holds nothing but markers.
+createMarker :: FilePath -> IO ()
+createMarker path = do
+  made <- try (openFd path WriteOnly defaultFileFlags
+    { creat = Just 0o644, exclusive = True }) :: IO (Either IOException Fd)
+  case made of
+    Right fd -> closeFd fd
+    Left exception
+      | isAlreadyExistsError exception -> pure ()
+      | otherwise -> ioError exception
+  syncDirectory (takeDirectory path)
 
 -- What a command answers for is on the disk when it answers (ADR 0014). A
 -- file's bytes are synced before it is given its name, and a directory is

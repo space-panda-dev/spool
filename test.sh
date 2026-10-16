@@ -519,7 +519,9 @@ printf '%s\n' "$ack_line" | spoolk ack | jq -e '.status == "acked"' >/dev/null; 
 cp "$work/interrupted-ack-saved/$ack_lease.json" \
   "$work/interrupted-ack-saved/$ack_lease.worker" "$work/interrupted-ack/leased/"
 cp -R "$work/interrupted-ack-saved/task-interrupted-ack" "$work/interrupted-ack/attachments/"
-rm -f "$work/interrupted-ack/done/$ack_lease.json"
+# A done task is filed under its task ID (ADR 0018).
+test -f "$work/interrupted-ack/done/interrupted-ack.json"; check
+rm -f "$work/interrupted-ack/done/interrupted-ack.json"
 test -f "$work/interrupted-ack/results/$ack_lease.json"; check
 spoolk reclaim --older-than 0 > "$work/interrupted-ack-reclaim.out"
 test ! -s "$work/interrupted-ack-reclaim.out"; check
@@ -534,6 +536,241 @@ other_result_exit=$?
 set -e
 test "$other_result_exit" -eq 4; check
 jq -e '.status == "stale"' "$work/interrupted-ack-other.out" >/dev/null; check
+
+# ADR 0018: finished work is collected, or ages out. These helpers drive the
+# real writers on the spool in one directory of the work area, with one task
+# pending at a time, so that each lease takes the task meant.
+in_spool() { local dir=$1; shift; "$spool_binary" --dir "$work/$dir" "$@"; }
+put_one() { printf '{"task_id":"%s","capability":"keep@1","payload":{}}\n' "$2" | in_spool "$1" put; }
+lease_one() { in_spool "$1" lease --worker keeper | jq -r '.lease_id'; }
+ack_one() {
+  jq -nc --arg task "$2" --arg lease "$3" '{task_id:$task,lease_id:$lease,result:{kept:$task}}' \
+    | in_spool "$1" ack
+}
+fail_one() {
+  jq -nc --arg task "$2" --arg lease "$3" '{task_id:$task,lease_id:$lease,reason:"kept"}' \
+    | in_spool "$1" fail "${@:4}"
+}
+collect_ids() { local dir=$1; shift; printf '{"task_id":"%s"}\n' "$@" | in_spool "$dir" collect; }
+# A done task with one retried failure behind it; prints the finishing lease.
+finish_with_history() {
+  local lease
+  put_one "$1" "$2" >/dev/null
+  lease=$(lease_one "$1")
+  fail_one "$1" "$2" "$lease" >/dev/null
+  lease=$(lease_one "$1")
+  ack_one "$1" "$2" "$lease" >/dev/null
+  printf '%s\n' "$lease"
+}
+# Make a record as old as this many seconds before now.
+age_record() {
+  jq -c --arg field "$2" --argjson age "$3" '.[$field] = ((now - $age) | floor | todate)' "$1" \
+    > "$work/aged.json"
+  mv -f "$work/aged.json" "$1"
+}
+records_of() { find "$work/$1/results" "$work/$1/failed" -name "*_$2.json"; }
+
+# collect deletes a finished task, done or finally failed, with its result
+# and every failure record, and answers every line; a pending or leased task
+# is not finished, and an ID the spool does not hold is unknown.
+in_spool kept init
+kept_done_lease=$(finish_with_history kept r-done)
+put_one kept r-failed >/dev/null
+fail_one kept r-failed "$(lease_one kept)" --no-retry >/dev/null
+put_one kept r-leased >/dev/null
+kept_leased_lease=$(lease_one kept)
+put_one kept r-pending >/dev/null
+in_spool kept status --json | jq -e '. == {pending:1,leased:1,done:1,failed:2}' >/dev/null; check
+# A malformed line acts on nothing, the lines before it included.
+set +e
+printf '%s\n' '{"task_id":"r-done"}' '{"task_id":"r-failed","extra":true}' \
+  | in_spool kept collect > "$work/collect-malformed.out" 2>/dev/null
+collect_malformed=$?
+set -e
+test "$collect_malformed" -eq 2; check
+test ! -s "$work/collect-malformed.out"; check
+in_spool kept status --json | jq -e '. == {pending:1,leased:1,done:1,failed:2}' >/dev/null; check
+collect_ids kept r-done r-failed r-pending r-leased r-never r-done > "$work/collect.out"
+jq -s -e '. == [ {task_id:"r-done", status:"collected"}
+               , {task_id:"r-failed", status:"collected"}
+               , {task_id:"r-pending", status:"not_finished"}
+               , {task_id:"r-leased", status:"not_finished"}
+               , {task_id:"r-never", status:"unknown"}
+               , {task_id:"r-done", status:"unknown"} ]' "$work/collect.out" >/dev/null; check
+in_spool kept status --json | jq -e '. == {pending:1,leased:1,done:0,failed:0}' >/dev/null; check
+in_spool kept results | jq -s -e 'length == 0' >/dev/null; check
+in_spool kept failures | jq -s -e 'length == 0' >/dev/null; check
+test -z "$(find "$work/kept/done" "$work/kept/results" "$work/kept/failed" "$work/kept/.task-cleanup" -type f)"; check
+test -f "$work/kept/pending/r-pending.json"; check
+# An acknowledgement repeated after its task was collected has nothing to
+# be compared with, and is stale.
+set +e
+ack_one kept r-done "$kept_done_lease" > "$work/collected-ack.out" 2>/dev/null
+collected_ack=$?
+set -e
+test "$collected_ack" -eq 4; check
+jq -e '.status == "stale"' "$work/collected-ack.out" >/dev/null; check
+# The dedupe window is the retention window: put again, a collected task is
+# a new task.
+put_one kept r-done | jq -e '.status == "inserted"' >/dev/null; check
+put_one kept r-failed | jq -e '.status == "inserted"' >/dev/null; check
+# A task that is pending again after a retried failure keeps its history.
+ack_one kept r-leased "$kept_leased_lease" | jq -e '.status == "acked"' >/dev/null; check
+in_spool kept lease --worker keeper --count 3 > "$work/kept-leases.jsonl"
+retrying_lease=$(jq -r 'select(.task_id == "r-done").lease_id' "$work/kept-leases.jsonl")
+fail_one kept r-done "$retrying_lease" >/dev/null
+collect_ids kept r-done r-leased > "$work/collect-retrying.out"
+jq -s -e '. == [ {task_id:"r-done", status:"not_finished"}
+               , {task_id:"r-leased", status:"collected"} ]' "$work/collect-retrying.out" >/dev/null; check
+in_spool kept failures | jq -s -e 'length == 1 and .[0].task_id == "r-done" and .[0].retried' >/dev/null; check
+
+# gc deletes the finished tasks that finished at least so long ago, oldest
+# first, and never a pending or leased task, whatever its history. Times
+# are made by editing the real records against a now computed here.
+in_spool aging init
+put_one aging a-new >/dev/null
+a_new_lease=$(lease_one aging)
+ack_one aging a-new "$a_new_lease" >/dev/null
+put_one aging a-old >/dev/null
+a_old_lease=$(lease_one aging)
+ack_one aging a-old "$a_old_lease" >/dev/null
+put_one aging f-old >/dev/null
+f_old_lease=$(lease_one aging)
+fail_one aging f-old "$f_old_lease" --no-retry >/dev/null
+put_one aging l-old >/dev/null
+lease_one aging >/dev/null
+put_one aging z-retrying >/dev/null
+z_lease=$(lease_one aging)
+fail_one aging z-retrying "$z_lease" >/dev/null
+age_record "$work/aging/results/$a_new_lease.json" finished_at 60
+age_record "$work/aging/results/$a_old_lease.json" finished_at 3600
+age_record "$work/aging/failed/$f_old_lease.json" failed_at 3000
+age_record "$work/aging/failed/$z_lease.json" failed_at 7200
+in_spool aging gc --older-than 1800 > "$work/gc.out"
+jq -s -e '. == [ {task_id:"a-old", status:"expired"}
+               , {task_id:"f-old", status:"expired"} ]' "$work/gc.out" >/dev/null; check
+in_spool aging status --json | jq -e '. == {pending:1,leased:1,done:1,failed:1}' >/dev/null; check
+in_spool aging results | jq -s -e 'map(.task_id) == ["a-new"]' >/dev/null; check
+in_spool aging failures | jq -s -e 'map(.task_id) == ["z-retrying"]' >/dev/null; check
+test -z "$(records_of aging a-old)$(records_of aging f-old)"; check
+in_spool aging gc --older-than 1800 > "$work/gc-again.out"
+test ! -s "$work/gc-again.out"; check
+put_one aging a-old | jq -e '.status == "inserted"' >/dev/null; check
+in_spool aging gc --older-than 0 | jq -s -e '. == [{task_id:"a-new", status:"expired"}]' >/dev/null; check
+in_spool aging status --json | jq -e '. == {pending:2,leased:1,done:0,failed:1}' >/dev/null; check
+expect_exit 2 in_spool aging gc --older-than -1
+expect_exit 2 in_spool aging gc
+
+# put reads no done task but the one under its own ID: its cost does not
+# grow with history. Every other done file is unreadable here, so a put
+# that read one would fail; acknowledging, and repeating one, read none.
+in_spool bomb init
+for name in b-one b-two b-three; do
+  put_one bomb "$name" >/dev/null
+  ack_one bomb "$name" "$(lease_one bomb)" >/dev/null
+done
+chmod 000 "$work/bomb/done/b-one.json" "$work/bomb/done/b-three.json"
+test ! -r "$work/bomb/done/b-one.json"; check
+put_one bomb b-four | jq -e '.status == "inserted"' >/dev/null; check
+put_one bomb b-two | jq -e '.status == "existing"' >/dev/null; check
+b_four_lease=$(lease_one bomb)
+ack_one bomb b-four "$b_four_lease" | jq -e '.status == "acked"' >/dev/null; check
+ack_one bomb b-four "$b_four_lease" | jq -e '.status == "already_done"' >/dev/null; check
+chmod 644 "$work/bomb/done/b-one.json" "$work/bomb/done/b-three.json"
+
+# Deleting a task is committed by its marker and finished by recovery. Each
+# step is made to fail on the real writer by refusing writes to the
+# directory it changes: the command fails, and the next command finishes
+# what the marker committed.
+in_spool crash init
+mkdir "$work/refused"
+chmod 555 "$work/refused"
+if touch "$work/refused/probe" 2>/dev/null; then
+  echo "test.sh: a refused write was allowed; do not run this suite as root" >&2
+  exit 1
+fi
+check
+chmod 755 "$work/refused"
+for step in done results failed; do
+  finish_with_history crash "c-$step" >/dev/null
+  chmod 555 "$work/crash/$step"
+  expect_exit 75 collect_ids crash "c-$step"
+  chmod 755 "$work/crash/$step"
+  test -e "$work/crash/.task-cleanup/c-$step"; check
+  in_spool crash status >/dev/null
+  test ! -e "$work/crash/.task-cleanup/c-$step"; check
+  test ! -e "$work/crash/done/c-$step.json"; check
+  test -z "$(records_of crash "c-$step")"; check
+  collect_ids crash "c-$step" | jq -e '.status == "unknown"' >/dev/null; check
+done
+# Before the marker, nothing has happened.
+finish_with_history crash c-marker >/dev/null
+chmod 555 "$work/crash/.task-cleanup"
+expect_exit 75 collect_ids crash c-marker
+chmod 755 "$work/crash/.task-cleanup"
+test -f "$work/crash/done/c-marker.json"; check
+in_spool crash results | jq -s -e 'map(select(.task_id == "c-marker")) | length == 1' >/dev/null; check
+in_spool crash failures | jq -s -e 'map(select(.task_id == "c-marker")) | length == 1' >/dev/null; check
+collect_ids crash c-marker | jq -e '.status == "collected"' >/dev/null; check
+# Removing the marker is the last step, and recovery repeats it.
+finish_with_history crash c-last >/dev/null
+chmod 555 "$work/crash/done"
+expect_exit 75 collect_ids crash c-last
+chmod 755 "$work/crash/done"
+chmod 555 "$work/crash/.task-cleanup"
+expect_exit 75 in_spool crash status
+chmod 755 "$work/crash/.task-cleanup"
+test -e "$work/crash/.task-cleanup/c-last"; check
+test ! -e "$work/crash/done/c-last.json"; check
+test -z "$(records_of crash c-last)"; check
+in_spool crash status --json | jq -e '. == {pending:0,leased:0,done:0,failed:0}' >/dev/null; check
+test ! -e "$work/crash/.task-cleanup/c-last"; check
+
+# A spool written by 0.0.2 files a done task under the lease that finished
+# it. The fixture is such a spool, made by scripts/make-layout-fixture.sh
+# running the 0.0.2 binary; the first command migrates it.
+mkdir "$work/migrated"
+tar -xf "$here/test/fixtures/spool-0.0.2-layout.tar" -C "$work/migrated"
+test ! -e "$work/migrated/.spool-layout"; check
+test "$(find "$work/migrated/done" -name 'lease_*' | wc -l | tr -d ' ')" = 3; check
+in_spool migrated status --json | jq -e '. == {pending:1,leased:1,done:3,failed:2}' >/dev/null; check
+test -f "$work/migrated/.spool-layout"; check
+test "$(cd "$work/migrated/done" && ls | tr '\n' ' ')" = "lease_1_2_x.json m-done.json m-retried.json "; check
+# An equal task is still a repeat, and a different one a conflict.
+printf '%s\n' '{"task_id":"m-done","capability":"fixture@1","payload":{"for":"m-done"}}' \
+  | in_spool migrated put | jq -e '.status == "existing"' >/dev/null; check
+printf '%s\n' '{"task_id":"lease_1_2_x","capability":"fixture@1","payload":{"for":"lease_1_2_x"}}' \
+  | in_spool migrated put | jq -e '.status == "existing"' >/dev/null; check
+set +e
+printf '%s\n' '{"task_id":"m-done","capability":"fixture@1","payload":{}}' \
+  | in_spool migrated put >/dev/null 2>&1
+migrated_conflict=$?
+set -e
+test "$migrated_conflict" -eq 3; check
+# The acknowledgement that finished a task is still answered as a repeat,
+# and the lease in flight is acknowledged and filed under its task.
+m_done_lease=$(in_spool migrated results | jq -r 'select(.task_id == "m-done").lease_id')
+jq -nc --arg lease "$m_done_lease" '{task_id:"m-done",lease_id:$lease,result:{done:"m-done"}}' \
+  | in_spool migrated ack | jq -e '.status == "already_done"' >/dev/null; check
+m_leased_lease=$(basename "$(find "$work/migrated/leased" -name '*.json')" .json)
+ack_one migrated m-leased "$m_leased_lease" | jq -e '.status == "acked"' >/dev/null; check
+test -f "$work/migrated/done/m-leased.json"; check
+collect_ids migrated m-done m-pending | jq -s -e \
+  '. == [{task_id:"m-done", status:"collected"}, {task_id:"m-pending", status:"not_finished"}]' >/dev/null; check
+in_spool migrated gc --older-than 0 | jq -s -e \
+  'map(.task_id) | sort == ["lease_1_2_x","m-failed","m-leased","m-retried"]' >/dev/null; check
+in_spool migrated status --json | jq -e '. == {pending:1,leased:0,done:0,failed:0}' >/dev/null; check
+# What a file holds decides, so a migration run again renames nothing, not
+# even the task whose ID looks like a lease's.
+mkdir "$work/migrated-again"
+tar -xf "$here/test/fixtures/spool-0.0.2-layout.tar" -C "$work/migrated-again"
+in_spool migrated-again status >/dev/null
+rm -f "$work/migrated-again/.spool-layout"
+in_spool migrated-again status >/dev/null
+test "$(cd "$work/migrated-again/done" && ls | tr '\n' ' ')" = "lease_1_2_x.json m-done.json m-retried.json "; check
+# A layout this binary does not know is corrupt state.
+printf 'unknown\n' > "$work/migrated-again/.spool-layout"
+expect_exit 70 in_spool migrated-again status
 
 # results and failures are listed oldest first, by when each was recorded.
 # The leases are resolved in the reverse of the order they were taken, so the
