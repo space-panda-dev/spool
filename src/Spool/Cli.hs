@@ -11,6 +11,9 @@ module Spool.Cli
   ) where
 
 import qualified Data.Text as T
+import Data.Maybe (fromMaybe)
+import Spool.Worker.Config (maxDelaySeconds)
+import Spool.Worker.Follow (defaultIdleSeconds)
 import Spool.Types
   ( Retry (..)
   , StatusFormat (..)
@@ -24,8 +27,11 @@ import Spool.Types
 -- makes, so that no executable runs while it is held.
 data Command
   = Store StoreCommand
-  | Work WorkerName FilePath (Maybe Int)
-  | WorkVia [String] FilePath (Maybe Int)
+  | Work WorkerName FilePath (Maybe Int) (Maybe Int)
+    -- ^ The last field is the longest a worker that follows its spool
+    -- waits between two leases; a worker that does not follow stops once
+    -- nothing is pending.
+  | WorkVia [String] FilePath (Maybe Int) (Maybe Int)
     -- ^ A worker on another machine: the transport command's words, to
     -- which one remote word is appended for each request.
   | WorkShow FilePath
@@ -92,26 +98,57 @@ parseSubcommand ("work" : "--config" : configPath : "--show" : []) =
 parseSubcommand ("work" : "--show" : "--config" : configPath : []) =
   Right (WorkShow configPath)
 parseSubcommand ("work" : rest) = do
-  (worker, configPath, maxTasks) <- parseWorkArgs rest
-  Right (Work worker configPath maxTasks)
+  (follow, others) <- followArgs rest
+  (worker, configPath, maxTasks) <- parseWorkArgs others
+  Right (Work worker configPath maxTasks follow)
 parseSubcommand _ = Left usageText
 
 -- | The form that needs no spool directory: a worker reaching its spool
 -- through a transport command.  The command is one word, split on single
 -- spaces into a program and its arguments.
 parseWorkVia :: [String] -> Either String Command
-parseWorkVia = go Nothing Nothing Nothing
+parseWorkVia args = do
+  (follow, others) <- followArgs args
+  go follow Nothing Nothing Nothing others
   where
-    go (Just via) (Just c) mt [] = Right (WorkVia via c mt)
-    go _ _ _ [] = Left "spool: work --via requires --via COMMAND and --config FILE"
-    go _ c mt ("--via" : value : rest) = case words value of
+    go f (Just via) (Just c) mt [] = Right (WorkVia via c mt f)
+    go _ _ _ _ [] = Left "spool: work --via requires --via COMMAND and --config FILE"
+    go f _ c mt ("--via" : value : rest) = case words value of
       [] -> Left "spool: --via requires a non-empty command"
-      transport -> go (Just transport) c mt rest
-    go v _ mt ("--config" : value : rest) = go v (Just value) mt rest
-    go v c _ ("--max-tasks" : value : rest) = case reads value of
-      [(number, "")] | number > 0 -> go v c (Just number) rest
+      transport -> go f (Just transport) c mt rest
+    go f v _ mt ("--config" : value : rest) = go f v (Just value) mt rest
+    go f v c _ ("--max-tasks" : value : rest) = case reads value of
+      [(number, "")] | number > 0 -> go f v c (Just number) rest
       _ -> Left "spool: --max-tasks requires a positive integer"
-    go _ _ _ _ = Left usageText
+    go _ _ _ _ _ = Left usageText
+
+-- | Take the words that make a worker follow its spool out of a work
+-- command line, and leave the rest: the longest wait between two leases, or
+-- nothing for a worker that stops once nothing is pending. A word that is
+-- the value of another option is that option's, whatever it says.
+followArgs :: [String] -> Either String (Maybe Int, [String])
+followArgs = go False Nothing []
+  where
+    go follow idle kept words' = case words' of
+      [] -> case (follow, idle) of
+        (True, _) -> Right (Just (fromMaybe defaultIdleSeconds idle), reverse kept)
+        (False, Nothing) -> Right (Nothing, reverse kept)
+        (False, Just _) -> Left "spool: --idle-seconds requires --follow"
+      "--follow" : rest | not follow -> go True idle kept rest
+      "--idle-seconds" : value : rest | idle == Nothing -> do
+        seconds <- idleSeconds value
+        go follow (Just seconds) kept rest
+      option : value : rest | option `elem` valued ->
+        go follow idle (value : option : kept) rest
+      word : rest -> go follow idle (word : kept) rest
+    valued = ["--worker", "--config", "--via", "--max-tasks"]
+    -- Read as an Integer and bounded before it is an Int, so a huge number
+    -- is refused rather than wrapped.
+    idleSeconds value = case reads value :: [(Integer, String)] of
+      [(number, "")] | number > 0 && number <= toInteger maxDelaySeconds ->
+        Right (fromInteger number)
+      _ -> Left ("spool: --idle-seconds requires a positive integer no greater than "
+        <> show maxDelaySeconds)
 
 store :: StoreCommand -> Either String Command
 store = Right . Store
@@ -181,4 +218,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|collect|gc --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N]\n       spool work --config FILE --show"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|collect|gc --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\nFOLLOW: --follow [--idle-seconds N]"

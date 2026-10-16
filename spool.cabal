@@ -50,6 +50,7 @@ library
     , Spool.Wire
     , Spool.Worker.Config
     , Spool.Worker.Connection
+    , Spool.Worker.Follow
     , Spool.Worker.Run
   build-depends:
       aeson      >=2.2    && <2.4
@@ -86,6 +87,7 @@ test-suite spool-test
     , Test.Cli
     , Test.Error
     , Test.Files
+    , Test.Follow
     , Test.Store
     , Test.Types
     , Test.Wire

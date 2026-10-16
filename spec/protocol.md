@@ -139,8 +139,8 @@ spool --dir DIR reclaim --older-than SECONDS
 spool --dir DIR collect < tasks.jsonl
 spool --dir DIR gc --older-than SECONDS
 spool --dir DIR status [--json]
-spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
-spool work --via COMMAND --config FILE [--max-tasks N]
+spool --dir DIR work --worker WORKER --config FILE [--max-tasks N] [--follow [--idle-seconds N]]
+spool work --via COMMAND --config FILE [--max-tasks N] [--follow [--idle-seconds N]]
 spool work --config FILE --show
 ```
 
@@ -409,7 +409,8 @@ a program's exit and output.
 
 A request the transport cannot carry, or that the spool denies, ends the
 worker with the status the spool gave, or 75 when the transport itself
-failed. Leases it held stand, for `reclaim` to return.
+failed. Leases it held stand, for `reclaim` to return. A worker that follows
+its spool (below) asks again after a lease that failed with 75.
 
 ### Reclaim driver
 
@@ -519,8 +520,9 @@ program that exits leaving a process behind, holding its output open, has
 not ended: 5 seconds after the program exits, whatever is left of its
 process group is sent SIGKILL and the run is a failure, retried.
 
-`work` sent SIGTERM stops: it leases nothing more, every run is killed as
-above, each run's working directory is deleted, and `work` exits 143. It
+`work` sent SIGTERM stops, whether it is running tasks or waiting for one:
+it leases nothing more, every run is killed as above, each run's working
+directory is deleted, and `work` exits 143. It
 reports nothing for the tasks it was running. Their leases stand, for
 `reclaim` to return.
 
@@ -530,3 +532,22 @@ directory before starting the capability. It attempts to delete that entire
 directory after the program exits. The spool keeps attachments across retry
 and reclaim, and deletes them when `ack` or `fail --no-retry` resolves the
 task.
+
+### Following a spool
+
+Under [ADR 0019](../docs/decisions/0019-a-worker-may-follow-its-spool.md),
+`work` stops once a lease finds nothing pending, unless it is given
+`--follow`. A worker that follows its spool waits and leases again instead,
+until it has started `--max-tasks` tasks or is sent SIGTERM. The first wait
+is 1 second; each wait after an empty lease is twice the one before, up to
+`--idle-seconds N`, a whole number of seconds from 1 through 9223372036854,
+30 when it is not given. A task leased starts the waits again from 1 second.
+`--idle-seconds` without `--follow` is malformed input, exit 2.
+
+A lease that fails with 75, because the transport could not carry it or the
+spool could not answer it, is said on stderr and asked again after a wait on
+the same schedule, without limit. Any other failure of a lease, such as a
+denied grant (5), ends the worker with that status at once. A task that
+fails while a following worker runs is said on stderr when it happens and
+does not stop the worker; when the worker stops at `--max-tasks`, it exits
+with the status of the first such failure.

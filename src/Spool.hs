@@ -68,17 +68,17 @@ run args = case args of
   ("work" : rest) | "--via" `elem` rest && "--dir" `notElem` args -> do
     command <- either (throwIO . Usage) pure (parseWorkVia rest)
     case command of
-      WorkVia (program : arguments) configPath maxTasks ->
-        runWork (remoteConnection program arguments) configPath maxTasks
+      WorkVia (program : arguments) configPath maxTasks follow ->
+        runWork (remoteConnection program arguments) configPath maxTasks follow
       _ -> throwIO (Usage "spool: --via requires a non-empty command")
   _ -> do
     (directory, command) <- either (throwIO . Usage) pure (parseCommand args)
     case command of
-      Work worker configPath maxTasks -> do
+      Work worker configPath maxTasks follow -> do
         paths <- openSpool directory
         initialise paths
         withLock paths (recover paths)
-        runWork (localConnection paths worker) configPath maxTasks
+        runWork (localConnection paths worker) configPath maxTasks follow
       WorkVia {} -> throwIO (Usage "spool: work --via takes no --dir")
       WorkShow configPath -> runWorkShow configPath
       Store transition -> withStore directory (runStoreCommand transition)
