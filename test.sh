@@ -27,7 +27,7 @@ if [[ -z ${SPOOL:-} ]]; then
     "$here/app/Main.hs" >/dev/null
 fi
 test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
-test "$($spool_binary --version)" = "spool 0.0.2"; check
+test "$($spool_binary --version)" = "spool 0.0.3"; check
 
 # Files the suite reads, beside it or where the flake check puts them.
 fixtures=${SPOOL_FIXTURES:-$here/test/fixtures}
@@ -2374,4 +2374,104 @@ check
 # --idle-seconds belongs to --follow.
 expect_exit 2 spoolfo work --worker w --config "$work/follow-config.json" --idle-seconds 5
 
-printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits, following workers (%d checks)\n' "$checks"
+#############################################################################
+# The three decisions together: a task's attempts (ADR 0017), retention
+# (ADR 0018), and a worker that follows its spool (ADR 0019).
+#############################################################################
+
+# lease_fail DIR TASK: lease TASK, fail it with retry, print the answer.
+lease_fail() {
+  local lease
+  lease=$(in_spool "$1" lease --worker together | jq -r --arg task "$2" 'select(.task_id == $task) | .lease_id')
+  test -n "$lease"
+  jq -nc --arg task "$2" --arg lease "$lease" '{task_id:$task,lease_id:$lease,reason:"again"}' \
+    | in_spool "$1" fail | jq -r '.status'
+}
+# lease_reclaim DIR TASK: lease TASK, reclaim it at once, print the answer.
+lease_reclaim() {
+  in_spool "$1" lease --worker together | jq -e --arg task "$2" '.task_id == $task' >/dev/null
+  in_spool "$1" reclaim --older-than 0 | jq -r --arg task "$2" 'select(.task_id == $task) | .status'
+}
+attempts_of() { in_spool "$1" failures | jq -s --arg task "$2" 'map(select(.task_id == $task)) | length'; }
+
+# Collecting a task forgets its attempts with it: a task done after two
+# retried failures, collected, and put again has three attempts again.
+in_spool together init
+put_one together t-collected >/dev/null
+test "$(lease_fail together t-collected)" = "failed_retry"; check
+test "$(lease_fail together t-collected)" = "failed_retry"; check
+ack_one together t-collected "$(lease_one together)" | jq -e '.status == "acked"' >/dev/null; check
+put_one together t-collected | jq -e '.status == "existing"' >/dev/null; check
+collect_ids together t-collected | jq -e '.status == "collected"' >/dev/null; check
+put_one together t-collected | jq -e '.status == "inserted"' >/dev/null; check
+test "$(lease_fail together t-collected)" = "failed_retry"; check
+test "$(lease_fail together t-collected)" = "failed_retry"; check
+test "$(lease_fail together t-collected)" = "failed"; check
+
+# A task the cap failed by reclaims is finished, so gc ages it out with
+# every record of its attempts, and put again it has three attempts again.
+in_spool cap-gc init
+put_one cap-gc t-reclaimed >/dev/null
+test "$(lease_reclaim cap-gc t-reclaimed)" = "reclaimed"; check
+test "$(lease_reclaim cap-gc t-reclaimed)" = "reclaimed"; check
+test "$(lease_reclaim cap-gc t-reclaimed)" = "failed"; check
+in_spool cap-gc status --json | jq -e '. == {pending:0,leased:0,done:0,failed:3}' >/dev/null; check
+in_spool cap-gc gc --older-than 0 | jq -s -e '. == [{task_id:"t-reclaimed", status:"expired"}]' >/dev/null; check
+test "$(attempts_of cap-gc t-reclaimed)" -eq 0; check
+put_one cap-gc t-reclaimed | jq -e '.status == "inserted"' >/dev/null; check
+test "$(lease_reclaim cap-gc t-reclaimed)" = "reclaimed"; check
+test "$(attempts_of cap-gc t-reclaimed)" -eq 1; check
+
+# After the cap fails a task by reclaims and the task is collected, nothing
+# of it is left: failures lists none of its attempts, and status counts
+# none of them, as it counts only what the spool holds.
+in_spool cap-collect init
+put_one cap-collect t-counted >/dev/null
+put_one cap-collect u-waiting >/dev/null
+for attempt in 1 2 3; do
+  in_spool cap-collect lease --worker together | jq -e '.task_id == "t-counted"' >/dev/null
+  # Only t-counted is leased, so only it is reclaimed.
+  in_spool cap-collect reclaim --older-than 0 >/dev/null
+done
+in_spool cap-collect failures | jq -s -e 'map(.retried) == [true, true, false]' >/dev/null; check
+in_spool cap-collect status --json | jq -e '. == {pending:1,leased:0,done:0,failed:3}' >/dev/null; check
+collect_ids cap-collect t-counted u-waiting | jq -s -e \
+  '. == [{task_id:"t-counted", status:"collected"}, {task_id:"u-waiting", status:"not_finished"}]' >/dev/null; check
+test -z "$(in_spool cap-collect failures)"; check
+in_spool cap-collect status --json | jq -e '. == {pending:1,leased:0,done:0,failed:0}' >/dev/null; check
+collect_ids cap-collect t-counted | jq -e '.status == "unknown"' >/dev/null; check
+
+# A following worker does not loop on a task that can never succeed: the
+# cap fails one that always crashes after three runs, exit 65 fails one
+# after one, and then the worker waits, running nothing more.
+in_spool follow-cap init
+jq -nc --arg crash "$bin/crash-three" --arg hopeless "$bin/hopeless" --arg path "$worker_path" \
+  '{max_concurrent: 1, renew_seconds: 30, env: {PATH: $path},
+    capabilities: {
+      "crash@1": {exec: $crash, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096},
+      "hopeless@1": {exec: $hopeless, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096}}}' \
+  > "$work/follow-cap.json"
+printf '%s\n%s\n' '{"task_id":"crashes","capability":"crash@1","payload":{}}' \
+  '{"task_id":"hopeless","capability":"hopeless@1","payload":{}}' | in_spool follow-cap put >/dev/null
+"$spool_binary" --dir "$work/follow-cap" work --worker follower --config "$work/follow-cap.json" \
+  --follow --idle-seconds 1 2>"$work/follow-cap.stderr" &
+cap_follower=$!
+both_finished() {
+  in_spool follow-cap failures | jq -s -e '
+    (map(select(.task_id == "crashes")) | map(.retried)) == [true, true, false] and
+    (map(select(.task_id == "hopeless")) | map(.retried)) == [false]' >/dev/null
+}
+eventually both_finished; check
+# Two more empty leases, at 1 s and 2 s, and still nothing more is run.
+sleep 2.5
+both_finished; check
+in_spool follow-cap status --json | jq -e '. == {pending:0,leased:0,done:0,failed:4}' >/dev/null; check
+kill -0 "$cap_follower"; check
+kill -TERM "$cap_follower"
+set +e
+wait "$cap_follower"
+cap_follower_exit=$?
+set -e
+test "$cap_follower_exit" -eq 143; check
+
+printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits, following workers, attempts with retention (%d checks)\n' "$checks"
