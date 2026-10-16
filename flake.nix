@@ -80,10 +80,11 @@
               pkgs.findutils
               pkgs.gnugrep
               pkgs.gnused
+              pkgs.gnutar
               pkgs.jq
             ];
           } ''
-            SPOOL=${spool}/bin/spool \
+            SPOOL=${spool}/bin/spool SPOOL_FIXTURES=${./test/fixtures} \
               ${pkgs.bash}/bin/bash ${./test.sh}
             touch "$out"
           '';

@@ -40,6 +40,8 @@ module Spool.Store
   , fetchAttachment
   , fetchFor
   , reclaimTasks
+  , collectTasks
+  , gcTasks
   , statusTasks
   ) where
 
@@ -50,10 +52,12 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.List (sortOn)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (listToMaybe)
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Time (getCurrentTime)
+import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import System.Directory (listDirectory)
 import System.FilePath (takeBaseName, (</>))
 import System.IO (IOMode (ReadMode), withBinaryFile)
@@ -74,6 +78,10 @@ import Spool.Files
   , Paths
   , atomicCreate
   , attachmentCleanupDir
+  , createMarker
+  , layoutPath
+  , taskCleanupDir
+  , taskCleanupPath
   , attachmentsDir
   , doneDir
   , failedDir
@@ -104,6 +112,7 @@ import Spool.Files
 import Spool.Input
   ( inputLines
   , parseAckLine
+  , parseCollectLine
   , parseFailLine
   , parseLeaseRefLine
   , parseTaskLine
@@ -116,6 +125,7 @@ import Spool.Types
   , TaskId
   , WorkerName
   , leaseIdText
+  , leaseSerialAndTask
   , leaseStarted
   , mkLeaseId
   , mkTaskId
@@ -123,11 +133,13 @@ import Spool.Types
   , newLeaseId
   , taskIdText
   , timestamp
+  , timestampTime
   , workerNameText
   )
 import Spool.Wire
   ( Ack (..)
   , AckStatus (..)
+  , CollectStatus (..)
   , Counts (..)
   , FailRequest (..)
   , FailureRecord (..)
@@ -139,6 +151,8 @@ import Spool.Wire
   , Task (..)
   , encode
   , encodeAckResult
+  , encodeCollectResult
+  , encodeExpiredResult
   , encodeFailResult
   , encodePutResult
   , encodeReclaimResult
@@ -162,7 +176,9 @@ withStore directory action = do
 -- compliant put or resolution.
 recover :: Paths -> IO ()
 recover paths = do
+  migrateLayout paths
   finishCommitted paths
+  finishTaskCleanup paths
   recoverAttachmentState paths
 
 -- | Finish every transition whose record is written and whose lease still
@@ -257,12 +273,14 @@ data Found
   | OtherTask  -- ^ the identifier, with different content
   deriving (Eq, Show)
 
--- | The leased and done directories are intentionally scanned because their
--- filenames are coordination tokens, not task ids.
+-- | A pending or done task is looked up under its own identifier, and no
+-- other done task is read, so a put costs no more as history grows. The
+-- leased directory is scanned, because a lease is filed under its own
+-- identifier; it holds only the leases in flight.
 findTask :: Paths -> Task -> IO (Maybe Found)
 findTask paths wanted = do
   pending <- comparePath (pendingPath paths (taskId wanted)) wanted
-  done <- compareFiles (doneDir paths) wanted
+  done <- comparePath (donePath paths (taskId wanted)) wanted
   leased <- compareFiles (leasedDir paths) wanted
   pure (listToMaybe [found | Just found <- [pending, done, leased]])
 
@@ -483,34 +501,32 @@ ackOne paths (LeaseRef ident leaseIdent) output = do
           case stored of
             Left failure -> pure (Left failure)
             Right () -> Right Acked <$ completeAck paths task leaseIdent
-    else do
-      done <- findDoneLease paths ident leaseIdent
-      doneResult paths leaseIdent output done
+    else repeatedAck paths ident leaseIdent output
 
--- | The steps after an ack's commit: the lease moves to done, its sidecars
--- go, and the task's attachments go.
+-- | An ack for a lease that is no longer in flight, answered from that
+-- lease's own result record alone: the same result is already done, and
+-- anything else is stale, an ack whose task has been collected included.
+repeatedAck :: Paths -> TaskId -> LeaseId -> A.Value -> IO (Either SpoolError AckStatus)
+repeatedAck paths ident leaseIdent output = do
+  let path = resultPath paths leaseIdent
+  present <- fileExists path
+  if not present
+    then pure (Left (stale "lease is unknown or stale"))
+    else do
+      stored <- readResultRecordFile path
+      pure $ if resultTask stored /= ident
+        then Left (stale "lease does not belong to task_id")
+        else if resultValue stored == output
+          then Right AlreadyDone
+          else Left (stale "ack result differs from completed result")
+
+-- | The steps after an ack's commit: the lease moves to done, filed under
+-- its task, its sidecars go, and the task's attachments go.
 completeAck :: Paths -> Task -> LeaseId -> IO ()
 completeAck paths task leaseIdent = do
-  syncedRename (leasedPath paths leaseIdent) (donePath paths leaseIdent)
+  syncedRename (leasedPath paths leaseIdent) (donePath paths (taskId task))
   removeSidecars paths leaseIdent
   tombstoneAndDelete paths (taskId task)
-
--- | How a task that is done relates to the lease a caller named.
-data DoneUnder
-  = ThisLease     -- ^ it was done under that lease
-  | AnotherLease  -- ^ it was done under a later one
-  deriving (Eq, Show)
-
-doneResult :: Paths -> LeaseId -> A.Value -> Maybe DoneUnder
-           -> IO (Either SpoolError AckStatus)
-doneResult paths leaseIdent output done = case done of
-  Just ThisLease -> do
-    same <- completedResultMatches paths leaseIdent output
-    pure $ if same
-      then Right AlreadyDone
-      else Left (stale "ack result differs from completed result")
-  Just AnotherLease -> pure (Left (stale "lease is stale"))
-  Nothing -> pure (Left (stale "lease is unknown or stale"))
 
 completedResultMatches :: Paths -> LeaseId -> A.Value -> IO Bool
 completedResultMatches paths leaseIdent output = do
@@ -520,17 +536,6 @@ completedResultMatches paths leaseIdent output = do
     ("completed lease has no result: " <> showLease leaseIdent)))
   stored <- readResultRecordFile path
   pure (resultValue stored == output)
-
-findDoneLease :: Paths -> TaskId -> LeaseId -> IO (Maybe DoneUnder)
-findDoneLease paths ident leaseIdent = do
-  files <- jsonFiles (doneDir paths)
-  matches <- forM files $ \path -> do
-    task <- readTaskFile path
-    pure $ if taskId task /= ident then Nothing
-      else Just (if takeBaseName path == showLease leaseIdent
-        then ThisLease
-        else AnotherLease)
-  pure (listToMaybe [found | Just found <- matches])
 
 renewTasks :: Paths -> IO ()
 renewTasks paths =
@@ -795,6 +800,166 @@ abandonLease paths reason leasedFile leaseIdent = do
       either throwIO pure stored
       completeFail paths task leaseIdent retry
       pure (taskId task, retry)
+
+-- Retention (ADR 0018). A finished task is a done task, or one whose latest
+-- failure was final. It is kept until whoever put it collects it, or until
+-- gc finds it older than it was asked to keep, and then it goes with its
+-- result and every failure record.
+
+-- | The layout this binary keeps: each done task filed under its task ID.
+currentLayout :: BL.ByteString
+currentLayout = "1\n"
+
+-- | Bring a spool written before ADR 0018 into the current layout, and
+-- refuse one in a layout this binary does not know. A done task was filed
+-- under the lease that finished it. What each file holds decides where it
+-- goes, because a task ID may itself look like a lease ID. Each rename is
+-- whole and the layout is written last, so a migration that is interrupted
+-- runs again and finds less to do.
+migrateLayout :: Paths -> IO ()
+migrateLayout paths = do
+  let marker = layoutPath paths
+  present <- fileExists marker
+  if present
+    then do
+      layout <- readWhole marker
+      unless (layout == currentLayout) (throwIO (corrupt
+        ("unknown spool layout in " <> marker)))
+    else do
+      files <- jsonFiles (doneDir paths)
+      forM_ files $ \path -> do
+        task <- readTaskFile path
+        let target = donePath paths (taskId task)
+        unless (path == target) $ do
+          taken <- fileExists target
+          if not taken
+            then syncedRename path target
+            else do
+              same <- equalTaskFile target task
+              unless same (throwIO (corrupt
+                ("two done tasks differ under " <> showTask (taskId task))))
+              syncedRemove path
+      _ <- atomicCreate marker currentLayout
+      pure ()
+
+-- | Finish every deletion whose marker was made.
+finishTaskCleanup :: Paths -> IO ()
+finishTaskCleanup paths = do
+  names <- listDirectory (taskCleanupDir paths)
+  unless (null names) $ do
+    results <- filedUnderTasks (resultsDir paths)
+    failures <- filedUnderTasks (failedDir paths)
+    forM_ names $ \name -> case mkTaskId (T.pack name) of
+      Left _ -> throwIO (corrupt ("unexpected entry in task cleanup: " <> name))
+      Right ident ->
+        removeTask paths ident (filedUnder results ident <> filedUnder failures ident)
+
+-- | The records in a directory filed under leases, by the task each lease
+-- was on, found from their names alone: a lease this spool made is named
+-- for its task.
+filedUnderTasks :: FilePath -> IO (Map.Map TaskId [FilePath])
+filedUnderTasks directory = do
+  files <- jsonFiles directory
+  owned <- forM files $ \path -> do
+    leaseIdent <- leaseIdOfFile path
+    case leaseSerialAndTask leaseIdent of
+      Just (_, ident) -> pure (ident, [path])
+      Nothing -> throwIO (corrupt
+        ("record is not filed under a lease this spool made: " <> path))
+  pure (Map.fromListWith (flip (<>)) owned)
+
+filedUnder :: Map.Map TaskId [FilePath] -> TaskId -> [FilePath]
+filedUnder index ident = Map.findWithDefault [] ident index
+
+-- | Delete a finished task. Making its marker is the commit: from then on
+-- recovery finishes the deletion, however much of it a crash left undone.
+retire :: Paths -> TaskId -> [FilePath] -> IO ()
+retire paths ident records = do
+  createMarker (taskCleanupPath paths ident)
+  removeTask paths ident records
+
+-- | The steps after the marker: the done file, then the records, then the
+-- marker itself, each removal synced.
+removeTask :: Paths -> TaskId -> [FilePath] -> IO ()
+removeTask paths ident records = do
+  ignoreMissing (syncedRemove (donePath paths ident))
+  mapM_ (ignoreMissing . syncedRemove) records
+  syncedRemove (taskCleanupPath paths ident)
+
+collectTasks :: Paths -> IO ()
+collectTasks paths = do
+  idents <- inputLines >>= mapM parseCollectLine
+  forM_ idents $ \ident -> do
+    status <- collectOne paths ident
+    BLC.putStrLn (encodeCollectResult ident status)
+
+-- | Delete a finished task now, because whoever put it has read what came
+-- of it. A task still pending or leased is left whole, and its history of
+-- retried failures with it.
+collectOne :: Paths -> TaskId -> IO CollectStatus
+collectOne paths ident = do
+  pending <- fileExists (pendingPath paths ident)
+  leased <- elem ident <$> activeTaskIds paths
+  if pending || leased
+    then pure NotFinished
+    else do
+      done <- fileExists (donePath paths ident)
+      results <- (`filedUnder` ident) <$> filedUnderTasks (resultsDir paths)
+      failures <- (`filedUnder` ident) <$> filedUnderTasks (failedDir paths)
+      forM_ results $ \path -> readResultRecordFile path >>= named path . resultTask
+      forM_ failures $ \path -> readFailureRecordFile path >>= named path . failureTask
+      if done || not (null results) || not (null failures)
+        then Collected <$ retire paths ident (results <> failures)
+        else pure Unknown
+  where
+    named path held = unless (held == ident) (throwIO (corrupt
+      ("record filed under " <> showTask ident <> " is another task's: " <> path)))
+
+-- | Delete every finished task that finished at least this many seconds
+-- ago, oldest first. A caller runs it; nothing in Spool does.
+gcTasks :: Paths -> Integer -> IO ()
+gcTasks paths age = do
+  now <- getCurrentTime
+  finished <- finishedTasks paths
+  let expired = sortOn (\(ident, at) -> (at, ident))
+        [entry | entry@(_, at) <- finished, diffUTCTime now at >= fromInteger age]
+  results <- filedUnderTasks (resultsDir paths)
+  failures <- filedUnderTasks (failedDir paths)
+  forM_ expired $ \(ident, _) -> do
+    retire paths ident (filedUnder results ident <> filedUnder failures ident)
+    BLC.putStrLn (encodeExpiredResult ident)
+
+-- | Every finished task and when it finished: a done task when its result
+-- was recorded, a finally failed one at its latest final failure. It reads
+-- every record the spool holds, so its cost grows with what is retained.
+finishedTasks :: Paths -> IO [(TaskId, UTCTime)]
+finishedTasks paths = do
+  results <- jsonFiles (resultsDir paths) >>= mapM readResultRecordFile
+  failures <- jsonFiles (failedDir paths) >>= mapM readFailureRecordFile
+  doneIds <- jsonFiles (doneDir paths) >>= mapM taskOfFileName
+  pendingIds <- jsonFiles (pendingDir paths) >>= mapM taskOfFileName
+  leasedIds <- activeTaskIds paths
+  finishedAt <- latest [(resultTask record, resultFinishedAt record) | record <- results]
+  failedAt <- latest
+    [ (failureTask record, failureFailedAt record)
+    | record <- failures, failureRetried record == NoRetry ]
+  done <- forM doneIds $ \ident -> case Map.lookup ident finishedAt of
+    Just at -> pure (ident, at)
+    Nothing -> throwIO (corrupt ("done task has no result: " <> showTask ident))
+  let standing = Set.fromList (doneIds <> pendingIds <> leasedIds)
+  pure (done <> [entry | entry@(ident, _) <- Map.toList failedAt,
+    ident `Set.notMember` standing])
+  where
+    latest entries = Map.fromListWith max <$> forM entries (\(ident, at) ->
+      case timestampTime at of
+        Just time -> pure (ident, time)
+        Nothing -> throwIO (corrupt ("unreadable time in a record of " <> showTask ident)))
+
+-- | The task a pending or done file is filed under.
+taskOfFileName :: FilePath -> IO TaskId
+taskOfFileName path = case mkTaskId (T.pack (takeBaseName path)) of
+  Right ident -> pure ident
+  Left _ -> throwIO (corrupt ("corrupt task filename: " <> path))
 
 statusTasks :: Paths -> StatusFormat -> IO ()
 statusTasks paths format = do

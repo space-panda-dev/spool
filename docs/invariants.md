@@ -28,7 +28,10 @@ resolved, its ID cannot acknowledge, renew, or fail anything.
 
 **INV-7. Retries are idempotent.** Putting an equal task again, or repeating an
 acknowledgement, changes nothing; the same task ID with different content is a
-conflict. ([ADR 0001](decisions/0001-pull-protocol.md))
+conflict. This holds for as long as the spool keeps the task: once it is
+collected or has aged out, it is new again.
+([ADR 0001](decisions/0001-pull-protocol.md),
+[ADR 0018](decisions/0018-finished-work-is-collected-or-ages-out.md))
 
 **INV-8. Attachments live only as long as their task.** They are verified by
 digest when staged and when received. The spool deletes its copies when the

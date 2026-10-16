@@ -8,6 +8,7 @@ import Data.Either (isLeft, isRight)
 import qualified Data.Text as T
 import Spool.Types
   ( leaseIdText
+  , leaseSerialAndTask
   , leaseStarted
   , mkCapability
   , mkLeaseId
@@ -15,6 +16,9 @@ import Spool.Types
   , newLeaseId
   , mkWorkerName
   , taskIdText
+  , storedTimestamp
+  , timestamp
+  , timestampTime
   , validatePeer
   , workerNameText
   )
@@ -77,6 +81,26 @@ tests = testGroup "identifiers"
             let made = newLeaseId micros serial task
             in (mkLeaseId (leaseIdText made) === Right made)
                  .&&. (leaseStarted made === Just micros)
+  , testProperty "a lease made here gives back its serial and its task" $
+      forAll taskText $ \text (NonNegative micros) (NonNegative serial) ->
+        case mkTaskId text of
+          Left _ -> False === True
+          Right task ->
+            leaseSerialAndTask (newLeaseId micros serial task) === Just (serial, task)
+  , testCase "a task whose ID looks like a lease is read whole" $
+      fmap leaseSerialAndTask (mkLeaseId "lease_9_3_lease_1_2_x")
+        @?= Right (either (const Nothing) (Just . (,) 3) (mkTaskId "lease_1_2_x"))
+  , testGroup "a lease not made here names no task"
+      [ testCase (show text) (fmap leaseSerialAndTask (mkLeaseId text) @?= Right Nothing)
+      | text <- ["lease_x", "lease_123_task-one", "lease__1_t", "lease_1__t", "lease_1_2_"]
+      ]
+  , testCase "a time this spool writes is read back as the time it wrote" $ do
+      let written = storedTimestamp "2026-10-15T01:02:03Z"
+      fmap timestamp (timestampTime written) @?= Just written
+  , testGroup "a time this spool does not write is not read"
+      [ testCase (show text) (timestampTime (storedTimestamp text) @?= Nothing)
+      | text <- ["", "2026-10-15", "2026-10-15T01:02:03", "2026-10-15T01:02:03.5Z", "yesterday"]
+      ]
   , testGroup "a worker"
       [ testCase "is kept as given" $
           fmap workerNameText (mkWorkerName "worker-one") @?= Right "worker-one"

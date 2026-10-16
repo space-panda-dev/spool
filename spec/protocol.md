@@ -68,9 +68,9 @@ A task is **pending**, **leased**, **done**, or **failed**.
   worker.
 - `ack` with that lease ID moves it to done, carrying the task's result: any
   JSON value, `{"task_id", "lease_id", "result"}`. The result is kept with the
-  done task until whoever put the task reads it; how long after that is open.
-  Repeating an equal ack is a no-op. Repeating the task and lease with a
-  different result is a stale-lease error and cannot replace the stored result.
+  done task until the task is collected or expires (below). Repeating an
+  equal ack is a no-op. Repeating the task and lease with a different result
+  is a stale-lease error and cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
   or, with `--no-retry` or on the task's last attempt, moves it to failed. A
@@ -79,6 +79,10 @@ A task is **pending**, **leased**, **done**, or **failed**.
   and last renewal is older than that, as a failure: it records one and
   returns the task to pending, or on its last attempt leaves it failed. The
   old lease ID is dead.
+- `collect` deletes a finished task, and `gc --older-than SECONDS` every
+  finished task that finished that long ago: a done task, or one whose latest
+  failure was final, whether by `--no-retry`, by exit 65, or by its last
+  attempt; with its result and all of its failure records.
 
 Under [ADR 0017](../docs/decisions/0017-a-task-has-three-attempts.md), a task
 has at most three attempts. Every lease that ends without a result is one,
@@ -132,6 +136,8 @@ spool --dir DIR failures
 spool --dir DIR results
 spool --dir DIR fetch < attachment-request.json > attachment
 spool --dir DIR reclaim --older-than SECONDS
+spool --dir DIR collect < tasks.jsonl
+spool --dir DIR gc --older-than SECONDS
 spool --dir DIR status [--json]
 spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
 spool work --via COMMAND --config FILE [--max-tasks N]
@@ -156,8 +162,9 @@ a command given lines on stdin reads and checks every line before it acts on
 any. A malformed line is exit 2 with nothing acted on, whether it is the first
 line or the last.
 
-`put` and `reclaim` answer on stdout with one line for each task they acted
-on, in the order they acted:
+`put`, `reclaim`, and `gc` answer on stdout with one line for each task they
+acted on, in the order they acted, and `collect` with one line for each line
+it was given, in the order given:
 
 ```json
 {"task_id":"task-one","status":"inserted"}
@@ -184,11 +191,17 @@ every answer names the lease it answers:
 | `ack`, `renew`, `fail` | `stale` | nothing was done: see below |
 | `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
 | `reclaim` | `failed` | the task is failed: that was its last attempt |
+| `collect` | `collected` | the task was finished, and it and its records are gone |
+| `collect` | `not_finished` | the task is pending or leased; nothing was deleted |
+| `collect` | `unknown` | the spool holds nothing under that ID |
+| `gc` | `expired` | the task had finished long enough ago, and it and its records are gone |
 
 `stale` answers a lease that is stale, unknown, another task's, or, through
-the remote command, another worker's; and an `ack` whose result differs from
-the one already stored. The answer does not say which. The command acts on
-the lines that are not stale, and then exits 4 if any was.
+the remote command, another worker's; an `ack` whose result differs from
+the one already stored; and an `ack` repeated after its task was collected
+or expired. The answer does not say which. The command acts on the lines
+that are not stale, and then exits 4 if any was. `collect` exits 0 whatever
+it answers.
 
 `init` answers nothing.
 
@@ -207,7 +220,14 @@ line when nothing was pending:
 {"task_id":"task-one","lease_id":"lease_...","reason":"why"}
 ```
 
-`results` emits one JSON object per acknowledged task, oldest first:
+`collect` takes one line for each task:
+
+```json
+{"task_id":"task-one"}
+```
+
+`results` emits one JSON object per acknowledged task that has not been
+collected or expired, oldest first:
 
 ```json
 {"task_id":"task-one","lease_id":"lease_...","capability":"classify@1","worker":"worker-one","finished_at":"2026-09-29T12:00:00Z","result":{"anything":"opaque"}}
@@ -216,7 +236,8 @@ line when nothing was pending:
 The `result` value is exactly the value carried by `ack`. Spool does not
 interpret it.
 
-`failures` emits one JSON object per reported failure, oldest first:
+`failures` emits one JSON object per reported failure of a task that has not
+been collected or expired, oldest first:
 
 ```json
 {"task_id":"task-one","lease_id":"lease_...","capability":"classify@1","worker":"worker-one","failed_at":"2026-09-29T12:00:00Z","reason":"exit 3: failed","retried":true}
@@ -251,7 +272,8 @@ pending=1 leased=0 done=3 failed=2
 ```
 
 `pending`, `leased`, and `done` count task files in those locations. `failed`
-counts every failure record, including retrying failures and reclaims. These counters are
+counts every failure record, including retrying failures and reclaims. They
+count what the spool holds now, so `collect` and `gc` make them smaller. These counters are
 not an exclusive partition of task IDs. A retrying failure can contribute one
 pending task and one or more failed records; its `retried` field distinguishes
 that history from terminal failure.
@@ -347,6 +369,7 @@ fetch
 put
 results
 failures
+collect
 status
 status --json
 ```
@@ -366,7 +389,11 @@ may declare no attachments; one that does is exit 2. Under
 [ADR 0016](../docs/decisions/0016-a-grant-that-may-put-may-read-what-came-of-it.md),
 `results`, `failures`, and `status` write what they write locally, for a
 grant whose `put` is true, and are exit 5 for one whose `put` is false; they
-read nothing on stdin. Requested command words never contain task IDs, lease
+read nothing on stdin. Under
+[ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md),
+`collect` takes and answers the same lines as it does locally, for a grant
+whose `put` is true; for one whose `put` is false it is exit 5 and the lines
+are not read. Requested command words never contain task IDs, lease
 IDs, digests, paths, or a claimed worker.
 
 ### Remote worker
@@ -396,6 +423,30 @@ configuration. It has no default and is not persisted. A recurring deployment
 uses a positive threshold greater than its workers' renewal interval plus the
 maximum renewal delay it intends to tolerate. The remote command does not
 expose reclaim.
+
+### Retention
+
+Under
+[ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md),
+a finished task is a done task, or a task whose latest failure was final. It
+is kept, with its result and every failure record, until whoever put it
+collects it or `gc` finds it old enough. A done task finished at its
+result's `finished_at`; a failed task at the latest `failed_at` of its final
+failures. Neither command touches a pending or leased task, or the failure
+records of one.
+
+`gc` is caller-driven as reclaim is: Spool starts nothing, and
+`--older-than SECONDS` is required, non-negative, has no default, and is not
+persisted. The remote command does not expose `gc`.
+
+The window in which an equal task put again is `existing` is the window in
+which the spool keeps it. Once a task is collected or expired, putting it
+again inserts it, and it runs again. A task whose latest failure was final
+is not kept against a repeat at all: putting it again inserts it.
+
+A deletion is committed before its first file is removed, and recovery
+finishes it, so a crash leaves a task either whole or on its way out, never
+half deleted and kept.
 
 ## Durability
 
