@@ -13,6 +13,7 @@
 -- worker being told to stop, what it started is stopped first.
 module Spool.Worker.Run
   ( runWork
+  , workWith
   ) where
 
 import Control.Concurrent (myThreadId, threadDelay, throwTo)
@@ -50,14 +51,14 @@ import Control.Exception
   , toException
   , try
   )
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (filterM, forM_, unless, void, when)
 import qualified Data.Aeson as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TEE
@@ -111,51 +112,72 @@ import Spool.Worker.Config
   , loadWorkConfig
   )
 import Spool.Worker.Connection (Connection (..))
+import Spool.Worker.Follow (awaitLease)
 
--- | The outcome of running a capability's executable to completion.
-data RunOutcome = RunSuccess BL.ByteString | RunFailure T.Text
+-- | The outcome of running a capability's executable to completion: a
+-- failure says whether the task is to be tried again.
+data RunOutcome = RunSuccess BL.ByteString | RunFailure Retry T.Text
+
+-- | Whether a program that exited with this status is to be tried again.
+-- Under ADR 0017, exit 65 (EX_DATAERR) says the task can never succeed.
+retryAfterExit :: Int -> Retry
+retryAfterExit 65 = NoRetry
+retryAfterExit _ = Retry
 
 -- | Lease tasks one at a time and run each in its own thread, as many at
 -- once as the configuration allows, until nothing is pending or the count
 -- asked for has been started. Then wait for what is running.
-runWork :: Connection -> FilePath -> Maybe Int -> IO ()
-runWork spool configPath maxTasks = do
+--
+-- A worker that follows its spool, given the longest it waits between two
+-- leases, does not stop when nothing is pending: it waits for a task, until
+-- the count is started or it is told to stop.
+runWork :: Connection -> FilePath -> Maybe Int -> Maybe Int -> IO ()
+runWork spool configPath maxTasks follow = do
   config <- loadWorkConfig configPath
+  workWith (\seconds -> threadDelay (seconds * 1000000)) spool config maxTasks follow
+
+-- | The worker, given how to wait so many seconds.
+workWith :: (Int -> IO ()) -> Connection -> WorkConfig -> Maybe Int -> Maybe Int -> IO ()
+workWith sleep spool config maxTasks follow = do
   slots <- newQSem (wcMaxConcurrent config)
-  failures <- newMVar ([] :: [SomeException])
+  failure <- newMVar (Nothing :: Maybe SomeException)
   stoppedBySignal $ bracket (newIORef []) stopAll $ \running -> do
     let -- A task's failure is said when it happens, while the others run
-        -- on. What is kept for the end is only its exit status, so the
-        -- entry point does not say it a second time. A task that is being
-        -- stopped has not failed.
+        -- on. What is kept for the end is only the first one's exit
+        -- status, so the entry point does not say it a second time, and a
+        -- worker that runs for months does not keep every one. A task that
+        -- is being stopped has not failed.
         record exception = case fromException exception of
           Just AsyncCancelled -> throwIO exception
           Nothing -> do
             held <- case fromException exception of
-              Just failure -> do
-                report (failure :: SpoolError)
-                pure (toException (ExitFailure (exitStatus failure)))
+              Just refusal -> do
+                report (refusal :: SpoolError)
+                pure (toException (ExitFailure (exitStatus refusal)))
               Nothing -> pure exception
-            modifyMVar_ failures (pure . (held :))
+            modifyMVar_ failure (pure . Just . fromMaybe held)
+        -- What has ended is let go, so the list holds what is running. Only
+        -- this thread changes it.
         start lease = mask_ $ do
           task <- asyncWithUnmask $ \unmask ->
             (unmask (runOneLease spool config lease) `catch` record)
               `finally` signalQSem slots
-          atomicModifyIORef' running (\tasks -> (task : tasks, ()))
+          live <- filterM (fmap isNothing . poll) =<< readIORef running
+          atomicModifyIORef' running (const (task : live, ()))
+        next = case follow of
+          Nothing -> leaseOne spool
+          Just capSeconds -> Just <$> awaitLease sleep report capSeconds (leaseOne spool)
         loop launched = unless (maybe False (launched >=) maxTasks) $ do
           leased <- bracketOnError (waitQSem slots) (const (signalQSem slots)) $
             \() -> do
-              leased <- leaseOne spool
+              leased <- next
               case leased of
                 Just lease -> start lease >> pure True
                 Nothing -> signalQSem slots >> pure False
           when leased (loop (launched + 1 :: Int))
     loop 0
     readIORef running >>= mapM_ wait
-  failed <- readMVar failures
-  case reverse failed of
-    [] -> pure ()
-    first : _ -> throwIO first
+  readMVar failure >>= mapM_ throwIO
   where
     stopAll running = readIORef running >>= mapM_ cancel
 
@@ -207,7 +229,7 @@ runExecutable spool config task leaseIdent capConfig payloadBytes = do
     Just (Right refusal) -> throwIO (withContext "work: renewal failed: " refusal)
     Just (Left exception) -> throwIO exception
     Nothing -> case outcome of
-      RunFailure reason -> completeFailure spool (taskId task) leaseIdent reason Retry
+      RunFailure retry reason -> completeFailure spool (taskId task) leaseIdent reason retry
       RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
         Left _ -> completeFailure spool (taskId task) leaseIdent "output is not JSON" Retry
         Right outputValue -> completeSuccess spool task leaseIdent outputValue
@@ -406,22 +428,22 @@ runCapability capConfig envPairs cwdPath payload =
           hClose input `catch` (\again -> const (pure ()) (again :: IOException))
       | otherwise = throwIO exception
     outcomeOf ended = case ended of
-      Exited _ _ _ (Left exception) -> RunFailure
+      Exited _ _ _ (Left exception) -> RunFailure Retry
         ("could not write payload: " <> T.pack (displayException exception))
       StoppedFor TimedOut -> timedOut
       StoppedFor Overran -> overran
       Exited _ output errors _ | any isPastLimit [Just output, Just errors] -> overran
-      LeftOpen -> RunFailure
+      LeftOpen -> RunFailure Retry
         ("output still open " <> T.pack (show terminationGraceSeconds)
           <> " s after exit: the program left a process running")
       Exited ExitSuccess (Captured output) _ _ -> RunSuccess (BL.fromStrict output)
-      Exited (ExitFailure n) _ (Captured errors) _ -> RunFailure
+      Exited (ExitFailure n) _ (Captured errors) _ -> RunFailure (retryAfterExit n)
         ("exit " <> T.pack (show n) <> ": " <> decodeLenient (tailBytes 1000 errors))
       -- Every stream past its limit was answered above.
       Exited _ _ _ _ -> overran
-    timedOut = RunFailure
+    timedOut = RunFailure Retry
       ("timeout after " <> T.pack (show (capTimeoutSeconds capConfig)) <> " s")
-    overran = RunFailure
+    overran = RunFailure Retry
       ("output exceeds max_output_bytes " <> T.pack (show limit))
 
 isPastLimit :: Maybe Captured -> Bool

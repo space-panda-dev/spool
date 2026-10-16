@@ -69,7 +69,7 @@
             nativeBuildInputs = [ pkgs.coreutils ];
           } ''
             test -x ${spool}/bin/spool
-            test "$(${spool}/bin/spool --version)" = "spool 0.0.2"
+            test "$(${spool}/bin/spool --version)" = "spool 0.0.3"
             touch "$out"
           '';
 
@@ -80,10 +80,11 @@
               pkgs.findutils
               pkgs.gnugrep
               pkgs.gnused
+              pkgs.gnutar
               pkgs.jq
             ];
           } ''
-            SPOOL=${spool}/bin/spool \
+            SPOOL=${spool}/bin/spool SPOOL_FIXTURES=${./test/fixtures} \
               ${pkgs.bash}/bin/bash ${./test.sh}
             touch "$out"
           '';

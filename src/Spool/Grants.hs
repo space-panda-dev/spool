@@ -9,7 +9,7 @@ module Spool.Grants
   ) where
 
 import Control.Exception (bracket, onException, throwIO)
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as A
 import qualified Data.ByteString as BS
@@ -68,17 +68,17 @@ import Spool.Store
   , readTaskFile
   , readResultRecordFile
   , readWorkerSidecar
-  , removeSidecars
   , leaseIdOfFile
   , leaseTasks
   , resultsCommand
   , failuresCommand
+  , collectTasks
   , statusTasks
   , answerEach
   , ackStep
   , renewStep
   , failStep
-  , returnToPending
+  , abandonLease
   , fetchFor
   )
 import Spool.Cli (GrantOptions (..))
@@ -253,11 +253,8 @@ reclaimWorkerLeases paths worker = do
   forM_ files $ \path -> do
     leaseIdent <- leaseIdOfFile path
     owner <- readWorkerSidecar paths leaseIdent
-    when (owner == worker) $ do
-      task <- readTaskFile path
-      returnToPending paths task
-      syncedRemove path
-      removeSidecars paths leaseIdent
+    when (owner == worker)
+      (void (abandonLease paths "reclaimed: grant revoked" path leaseIdent))
 
 runRemote :: T.Text -> IO ()
 runRemote requested = do
@@ -302,6 +299,11 @@ dispatchRemote paths grant operation = case operation of
   Access.RemoteResults -> reading (resultsCommand paths)
   Access.RemoteFailures -> reading (failuresCommand paths)
   Access.RemoteStatus format -> reading (statusTasks paths format)
+  -- Saying a result has been read goes with reading it (ADR 0018). A grant
+  -- that may not is denied before a line is read.
+  Access.RemoteCollect
+    | Access.grantPut grant -> collectTasks paths
+    | otherwise -> throwIO (grantRefused "grant does not permit collect")
   Access.RemoteLease count -> do
     let requested = fromMaybe 1 count
     when (requested > toInteger (maxBound :: Int))

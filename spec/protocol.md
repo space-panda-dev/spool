@@ -1,12 +1,47 @@
 # Spool protocol
 
-Version: 0.0.2
+Version: 0.0.3
 Status: draft
 
 The protocol a spool and its workers follow. It is dedicated to the public
 domain under CC0 1.0: anyone may implement it. The version above must match
 [`VERSION`](VERSION). Matters that are not settled remain listed in
 [`docs/open-questions.md`](../docs/open-questions.md).
+
+## Since 0.0.2
+
+Version 0.0.3 adds three decisions:
+[ADR 0017](../docs/decisions/0017-a-task-has-three-attempts.md) (a task has
+three attempts, and exit 65 is final),
+[ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md)
+(`collect`, `gc`, and done tasks filed under their task ID), and
+[ADR 0019](../docs/decisions/0019-a-worker-may-follow-its-spool.md)
+(`work --follow`). No envelope, record, or request a 0.0.2 client sends
+changes shape, and no field is added. What changes is what a spool may
+answer, and what it keeps:
+
+- `fail` without `--no-retry` may answer `failed`, on a task's third
+  attempt, and `reclaim` may answer `{"task_id":...,"status":"failed"}`.
+  Both are answers a 0.0.2 client was never told about. A 0.0.2 worker reads
+  every answer that is not `stale` as accepted, so it carries on; a caller
+  that took `failed_retry` or `reclaimed` as a promise that the task would
+  run again is wrong for that task.
+- `failures` and the `failed` counter include reclaims and revokes.
+- `collect`, `gc`, and their answers `collected`, `not_finished`,
+  `unknown`, and `expired` are new. A 0.0.2 client never sends them; a
+  0.0.2 spool, local or remote, refuses them as malformed input (exit 2).
+- `results`, `failures`, and `status` count only what has not been
+  collected or aged out, so they can shrink. An `ack` repeated after its task
+  was collected is `stale`. A task put again after it was collected or aged
+  out is `inserted` and runs again.
+- A 0.0.2 worker does not know exit 65; it fails such a run with retry, and
+  the spool's cap still ends the task after three attempts.
+- A 0.0.2 binary must not be run on a spool a 0.0.3 binary has used: it
+  files a done task where 0.0.3 no longer looks. Nothing refuses it yet.
+
+How a client learns the version a spool speaks is still
+[open](../docs/open-questions.md); this section is documentation, not
+negotiation.
 
 ## Tasks
 
@@ -68,15 +103,33 @@ A task is **pending**, **leased**, **done**, or **failed**.
   worker.
 - `ack` with that lease ID moves it to done, carrying the task's result: any
   JSON value, `{"task_id", "lease_id", "result"}`. The result is kept with the
-  done task until whoever put the task reads it; how long after that is open.
-  Repeating an equal ack is a no-op. Repeating the task and lease with a
-  different result is a stale-lease error and cannot replace the stored result.
+  done task until the task is collected or expires (below). Repeating an
+  equal ack is a no-op. Repeating the task and lease with a different result
+  is a stale-lease error and cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
-  or, with `--no-retry`, moves it to failed. A lease has at most one failure
-  record.
-- `reclaim --older-than SECONDS` returns to pending every lease whose later of
-  lease time and last renewal is older than that. The old lease ID is dead.
+  or, with `--no-retry` or on the task's last attempt, moves it to failed. A
+  lease has at most one failure record.
+- `reclaim --older-than SECONDS` ends every lease whose later of lease time
+  and last renewal is older than that, as a failure: it records one and
+  returns the task to pending, or on its last attempt leaves it failed. The
+  old lease ID is dead.
+- `collect` deletes a finished task, and `gc --older-than SECONDS` every
+  finished task that finished that long ago: a done task, or one whose latest
+  failure was final, whether by `--no-retry`, by exit 65, or by its last
+  attempt; with its result and all of its failure records.
+
+Under [ADR 0017](../docs/decisions/0017-a-task-has-three-attempts.md), a task
+has at most three attempts. Every lease that ends without a result is one,
+and each has a failure record: a `fail`, a reclaim, and a revoke's reclaim.
+The attempts a task has had are its retried failure records taken under
+leases later than its latest record that was not retried, so a task put
+again after it failed for good starts afresh. A `fail` with retry, or a
+reclaim, on the third attempt is not retried: its record has `retried`
+false and its reason ends `; retries exhausted after 3 attempts`. The
+decision is written into the record, and recovery follows the record. A
+lease with no worker on file was never handed to a worker; reclaim returns
+its task to pending with no record, and it is no attempt.
 
 A lease ID that is not the task's current lease acts on nothing.
 
@@ -118,9 +171,11 @@ spool --dir DIR failures
 spool --dir DIR results
 spool --dir DIR fetch < attachment-request.json > attachment
 spool --dir DIR reclaim --older-than SECONDS
+spool --dir DIR collect < tasks.jsonl
+spool --dir DIR gc --older-than SECONDS
 spool --dir DIR status [--json]
-spool --dir DIR work --worker WORKER --config FILE [--max-tasks N]
-spool work --via COMMAND --config FILE [--max-tasks N]
+spool --dir DIR work --worker WORKER --config FILE [--max-tasks N] [--follow [--idle-seconds N]]
+spool work --via COMMAND --config FILE [--max-tasks N] [--follow [--idle-seconds N]]
 spool work --config FILE --show
 ```
 
@@ -142,8 +197,9 @@ a command given lines on stdin reads and checks every line before it acts on
 any. A malformed line is exit 2 with nothing acted on, whether it is the first
 line or the last.
 
-`put` and `reclaim` answer on stdout with one line for each task they acted
-on, in the order they acted:
+`put`, `reclaim`, and `gc` answer on stdout with one line for each task they
+acted on, in the order they acted, and `collect` with one line for each line
+it was given, in the order given:
 
 ```json
 {"task_id":"task-one","status":"inserted"}
@@ -165,14 +221,22 @@ every answer names the lease it answers:
 | `ack` | `already_done` | the same acknowledgement had been made |
 | `renew` | `renewed` | the lease will not be reclaimed yet |
 | `fail` | `failed_retry` | the task is pending again |
+| `fail` | `failed` | the task is failed: that was its last attempt |
 | `fail --no-retry` | `failed` | the task is failed |
 | `ack`, `renew`, `fail` | `stale` | nothing was done: see below |
 | `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
+| `reclaim` | `failed` | the task is failed: that was its last attempt |
+| `collect` | `collected` | the task was finished, and it and its records are gone |
+| `collect` | `not_finished` | the task is pending or leased; nothing was deleted |
+| `collect` | `unknown` | the spool holds nothing under that ID |
+| `gc` | `expired` | the task had finished long enough ago, and it and its records are gone |
 
 `stale` answers a lease that is stale, unknown, another task's, or, through
-the remote command, another worker's; and an `ack` whose result differs from
-the one already stored. The answer does not say which. The command acts on
-the lines that are not stale, and then exits 4 if any was.
+the remote command, another worker's; an `ack` whose result differs from
+the one already stored; and an `ack` repeated after its task was collected
+or expired. The answer does not say which. The command acts on the lines
+that are not stale, and then exits 4 if any was. `collect` exits 0 whatever
+it answers.
 
 `init` answers nothing.
 
@@ -191,7 +255,14 @@ line when nothing was pending:
 {"task_id":"task-one","lease_id":"lease_...","reason":"why"}
 ```
 
-`results` emits one JSON object per acknowledged task, oldest first:
+`collect` takes one line for each task:
+
+```json
+{"task_id":"task-one"}
+```
+
+`results` emits one JSON object per acknowledged task that has not been
+collected or expired, oldest first:
 
 ```json
 {"task_id":"task-one","lease_id":"lease_...","capability":"classify@1","worker":"worker-one","finished_at":"2026-09-29T12:00:00Z","result":{"anything":"opaque"}}
@@ -200,7 +271,8 @@ line when nothing was pending:
 The `result` value is exactly the value carried by `ack`. Spool does not
 interpret it.
 
-`failures` emits one JSON object per reported failure, oldest first:
+`failures` emits one JSON object per reported failure of a task that has not
+been collected or expired, oldest first:
 
 ```json
 {"task_id":"task-one","lease_id":"lease_...","capability":"classify@1","worker":"worker-one","failed_at":"2026-09-29T12:00:00Z","reason":"exit 3: failed","retried":true}
@@ -210,11 +282,14 @@ Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
 
-`reclaim` emits one JSON object per task it returned to pending, and nothing
-when no lease was old enough:
+`reclaim` emits one JSON object per lease it ended, and nothing when no
+lease was old enough. A reclaim's failure record has the reason
+`reclaimed: not renewed within SECONDS s`, and a revoke's
+`reclaimed: grant revoked`.
 
 ```json
 {"task_id":"task-one","status":"reclaimed"}
+{"task_id":"task-two","status":"failed"}
 ```
 
 ### `status` counters
@@ -232,7 +307,8 @@ pending=1 leased=0 done=3 failed=2
 ```
 
 `pending`, `leased`, and `done` count task files in those locations. `failed`
-counts every failure record, including retrying failures. These counters are
+counts every failure record, including retrying failures and reclaims. They
+count what the spool holds now, so `collect` and `gc` make them smaller. These counters are
 not an exclusive partition of task IDs. A retrying failure can contribute one
 pending task and one or more failed records; its `retried` field distinguishes
 that history from terminal failure.
@@ -328,6 +404,7 @@ fetch
 put
 results
 failures
+collect
 status
 status --json
 ```
@@ -347,7 +424,11 @@ may declare no attachments; one that does is exit 2. Under
 [ADR 0016](../docs/decisions/0016-a-grant-that-may-put-may-read-what-came-of-it.md),
 `results`, `failures`, and `status` write what they write locally, for a
 grant whose `put` is true, and are exit 5 for one whose `put` is false; they
-read nothing on stdin. Requested command words never contain task IDs, lease
+read nothing on stdin. Under
+[ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md),
+`collect` takes and answers the same lines as it does locally, for a grant
+whose `put` is true; for one whose `put` is false it is exit 5 and the lines
+are not read. Requested command words never contain task IDs, lease
 IDs, digests, paths, or a claimed worker.
 
 ### Remote worker
@@ -363,7 +444,8 @@ a program's exit and output.
 
 A request the transport cannot carry, or that the spool denies, ends the
 worker with the status the spool gave, or 75 when the transport itself
-failed. Leases it held stand, for `reclaim` to return.
+failed. Leases it held stand, for `reclaim` to return. A worker that follows
+its spool (below) asks again after a lease that failed with 75.
 
 ### Reclaim driver
 
@@ -377,6 +459,30 @@ configuration. It has no default and is not persisted. A recurring deployment
 uses a positive threshold greater than its workers' renewal interval plus the
 maximum renewal delay it intends to tolerate. The remote command does not
 expose reclaim.
+
+### Retention
+
+Under
+[ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md),
+a finished task is a done task, or a task whose latest failure was final. It
+is kept, with its result and every failure record, until whoever put it
+collects it or `gc` finds it old enough. A done task finished at its
+result's `finished_at`; a failed task at the latest `failed_at` of its final
+failures. Neither command touches a pending or leased task, or the failure
+records of one.
+
+`gc` is caller-driven as reclaim is: Spool starts nothing, and
+`--older-than SECONDS` is required, non-negative, has no default, and is not
+persisted. The remote command does not expose `gc`.
+
+The window in which an equal task put again is `existing` is the window in
+which the spool keeps it. Once a task is collected or expired, putting it
+again inserts it, and it runs again. A task whose latest failure was final
+is not kept against a repeat at all: putting it again inserts it.
+
+A deletion is committed before its first file is removed, and recovery
+finishes it, so a crash leaves a task either whole or on its way out, never
+half deleted and kept.
 
 ## Durability
 
@@ -411,8 +517,13 @@ and an output limit; the configuration also sets the concurrency limit, the
 renew interval, and the complete environment a program receives. A program
 gets the payload on stdin in a fresh temporary directory, in its own process
 group. Exit 0 with JSON on stdout is a result; anything else is a failure,
-retried unless the capability was unknown or the payload too large. `work`
-acknowledges with that result.
+retried, up to the task's last attempt, unless the capability was unknown,
+the payload too large, or the program exited 65. `work` acknowledges with
+that result.
+
+Exit 65 (`EX_DATAERR`) is how a program says its task can never succeed.
+`work` fails it with `--no-retry` and the reason `exit 65: ` followed by the
+end of the program's stderr, as for any other failing exit.
 
 Every number in the configuration is a whole number of at least 1. The
 concurrency limit and the byte limits may be as large as the host's integers
@@ -444,8 +555,9 @@ program that exits leaving a process behind, holding its output open, has
 not ended: 5 seconds after the program exits, whatever is left of its
 process group is sent SIGKILL and the run is a failure, retried.
 
-`work` sent SIGTERM stops: it leases nothing more, every run is killed as
-above, each run's working directory is deleted, and `work` exits 143. It
+`work` sent SIGTERM stops, whether it is running tasks or waiting for one:
+it leases nothing more, every run is killed as above, each run's working
+directory is deleted, and `work` exits 143. It
 reports nothing for the tasks it was running. Their leases stand, for
 `reclaim` to return.
 
@@ -455,3 +567,22 @@ directory before starting the capability. It attempts to delete that entire
 directory after the program exits. The spool keeps attachments across retry
 and reclaim, and deletes them when `ack` or `fail --no-retry` resolves the
 task.
+
+### Following a spool
+
+Under [ADR 0019](../docs/decisions/0019-a-worker-may-follow-its-spool.md),
+`work` stops once a lease finds nothing pending, unless it is given
+`--follow`. A worker that follows its spool waits and leases again instead,
+until it has started `--max-tasks` tasks or is sent SIGTERM. The first wait
+is 1 second; each wait after an empty lease is twice the one before, up to
+`--idle-seconds N`, a whole number of seconds from 1 through 9223372036854,
+30 when it is not given. A task leased starts the waits again from 1 second.
+`--idle-seconds` without `--follow` is malformed input, exit 2.
+
+A lease that fails with 75, because the transport could not carry it or the
+spool could not answer it, is said on stderr and asked again after a wait on
+the same schedule, without limit. Any other failure of a lease, such as a
+denied grant (5), ends the worker with that status at once. A task that
+fails while a following worker runs is said on stderr when it happens and
+does not stop the worker; when the worker stops at `--max-tasks`, it exits
+with the status of the first such failure.

@@ -52,6 +52,7 @@ acceptedCommands =
   , ("put", RemotePut)
   , ("results", RemoteResults)
   , ("failures", RemoteFailures)
+  , ("collect", RemoteCollect)
   , ("status", RemoteStatus StatusText)
   , ("status --json", RemoteStatus StatusJson)
   ]
@@ -81,6 +82,8 @@ rejectedCommands =
   , ("status with another option", "status --text")
   , ("results with an option", "results --json")
   , ("local reclaim", "reclaim --older-than 0")
+  , ("local gc", "gc --older-than 0")
+  , ("collect with an option", "collect --all")
   , ("local grant", "grant --worker other")
   , ("local revoke", "revoke --grant grant_deadbeef")
   , ("missing count", "lease --count")

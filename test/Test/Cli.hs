@@ -31,10 +31,10 @@ tests = testGroup "command line"
   , testGroup "work --via"
       [ testCase "splits the transport command into a program and its arguments" $
           parseWorkVia ["--via", "ssh -i key spool@host", "--config", "c.json"]
-            @?= Right (WorkVia ["ssh", "-i", "key", "spool@host"] "c.json" Nothing)
+            @?= Right (WorkVia ["ssh", "-i", "key", "spool@host"] "c.json" Nothing Nothing)
       , testCase "takes --max-tasks and its options in any order" $
           parseWorkVia ["--max-tasks", "3", "--config", "c.json", "--via", "fake-ssh"]
-            @?= Right (WorkVia ["fake-ssh"] "c.json" (Just 3))
+            @?= Right (WorkVia ["fake-ssh"] "c.json" (Just 3) Nothing)
       , testCase "refuses an empty command" $
           assertBool "refused" (isLeft (parseWorkVia ["--via", "  ", "--config", "c.json"]))
       , testCase "refuses a missing config" $
@@ -42,6 +42,15 @@ tests = testGroup "command line"
       , testCase "refuses a worker name: the grant names the worker" $
           assertBool "refused" $ isLeft $
             parseWorkVia ["--via", "ssh host", "--config", "c.json", "--worker", "w"]
+      , testCase "follows, waiting up to 30 s unless told otherwise" $
+          parseWorkVia ["--via", "fake-ssh", "--follow", "--config", "c.json"]
+            @?= Right (WorkVia ["fake-ssh"] "c.json" Nothing (Just 30))
+      , testCase "follows with the longest wait it is given" $
+          parseWorkVia ["--idle-seconds", "5", "--via", "fake-ssh", "--config", "c.json", "--follow"]
+            @?= Right (WorkVia ["fake-ssh"] "c.json" Nothing (Just 5))
+      , testCase "refuses --idle-seconds without --follow" $
+          assertBool "refused" $ isLeft $
+            parseWorkVia ["--via", "fake-ssh", "--config", "c.json", "--idle-seconds", "5"]
       ]
   ]
 
@@ -65,11 +74,21 @@ acceptedForms =
   , (["fetch"], Store Fetch)
   , (["reclaim", "--older-than", "0"], Store (Reclaim 0))
   , (["reclaim", "--older-than", "90"], Store (Reclaim 90))
+  , (["collect"], Store Collect)
+  , (["gc", "--older-than", "0"], Store (Gc 0))
+  , (["gc", "--older-than", "86400"], Store (Gc 86400))
   , (["status"], Store (Status StatusText))
   , (["status", "--json"], Store (Status StatusJson))
-  , (["work", "--worker", "w", "--config", "c.json"], Work w "c.json" Nothing)
+  , (["work", "--worker", "w", "--config", "c.json"], Work w "c.json" Nothing Nothing)
   , ( ["work", "--config", "c.json", "--worker", "w", "--max-tasks", "2"]
-    , Work w "c.json" (Just 2) )
+    , Work w "c.json" (Just 2) Nothing )
+  , (["work", "--worker", "w", "--config", "c.json", "--follow"], Work w "c.json" Nothing (Just 30))
+  , ( ["work", "--follow", "--idle-seconds", "7", "--worker", "w", "--config", "c.json"]
+    , Work w "c.json" Nothing (Just 7) )
+  , ( ["work", "--worker", "w", "--config", "--follow"]
+    , Work w "--follow" Nothing Nothing )
+  , ( ["work", "--worker", "w", "--config", "c.json", "--follow", "--idle-seconds", "9223372036854"]
+    , Work w "c.json" Nothing (Just 9223372036854) )
   , (["work", "--config", "c.json", "--show"], WorkShow "c.json")
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"]
     , Store (GrantCommand "p" w "k.pub" (GrantOptions False Nothing Nothing)) )
@@ -104,9 +123,18 @@ rejectedForms =
   , ("fractional count", ["lease", "--worker", "w", "--count", "1.5"])
   , ("negative age", ["reclaim", "--older-than", "-1"])
   , ("missing age", ["reclaim"])
+  , ("collect with a word", ["collect", "all"])
+  , ("gc without an age", ["gc"])
+  , ("gc with a negative age", ["gc", "--older-than", "-1"])
+  , ("gc with a fractional age", ["gc", "--older-than", "1.5"])
   , ("work without a worker", ["work", "--config", "c.json"])
   , ("work without a config", ["work", "--worker", "w"])
   , ("zero max-tasks", ["work", "--worker", "w", "--config", "c", "--max-tasks", "0"])
+  , ("idle seconds without --follow", ["work", "--worker", "w", "--config", "c", "--idle-seconds", "5"])
+  , ("zero idle seconds", ["work", "--worker", "w", "--config", "c", "--follow", "--idle-seconds", "0"])
+  , ("idle seconds past the largest wait", ["work", "--worker", "w", "--config", "c", "--follow", "--idle-seconds", "9223372036855"])
+  , ("idle seconds that would wrap", ["work", "--worker", "w", "--config", "c", "--follow", "--idle-seconds", "18446744073709551617"])
+  , ("--follow twice", ["work", "--worker", "w", "--config", "c", "--follow", "--follow"])
   , ("grant without a peer", ["grant", "--peer", "", "--worker", "w", "--key", "k"])
   , ("grant with --put twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--put", "--put"])
   , ("grant with --executable twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--executable", "/a", "--executable", "/b"])

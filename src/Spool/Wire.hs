@@ -23,6 +23,7 @@ module Spool.Wire
   , parseAck
   , parseFail
   , parseFetchRequest
+  , parseCollectRequest
     -- * What the spool keeps
   , ResultRecord (..)
   , FailureRecord (..)
@@ -31,6 +32,7 @@ module Spool.Wire
     -- * What the spool answers
   , PutStatus (..)
   , AckStatus (..)
+  , CollectStatus (..)
   , Counts (..)
   , encodePutResult
   , encodeAckResult
@@ -38,6 +40,8 @@ module Spool.Wire
   , encodeFailResult
   , encodeStaleResult
   , encodeReclaimResult
+  , encodeCollectResult
+  , encodeExpiredResult
     -- * Encoding
   , encode
   , canonical
@@ -197,6 +201,13 @@ data PutStatus = PutInserted | PutExisting deriving (Eq, Show)
 
 data AckStatus = Acked | AlreadyDone deriving (Eq, Show)
 
+-- | What @collect@ found under a task's identifier (ADR 0018).
+data CollectStatus
+  = Collected    -- ^ it was finished, and is gone with its records
+  | NotFinished  -- ^ it is pending or leased, and nothing was deleted
+  | Unknown      -- ^ the spool holds nothing under it
+  deriving (Bounded, Enum, Eq, Show)
+
 -- | What @status@ counts: task files in three places, and failure records.
 data Counts = Counts
   { countPending :: Int
@@ -302,6 +313,11 @@ parseFetchRequest = strictObject "fetch request"
     digest <- SA.mkSha256 digestText
     pure (FetchRequest reference digest)
 
+-- | A task a caller has read what came of, and is done with.
+parseCollectRequest :: BL.ByteString -> Either String TaskId
+parseCollectRequest = strictObject "collect request" ["task_id"] $ \object ->
+  mkTaskId =<< requiredText "task_id" object
+
 -- | The two identifiers of a request, checked only once every field of the
 -- request is known to be there, so that a missing field is what is reported
 -- when a field is missing.
@@ -401,8 +417,21 @@ encodeFailResult reference retry = answer reference $ case retry of
 encodeStaleResult :: LeaseRef -> BL.ByteString
 encodeStaleResult reference = answer reference "stale"
 
-encodeReclaimResult :: TaskId -> BL.ByteString
-encodeReclaimResult ident = reply ident "reclaimed"
+-- | What reclaim did with a task: returned it to pending, or, when the task
+-- had used its retries, left it failed.
+encodeReclaimResult :: TaskId -> Retry -> BL.ByteString
+encodeReclaimResult ident retry = reply ident $ case retry of
+  Retry -> "reclaimed"
+  NoRetry -> "failed"
+
+encodeCollectResult :: TaskId -> CollectStatus -> BL.ByteString
+encodeCollectResult ident status = reply ident $ case status of
+  Collected -> "collected"
+  NotFinished -> "not_finished"
+  Unknown -> "unknown"
+
+encodeExpiredResult :: TaskId -> BL.ByteString
+encodeExpiredResult ident = reply ident "expired"
 
 -- | What a transition on a lease answers: the lease, and what became of it.
 answer :: LeaseRef -> T.Text -> BL.ByteString

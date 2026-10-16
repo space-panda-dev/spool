@@ -36,7 +36,8 @@ does not need to survive its caller should skip Spool and use GNU parallel.
 
 The `spool` binary implements the protocol with files, atomic transitions, and
 JSONL commands. It can run configured local capabilities, renew and reclaim
-fenced leases, and retain results and failure history. Dedicated SSH accounts
+fenced leases, and retain results and failure history until whoever asked
+collects them or they age out. Dedicated SSH accounts
 use revocable or expiring grants whose forced command exposes only worker
 operations, and `put` for a grant that allows it, and fixes the worker
 identity. A worker on another machine runs `spool work --via "ssh account@host"`
