@@ -147,6 +147,7 @@ data RemoteCommand
   | RemotePut
   | RemoteResults
   | RemoteFailures
+  | RemoteCollect
   | RemoteStatus StatusFormat
   deriving (Eq, Show)
 
@@ -318,6 +319,7 @@ parseRemoteCommand bytes
   | bytes == "put" = Right RemotePut
   | bytes == "results" = Right RemoteResults
   | bytes == "failures" = Right RemoteFailures
+  | bytes == "collect" = Right RemoteCollect
   | bytes == "status" = Right (RemoteStatus StatusText)
   | bytes == "status --json" = Right (RemoteStatus StatusJson)
   | Just suffix <- BS.stripPrefix "lease --count " bytes = do

@@ -1702,6 +1702,8 @@ expect_exit 5 remote_primary 'status' </dev/null
 expect_exit 5 remote_primary 'status --json' </dev/null
 remote_reject 'status --text'
 remote_reject 'results --json'
+remote_reject 'collect --all'
+remote_reject 'gc --older-than 0'
 remote_reject 'reclaim --older-than 0'
 remote_reject 'grant --worker other'
 remote_reject 'revoke --grant grant_deadbeef'
@@ -1947,6 +1949,26 @@ for word in results failures status 'status --json'; do
   expect_exit 5 "$bin/fake-ssh" "$reader_grant" "$word" </dev/null
   test ! -s "$work/exit.stdout"; check
 done
+# collect is a remote word for a grant that may put (ADR 0018); one that may
+# not is denied before a line is read, and the task is still there.
+printf '%s\n' '{"task_id":"000-remote-collect","capability":"classify@1","payload":{}}' \
+  | spoolg put >/dev/null
+spoolg lease --worker local-collector > "$work/remote-collect-lease.jsonl"
+jq -e '.task_id == "000-remote-collect"' "$work/remote-collect-lease.jsonl" >/dev/null; check
+jq -c '{task_id, lease_id, result: {collected: "remotely"}}' "$work/remote-collect-lease.jsonl" \
+  | spoolg ack >/dev/null
+remote_collect_line='{"task_id":"000-remote-collect"}'
+set +e
+printf '%s\n' "$remote_collect_line" | "$bin/fake-ssh" "$reader_grant" collect \
+  > "$work/remote-collect-denied.out" 2>/dev/null
+remote_collect_denied=$?
+set -e
+test "$remote_collect_denied" -eq 5; check
+test ! -s "$work/remote-collect-denied.out"; check
+spoolg results | jq -s -e 'map(select(.task_id == "000-remote-collect")) | length == 1' >/dev/null; check
+printf '%s\n' "$remote_collect_line" | "$bin/fake-ssh" "$putter_grant" collect \
+  | jq -e '. == {task_id:"000-remote-collect", status:"collected"}' >/dev/null; check
+spoolg results | jq -s -e 'map(select(.task_id == "000-remote-collect")) | length == 0' >/dev/null; check
 # A task with attachments cannot come this way.
 set +e
 jq -nc --arg digest "$attachment_digest" --argjson size "$attachment_size" \

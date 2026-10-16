@@ -73,6 +73,7 @@ import Spool.Store
   , leaseTasks
   , resultsCommand
   , failuresCommand
+  , collectTasks
   , statusTasks
   , answerEach
   , ackStep
@@ -302,6 +303,11 @@ dispatchRemote paths grant operation = case operation of
   Access.RemoteResults -> reading (resultsCommand paths)
   Access.RemoteFailures -> reading (failuresCommand paths)
   Access.RemoteStatus format -> reading (statusTasks paths format)
+  -- Saying a result has been read goes with reading it (ADR 0018). A grant
+  -- that may not is denied before a line is read.
+  Access.RemoteCollect
+    | Access.grantPut grant -> collectTasks paths
+    | otherwise -> throwIO (grantRefused "grant does not permit collect")
   Access.RemoteLease count -> do
     let requested = fromMaybe 1 count
     when (requested > toInteger (maxBound :: Int))
