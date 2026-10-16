@@ -9,7 +9,7 @@ module Spool.Grants
   ) where
 
 import Control.Exception (bracket, onException, throwIO)
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as A
 import qualified Data.ByteString as BS
@@ -68,7 +68,6 @@ import Spool.Store
   , readTaskFile
   , readResultRecordFile
   , readWorkerSidecar
-  , removeSidecars
   , leaseIdOfFile
   , leaseTasks
   , resultsCommand
@@ -78,7 +77,7 @@ import Spool.Store
   , ackStep
   , renewStep
   , failStep
-  , returnToPending
+  , abandonLease
   , fetchFor
   )
 import Spool.Cli (GrantOptions (..))
@@ -253,11 +252,8 @@ reclaimWorkerLeases paths worker = do
   forM_ files $ \path -> do
     leaseIdent <- leaseIdOfFile path
     owner <- readWorkerSidecar paths leaseIdent
-    when (owner == worker) $ do
-      task <- readTaskFile path
-      returnToPending paths task
-      syncedRemove path
-      removeSidecars paths leaseIdent
+    when (owner == worker)
+      (void (abandonLease paths "reclaimed: grant revoked" path leaseIdent))
 
 runRemote :: T.Text -> IO ()
 runRemote requested = do

@@ -17,6 +17,7 @@ module Spool.Types
   , newLeaseId
   , leaseIdText
   , leaseStarted
+  , leaseSerialAndTask
   , WorkerName
   , mkWorkerName
   , workerNameText
@@ -127,6 +128,25 @@ leaseStarted (LeaseId value) =
   case reads (T.unpack (T.takeWhile asciiDigit (T.drop 6 value))) of
     [(number, "")] -> Just number
     _ -> Nothing
+
+-- | The serial number a lease was given and the task it was taken on, as
+-- an identifier this spool made records them. Serials only grow, so they
+-- order a spool's leases.
+leaseSerialAndTask :: LeaseId -> Maybe (Integer, TaskId)
+leaseSerialAndTask (LeaseId value) = do
+  rest <- T.stripPrefix "lease_" value
+  (_, afterMicros) <- number rest
+  (serial, afterSerial) <- number afterMicros
+  task <- either (const Nothing) Just (mkTaskId afterSerial)
+  pure (serial, task)
+  where
+    number :: T.Text -> Maybe (Integer, T.Text)
+    number text = do
+      let (digits, rest) = T.span asciiDigit text
+      after <- T.stripPrefix "_" rest
+      case reads (T.unpack digits) of
+        [(parsed, "")] -> Just (parsed, after)
+        _ -> Nothing
 
 instance ToJSON LeaseId where
   toJSON = toJSON . leaseIdText

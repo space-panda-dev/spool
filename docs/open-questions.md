@@ -17,6 +17,9 @@ than guessing.
 - Is there a hard cancel for a running task?
 - How do an attachment's bytes reach the spool from another machine? A task
   put through the remote command may declare none ([ADR 0015](decisions/0015-a-grant-may-let-its-holder-put.md)).
+- Should a spool, or a task, choose its own number of attempts? Three is
+  fixed ([ADR 0017](decisions/0017-a-task-has-three-attempts.md)) until a
+  real need for another says what the setting should be.
 - Should a worker stop a run when its lease is lost? A renewal that is
   refused is found only when the program finishes, so the program runs to
   the end of work that can no longer be acknowledged.

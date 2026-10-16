@@ -377,8 +377,128 @@ pending_after=$(spool status --json | jq -r '.pending')
 test "$pending_after" = "$pending_while_leased"; check
 spool failures | jq -s --arg lease "$fail_lease2" -e \
   'map(select(.lease_id == $lease)) | length == 1 and .[0].retried == false' >/dev/null; check
-spool status | grep -q 'failed=2'; check
-spool status --json | jq -e '.failed == 2' >/dev/null; check
+# The three reclaims above each wrote a failure record too.
+spool status | grep -q 'failed=5'; check
+spool status --json | jq -e '.failed == 5' >/dev/null; check
+
+# A task has three attempts (ADR 0017). Every lease that ends without a result
+# is one: a retried fail, and a reclaim, which writes a failure record of its
+# own. The third is not retried, whatever ends it, and says so in its reason.
+spoolr() { "$spool_binary" --dir "$work/retry-cap" "$@"; }
+spoolr init
+cap_lease() {
+  # cap_lease TASK: lease the one pending task, which must be TASK.
+  spoolr lease --worker capper > "$work/cap-lease.jsonl"
+  test "$(jq -r '.task_id' "$work/cap-lease.jsonl")" = "$1"
+  cap_held=$(jq -r '.lease_id' "$work/cap-lease.jsonl")
+}
+cap_fail() {
+  # cap_fail TASK REASON [--no-retry]: fail the lease cap_lease took.
+  jq -nc --arg task "$1" --arg lease "$cap_held" --arg reason "$2" \
+    '{task_id:$task,lease_id:$lease,reason:$reason}' | spoolr fail ${3:+"$3"} > "$work/cap-fail.jsonl"
+  cap_answer=$(jq -r '.status' "$work/cap-fail.jsonl")
+}
+cap_reclaim() {
+  spoolr reclaim --older-than 0 > "$work/cap-reclaim.jsonl"
+  cap_answer=$(jq -s -c '.' "$work/cap-reclaim.jsonl")
+}
+cap_records() {
+  # cap_records TASK: that task's failure records, oldest first, as one array.
+  spoolr failures | jq -s -c --arg task "$1" 'map(select(.task_id == $task))'
+}
+exhausted='; retries exhausted after 3 attempts'
+reclaimed='reclaimed: not renewed within 0 s'
+
+# Three failures: the first two go back to pending, the third does not.
+printf '%s\n' '{"task_id":"cap-fails","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+for attempt in 1 2; do
+  cap_lease cap-fails
+  cap_fail cap-fails "boom $attempt"
+  test "$cap_answer" = "failed_retry"; check
+done
+cap_lease cap-fails
+cap_fail cap-fails "boom 3"
+test "$cap_answer" = "failed"; check
+expect_exit 1 spoolr lease --worker capper
+cap_records cap-fails | jq -e --arg last "boom 3$exhausted" \
+  'length == 3 and map(.retried) == [true, true, false]
+   and map(.reason) == ["boom 1", "boom 2", $last]' >/dev/null; check
+spoolr status --json | jq -e '.pending == 0 and .leased == 0 and .failed == 3' >/dev/null; check
+
+# A task put again after it failed for good starts afresh.
+printf '%s\n' '{"task_id":"cap-fails","capability":"classify@1","payload":{}}' \
+  | spoolr put | jq -e '.status == "inserted"' >/dev/null; check
+cap_lease cap-fails
+cap_fail cap-fails "again"
+test "$cap_answer" = "failed_retry"; check
+cap_lease cap-fails
+jq -c '{task_id, lease_id, result: {fresh: true}}' "$work/cap-lease.jsonl" | spoolr ack >/dev/null
+
+# Three reclaims: each writes a record; the third leaves the task failed.
+printf '%s\n' '{"task_id":"cap-reclaims","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+for attempt in 1 2; do
+  cap_lease cap-reclaims
+  cap_reclaim
+  test "$cap_answer" = '[{"status":"reclaimed","task_id":"cap-reclaims"}]'; check
+done
+cap_lease cap-reclaims
+cap_reclaim
+test "$cap_answer" = '[{"status":"failed","task_id":"cap-reclaims"}]'; check
+expect_exit 1 spoolr lease --worker capper
+cap_records cap-reclaims | jq -e --arg reason "$reclaimed" --arg last "$reclaimed$exhausted" \
+  'length == 3 and map(.retried) == [true, true, false] and map(.worker) == ["capper", "capper", "capper"]
+   and map(.reason) == [$reason, $reason, $last]' >/dev/null; check
+
+# Fails and reclaims count together, in either order.
+printf '%s\n' '{"task_id":"cap-mixed-a","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+cap_lease cap-mixed-a; cap_fail cap-mixed-a "first"
+test "$cap_answer" = "failed_retry"; check
+cap_lease cap-mixed-a; cap_reclaim
+test "$cap_answer" = '[{"status":"reclaimed","task_id":"cap-mixed-a"}]'; check
+cap_lease cap-mixed-a; cap_fail cap-mixed-a "third"
+test "$cap_answer" = "failed"; check
+printf '%s\n' '{"task_id":"cap-mixed-b","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+cap_lease cap-mixed-b; cap_reclaim
+cap_lease cap-mixed-b; cap_fail cap-mixed-b "second"
+test "$cap_answer" = "failed_retry"; check
+cap_lease cap-mixed-b; cap_reclaim
+test "$cap_answer" = '[{"status":"failed","task_id":"cap-mixed-b"}]'; check
+expect_exit 1 spoolr lease --worker capper
+
+# --no-retry is final at the first attempt, with its reason as given.
+printf '%s\n' '{"task_id":"cap-final","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+cap_lease cap-final
+cap_fail cap-final "hopeless" --no-retry
+test "$cap_answer" = "failed"; check
+cap_records cap-final | jq -e 'length == 1 and .[0].retried == false and .[0].reason == "hopeless"' >/dev/null; check
+
+# A lease whose worker was never recorded (a crash between the lease and its
+# sidecar) was never handed out: reclaim returns it with no record.
+printf '%s\n' '{"task_id":"cap-unhanded","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+cap_lease cap-unhanded
+rm -f "$work/retry-cap/leased/$cap_held.worker"
+cap_reclaim
+test "$cap_answer" = '[{"status":"reclaimed","task_id":"cap-unhanded"}]'; check
+test "$(cap_records cap-unhanded)" = "[]"; check
+cap_lease cap-unhanded
+jq -c '{task_id, lease_id, result: {unhanded: true}}' "$work/cap-lease.jsonl" | spoolr ack >/dev/null
+
+# The decision is in the record. A last fail interrupted after its record
+# leaves the lease standing; the next command follows the record and leaves
+# the task failed, not pending. The state is rebuilt from the real writer's
+# own files, as above.
+printf '%s\n' '{"task_id":"cap-crash","capability":"classify@1","payload":{}}' | spoolr put >/dev/null
+cap_lease cap-crash; cap_fail cap-crash "one"
+cap_lease cap-crash; cap_reclaim
+cap_lease cap-crash
+mkdir "$work/cap-saved"
+cp "$work/retry-cap/leased/$cap_held.json" "$work/retry-cap/leased/$cap_held.worker" "$work/cap-saved/"
+cap_fail cap-crash "three"
+test "$cap_answer" = "failed"; check
+cp "$work/cap-saved/$cap_held.json" "$work/cap-saved/$cap_held.worker" "$work/retry-cap/leased/"
+test -f "$work/retry-cap/leased/$cap_held.json"; check
+spoolr status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+cap_records cap-crash | jq -e 'length == 3 and map(.retried) == [true, true, false]' >/dev/null; check
 
 # Explicit --dir is mandatory; caller environment variables cannot select data.
 set +e
@@ -486,7 +606,7 @@ cp "$work/interrupted-saved/$final_lease.json" \
 spoolf reclaim --older-than 0 > "$work/interrupted-reclaim.out"
 jq -s -e '. == [{task_id:"interrupted-fail", status:"reclaimed"}]' \
   "$work/interrupted-reclaim.out" >/dev/null; check
-spoolf status --json | jq -e '.pending == 1 and .leased == 0 and .failed == 2' >/dev/null; check
+spoolf status --json | jq -e '.pending == 1 and .leased == 0 and .failed == 3' >/dev/null; check
 test ! -e "$work/interrupted-fail/attachments/task-interrupted-final"; check
 
 # An ack interrupted after its result was written is finished the same way,
@@ -595,6 +715,14 @@ echo "deliberate crash for the spool worker test" >&2
 exit 3
 SCRIPT
 chmod +x "$bin/crash-three"
+
+cat > "$bin/hopeless" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+echo "this payload can never be classified" >&2
+exit 65
+SCRIPT
+chmod +x "$bin/hopeless"
 
 grandchild_pidfile="$work/grandchild-pid"
 cat > "$bin/sleeper" <<SCRIPT
@@ -845,6 +973,27 @@ spoolw failures | jq -s --arg task work-crash -e \
    and (.[0].reason | test("exit 3")) and (.[0].reason | test("deliberate crash"))' >/dev/null
 check
 drain_pending "work-crash"
+
+# Any other failing exit is retried up to the cap: three runs, then failed.
+printf '%s\n' '{"task_id":"work-crash-cap","capability":"crash@1","payload":{}}' | spoolw put >/dev/null
+spoolw work --worker w1 --config "$work/crash-config.json" --max-tasks 5
+spoolw status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+spoolw failures | jq -s --arg task work-crash-cap -e \
+  'map(select(.task_id == $task)) | length == 3 and map(.retried) == [true, true, false]
+   and (.[2].reason | startswith("exit 3: "))
+   and (.[2].reason | endswith("; retries exhausted after 3 attempts"))' >/dev/null
+check
+
+# Exit 65 says the task can never succeed: one run, failed, with its stderr.
+printf '%s\n' '{"task_id":"work-hopeless","capability":"hopeless@1","payload":{}}' | spoolw put >/dev/null
+worker_config "hopeless@1" "$bin/hopeless" 5 1024 > "$work/hopeless-config.json"
+spoolw work --worker w1 --config "$work/hopeless-config.json" --max-tasks 5
+spoolw status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+spoolw failures | jq -s --arg task work-hopeless -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].retried == false
+   and (.[0].reason | startswith("exit 65: "))
+   and (.[0].reason | test("can never be classified"))' >/dev/null
+check
 
 # Unknown capability fails without retry.
 unknown_task='{"task_id":"work-unknown","capability":"mystery@9","payload":{}}'
@@ -1762,6 +1911,34 @@ spoolg failures | jq -s --arg task remote-crash -e \
 jq -c '{task_id, lease_id, result: {drained: true}}' "$work/remote-crash-lease.jsonl" \
   | "$bin/fake-ssh" "$reader_grant" ack >/dev/null
 
+# The cap and exit 65 hold for a remote worker as for a local one.
+printf '%s\n' '{"task_id":"remote-crash-cap","capability":"crash@1","payload":{}}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+# One run at a time, so each retry is pending again when the next lease is asked for.
+jq -c '.max_concurrent = 1' "$work/remote-worker-crash.json" > "$work/remote-worker-crash-serial.json"
+"$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-crash-serial.json" --max-tasks 5
+spoolg failures | jq -s --arg task remote-crash-cap -e \
+  'map(select(.task_id == $task)) | length == 3 and map(.retried) == [true, true, false]
+   and map(.worker) == ["reader", "reader", "reader"]' >/dev/null; check
+printf '%s\n' '{"task_id":"remote-hopeless","capability":"hopeless@1","payload":{}}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+jq -c --arg hopeless "$bin/hopeless" \
+  '.capabilities["hopeless@1"] = {exec: $hopeless, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096}' \
+  "$work/remote-worker.json" > "$work/remote-worker-hopeless.json"
+"$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-hopeless.json" --max-tasks 5
+spoolg failures | jq -s --arg task remote-hopeless -e \
+  'map(select(.task_id == $task)) | length == 1 and .[0].retried == false
+   and (.[0].reason | startswith("exit 65: "))' >/dev/null; check
+# Through the remote command, the third fail is answered failed.
+printf '%s\n' '{"task_id":"remote-fail-cap","capability":"crash@1","payload":{}}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+for expected in failed_retry failed_retry failed; do
+  "$bin/fake-ssh" "$reader_grant" lease > "$work/remote-cap-lease.jsonl"
+  jq -e '.task_id == "remote-fail-cap"' "$work/remote-cap-lease.jsonl" >/dev/null; check
+  jq -c '{task_id, lease_id, reason: "remote"}' "$work/remote-cap-lease.jsonl" \
+    | "$bin/fake-ssh" "$reader_grant" fail | jq -e --arg s "$expected" '.status == $s' >/dev/null; check
+done
+
 # A lease reclaimed while the remote worker runs fences its acknowledgement:
 # the worker exits 4 and the spool keeps no result, as locally.
 printf '%s\n' '{"task_id":"remote-late","capability":"late@1","payload":{}}' \
@@ -1810,6 +1987,10 @@ test ! -e "$grant_home/.spool/grants/$grant_id.json"; check
 ! grep -F "spool-grant:$grant_id" "$grant_home/.ssh/authorized_keys" >/dev/null; check
 test "$(head -n 1 "$grant_home/.ssh/authorized_keys")" = '# unrelated key material'; check
 spoolg status --json | jq -e '.pending >= 1' >/dev/null; check
+# The revoked lease is an attempt, recorded as a reclaim is.
+spoolg failures | jq -s --arg lease "$revoke_lease" -e \
+  'map(select(.lease_id == $lease)) | length == 1
+   and .[0].retried == true and .[0].reason == "reclaimed: grant revoked"' >/dev/null; check
 expect_exit 5 env HOME="$grant_home" SSH_ORIGINAL_COMMAND=lease \
   "$spool_binary" remote --grant "$grant_id"
 late_revoke_ack=$(jq -nc --arg lease "$revoke_lease" \

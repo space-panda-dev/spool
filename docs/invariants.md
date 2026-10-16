@@ -40,3 +40,8 @@ copy may survive.
 **INV-9. A spool is coordination, not a record.** Deleting a spool loses only
 coordination history. Whatever must last is made from results by whoever asked
 for the work. ([ADR 0001](decisions/0001-pull-protocol.md))
+
+**INV-10. A task is attempted at most three times.** Every lease that ends
+without a result is an attempt and leaves a failure record, and a task goes
+back to pending after at most two of them.
+([ADR 0017](decisions/0017-a-task-has-three-attempts.md))

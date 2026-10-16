@@ -73,10 +73,24 @@ A task is **pending**, **leased**, **done**, or **failed**.
   different result is a stale-lease error and cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
-  or, with `--no-retry`, moves it to failed. A lease has at most one failure
-  record.
-- `reclaim --older-than SECONDS` returns to pending every lease whose later of
-  lease time and last renewal is older than that. The old lease ID is dead.
+  or, with `--no-retry` or on the task's last attempt, moves it to failed. A
+  lease has at most one failure record.
+- `reclaim --older-than SECONDS` ends every lease whose later of lease time
+  and last renewal is older than that, as a failure: it records one and
+  returns the task to pending, or on its last attempt leaves it failed. The
+  old lease ID is dead.
+
+Under [ADR 0017](../docs/decisions/0017-a-task-has-three-attempts.md), a task
+has at most three attempts. Every lease that ends without a result is one,
+and each has a failure record: a `fail`, a reclaim, and a revoke's reclaim.
+The attempts a task has had are its retried failure records taken under
+leases later than its latest record that was not retried, so a task put
+again after it failed for good starts afresh. A `fail` with retry, or a
+reclaim, on the third attempt is not retried: its record has `retried`
+false and its reason ends `; retries exhausted after 3 attempts`. The
+decision is written into the record, and recovery follows the record. A
+lease with no worker on file was never handed to a worker; reclaim returns
+its task to pending with no record, and it is no attempt.
 
 A lease ID that is not the task's current lease acts on nothing.
 
@@ -165,9 +179,11 @@ every answer names the lease it answers:
 | `ack` | `already_done` | the same acknowledgement had been made |
 | `renew` | `renewed` | the lease will not be reclaimed yet |
 | `fail` | `failed_retry` | the task is pending again |
+| `fail` | `failed` | the task is failed: that was its last attempt |
 | `fail --no-retry` | `failed` | the task is failed |
 | `ack`, `renew`, `fail` | `stale` | nothing was done: see below |
 | `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
+| `reclaim` | `failed` | the task is failed: that was its last attempt |
 
 `stale` answers a lease that is stale, unknown, another task's, or, through
 the remote command, another worker's; and an `ack` whose result differs from
@@ -210,11 +226,14 @@ Both record envelopes are validated when read. A missing field, an unknown
 field, or a field of the wrong type is corrupt durable state, not an empty
 result.
 
-`reclaim` emits one JSON object per task it returned to pending, and nothing
-when no lease was old enough:
+`reclaim` emits one JSON object per lease it ended, and nothing when no
+lease was old enough. A reclaim's failure record has the reason
+`reclaimed: not renewed within SECONDS s`, and a revoke's
+`reclaimed: grant revoked`.
 
 ```json
 {"task_id":"task-one","status":"reclaimed"}
+{"task_id":"task-two","status":"failed"}
 ```
 
 ### `status` counters
@@ -232,7 +251,7 @@ pending=1 leased=0 done=3 failed=2
 ```
 
 `pending`, `leased`, and `done` count task files in those locations. `failed`
-counts every failure record, including retrying failures. These counters are
+counts every failure record, including retrying failures and reclaims. These counters are
 not an exclusive partition of task IDs. A retrying failure can contribute one
 pending task and one or more failed records; its `retried` field distinguishes
 that history from terminal failure.
@@ -411,8 +430,13 @@ and an output limit; the configuration also sets the concurrency limit, the
 renew interval, and the complete environment a program receives. A program
 gets the payload on stdin in a fresh temporary directory, in its own process
 group. Exit 0 with JSON on stdout is a result; anything else is a failure,
-retried unless the capability was unknown or the payload too large. `work`
-acknowledges with that result.
+retried, up to the task's last attempt, unless the capability was unknown,
+the payload too large, or the program exited 65. `work` acknowledges with
+that result.
+
+Exit 65 (`EX_DATAERR`) is how a program says its task can never succeed.
+`work` fails it with `--no-retry` and the reason `exit 65: ` followed by the
+end of the program's stderr, as for any other failing exit.
 
 Every number in the configuration is a whole number of at least 1. The
 concurrency limit and the byte limits may be as large as the host's integers

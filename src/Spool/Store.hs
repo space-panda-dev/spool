@@ -30,7 +30,11 @@ module Spool.Store
   , failTasks
   , failStep
   , failLease
+  , failOne
   , returnToPending
+  , abandonLease
+  , retryCap
+  , attemptsBefore
   , failuresCommand
   , resultsCommand
   , fetchAttachment
@@ -108,6 +112,7 @@ import Spool.Types
   ( LeaseId
   , Retry (..)
   , StatusFormat (..)
+  , leaseSerialAndTask
   , TaskId
   , WorkerName
   , leaseIdText
@@ -556,14 +561,20 @@ failTasks retry paths =
 
 failStep :: Retry -> Paths -> FailRequest -> IO (Either SpoolError BL.ByteString)
 failStep retry paths request =
-  fmap (const (encodeFailResult (failRef request) retry))
-    <$> failLease paths (failRef request) (failReason request) retry
+  fmap (encodeFailResult (failRef request))
+    <$> failOne paths (failRef request) (failReason request) retry
 
--- | Move a leased task to failed/, recording why, and (with retry) put an
--- identical task back in pending/. Shared by the CLI `fail` command and the
--- `work` loop's failure paths.
+-- | 'failOne', for a caller that does not need to know whether the task
+-- went back to pending. Used by the `work` loop's failure paths.
 failLease :: Paths -> LeaseRef -> T.Text -> Retry -> IO (Either SpoolError ())
-failLease paths (LeaseRef ident leaseIdent) reason retry = do
+failLease paths reference reason retry =
+  fmap (const ()) <$> failOne paths reference reason retry
+
+-- | Move a leased task to failed/, recording why, and (with retry, while
+-- the task has retries left) put an identical task back in pending/.
+-- Answers whether it went back.
+failOne :: Paths -> LeaseRef -> T.Text -> Retry -> IO (Either SpoolError Retry)
+failOne paths (LeaseRef ident leaseIdent) reason retry = do
   let source = leasedPath paths leaseIdent
   exists <- fileExists source
   if not exists
@@ -574,10 +585,56 @@ failLease paths (LeaseRef ident leaseIdent) reason retry = do
         then pure (Left (stale "lease does not belong to task_id"))
         else do
           worker <- readWorkerSidecar paths leaseIdent
-          stored <- writeFailureRecord paths task leaseIdent worker reason retry
+          (effective, recorded) <- capped paths task leaseIdent reason retry
+          stored <- writeFailureRecord paths task leaseIdent worker recorded effective
           case stored of
             Left failure -> pure (Left failure)
-            Right () -> Right () <$ completeFail paths task leaseIdent retry
+            Right () -> Right effective <$ completeFail paths task leaseIdent effective
+
+-- | How many times a task goes back to pending after failing, under
+-- ADR 0017: three attempts in all.
+retryCap :: Int
+retryCap = 2
+
+-- | How many attempts a task has had before a lease, from the serial
+-- number and retry of each of its other failure records: the retried
+-- ones since its latest one that was not retried. A task put again after
+-- it failed for good starts afresh.
+attemptsBefore :: [(Integer, Retry)] -> Int
+attemptsBefore history = length
+  [ serial | (serial, Retry) <- history, all (serial >) finals ]
+  where
+    finals = [serial | (serial, NoRetry) <- history]
+
+-- | The retry a failure of this lease gets, and the reason to record with
+-- it: what was asked for, unless this is the task's last attempt, when it
+-- is not retried and the reason says so. The decision is written into the
+-- record, which recovery follows; it is never worked out again.
+capped :: Paths -> Task -> LeaseId -> T.Text -> Retry -> IO (Retry, T.Text)
+capped _ _ _ reason NoRetry = pure (NoRetry, reason)
+capped paths task leaseIdent reason Retry = do
+  history <- failureHistory paths (taskId task) leaseIdent
+  pure $ if attemptsBefore history >= retryCap
+    then (NoRetry, reason <> "; retries exhausted after "
+      <> T.pack (show (retryCap + 1)) <> " attempts")
+    else (Retry, reason)
+
+-- | The serial number and retry of every failure record of this task but
+-- the one for this lease. A record is named by its lease, which names its
+-- task, so only this task's records are read.
+failureHistory :: Paths -> TaskId -> LeaseId -> IO [(Integer, Retry)]
+failureHistory paths ident leaseIdent = do
+  files <- jsonFiles (failedDir paths)
+  named <- forM files $ \path -> do
+    recordLease <- leaseIdOfFile path
+    case leaseSerialAndTask recordLease of
+      Nothing -> throwIO (corrupt ("corrupt failure record name: " <> path))
+      Just (serial, owner)
+        | owner == ident && recordLease /= leaseIdent -> pure (Just (serial, path))
+        | otherwise -> pure Nothing
+  forM [entry | Just entry <- named] $ \(serial, path) -> do
+    record <- readFailureRecordFile path
+    pure (serial, failureRetried record)
 
 -- | The steps after a fail's commit: the task goes back to pending if it is
 -- to be retried, the lease and its sidecars go, and for a task left failed
@@ -710,15 +767,34 @@ reclaimTasks paths age = do
       Just started -> do
         renewed <- readRenewedSidecar paths leaseIdent
         let effective = maybe started (max started) renewed
-        when (now - effective >= age * 1000000) (reclaimOne paths path leaseIdent)
+        when (now - effective >= age * 1000000) $ do
+          (ident, retry) <- abandonLease paths
+            ("reclaimed: not renewed within " <> T.pack (show age) <> " s")
+            path leaseIdent
+          BLC.putStrLn (encodeReclaimResult ident retry)
 
-reclaimOne :: Paths -> FilePath -> LeaseId -> IO ()
-reclaimOne paths leasedFile leaseIdent = do
+-- | End a lease that has no result, as a failure of the task under it
+-- (ADR 0017): the failure is recorded with this reason, and the task goes
+-- back to pending unless it has used its retries. Answers the task and
+-- whether it went back. A lease with no worker recorded was never handed
+-- to one: its task goes back to pending with no record, since nothing ran.
+abandonLease :: Paths -> T.Text -> FilePath -> LeaseId -> IO (TaskId, Retry)
+abandonLease paths reason leasedFile leaseIdent = do
   task <- readTaskFile leasedFile
-  returnToPending paths task
-  syncedRemove leasedFile
-  removeSidecars paths leaseIdent
-  BLC.putStrLn (encodeReclaimResult (taskId task))
+  handedOut <- fileExists (workerSidecarPath paths leaseIdent)
+  if not handedOut
+    then do
+      returnToPending paths task
+      syncedRemove leasedFile
+      removeSidecars paths leaseIdent
+      pure (taskId task, Retry)
+    else do
+      worker <- readWorkerSidecar paths leaseIdent
+      (retry, recorded) <- capped paths task leaseIdent reason Retry
+      stored <- writeFailureRecord paths task leaseIdent worker recorded retry
+      either throwIO pure stored
+      completeFail paths task leaseIdent retry
+      pure (taskId task, retry)
 
 statusTasks :: Paths -> StatusFormat -> IO ()
 statusTasks paths format = do

@@ -401,8 +401,12 @@ encodeFailResult reference retry = answer reference $ case retry of
 encodeStaleResult :: LeaseRef -> BL.ByteString
 encodeStaleResult reference = answer reference "stale"
 
-encodeReclaimResult :: TaskId -> BL.ByteString
-encodeReclaimResult ident = reply ident "reclaimed"
+-- | What reclaim did with a task: returned it to pending, or, when the task
+-- had used its retries, left it failed.
+encodeReclaimResult :: TaskId -> Retry -> BL.ByteString
+encodeReclaimResult ident retry = reply ident $ case retry of
+  Retry -> "reclaimed"
+  NoRetry -> "failed"
 
 -- | What a transition on a lease answers: the lease, and what became of it.
 answer :: LeaseRef -> T.Text -> BL.ByteString
