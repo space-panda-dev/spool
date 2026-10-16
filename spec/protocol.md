@@ -1,12 +1,47 @@
 # Spool protocol
 
-Version: 0.0.2
+Version: 0.0.3
 Status: draft
 
 The protocol a spool and its workers follow. It is dedicated to the public
 domain under CC0 1.0: anyone may implement it. The version above must match
 [`VERSION`](VERSION). Matters that are not settled remain listed in
 [`docs/open-questions.md`](../docs/open-questions.md).
+
+## Since 0.0.2
+
+Version 0.0.3 adds three decisions:
+[ADR 0017](../docs/decisions/0017-a-task-has-three-attempts.md) (a task has
+three attempts, and exit 65 is final),
+[ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md)
+(`collect`, `gc`, and done tasks filed under their task ID), and
+[ADR 0019](../docs/decisions/0019-a-worker-may-follow-its-spool.md)
+(`work --follow`). No envelope, record, or request a 0.0.2 client sends
+changes shape, and no field is added. What changes is what a spool may
+answer, and what it keeps:
+
+- `fail` without `--no-retry` may answer `failed`, on a task's third
+  attempt, and `reclaim` may answer `{"task_id":...,"status":"failed"}`.
+  Both are answers a 0.0.2 client was never told about. A 0.0.2 worker reads
+  every answer that is not `stale` as accepted, so it carries on; a caller
+  that took `failed_retry` or `reclaimed` as a promise that the task would
+  run again is wrong for that task.
+- `failures` and the `failed` counter include reclaims and revokes.
+- `collect`, `gc`, and their answers `collected`, `not_finished`,
+  `unknown`, and `expired` are new. A 0.0.2 client never sends them; a
+  0.0.2 spool, local or remote, refuses them as malformed input (exit 2).
+- `results`, `failures`, and `status` count only what has not been
+  collected or aged out, so they can shrink. An `ack` repeated after its task
+  was collected is `stale`. A task put again after it was collected or aged
+  out is `inserted` and runs again.
+- A 0.0.2 worker does not know exit 65; it fails such a run with retry, and
+  the spool's cap still ends the task after three attempts.
+- A 0.0.2 binary must not be run on a spool a 0.0.3 binary has used: it
+  files a done task where 0.0.3 no longer looks. Nothing refuses it yet.
+
+How a client learns the version a spool speaks is still
+[open](../docs/open-questions.md); this section is documentation, not
+negotiation.
 
 ## Tasks
 
