@@ -29,6 +29,10 @@ fi
 test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
 test "$($spool_binary --version)" = "spool 0.0.2"; check
 
+# Files the suite reads, beside it or where the flake check puts them.
+fixtures=${SPOOL_FIXTURES:-$here/test/fixtures}
+test -f "$fixtures/spool-0.0.2-layout.tar"
+
 spool() { "$spool_binary" --dir "$work/spool" "$@"; }
 
 # Capture an exit status without letting errexit hide the result.
@@ -737,7 +741,7 @@ test ! -e "$work/crash/.task-cleanup/c-last"; check
 # it. The fixture is such a spool, made by scripts/make-layout-fixture.sh
 # running the 0.0.2 binary; the first command migrates it.
 mkdir "$work/migrated"
-tar -xf "$here/test/fixtures/spool-0.0.2-layout.tar" -C "$work/migrated"
+tar -xf "$fixtures/spool-0.0.2-layout.tar" -C "$work/migrated"
 test ! -e "$work/migrated/.spool-layout"; check
 test "$(find "$work/migrated/done" -name 'lease_*' | wc -l | tr -d ' ')" = 3; check
 in_spool migrated status --json | jq -e '. == {pending:1,leased:1,done:3,failed:2}' >/dev/null; check
@@ -770,7 +774,7 @@ in_spool migrated status --json | jq -e '. == {pending:1,leased:0,done:0,failed:
 # What a file holds decides, so a migration run again renames nothing, not
 # even the task whose ID looks like a lease's.
 mkdir "$work/migrated-again"
-tar -xf "$here/test/fixtures/spool-0.0.2-layout.tar" -C "$work/migrated-again"
+tar -xf "$fixtures/spool-0.0.2-layout.tar" -C "$work/migrated-again"
 in_spool migrated-again status >/dev/null
 rm -f "$work/migrated-again/.spool-layout"
 in_spool migrated-again status >/dev/null
