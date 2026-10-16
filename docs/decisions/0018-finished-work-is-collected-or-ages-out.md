@@ -118,7 +118,7 @@ protocol is versioned.
 ([ADR 0009](0009-status-counts-coordination-records.md)); after `collect`
 or `gc` it counts fewer.
 
-### Decision details proposed by the implementer — operator to confirm
+### Decision details, confirmed by the operator on 2026-10-16
 
 1. `collect` exits 0 when a line is `not_finished` or `unknown`. Those are
    answers about tasks, not a refused lease, and exit 4 belongs to leases.
