@@ -642,22 +642,29 @@ lease_one aging >/dev/null
 put_one aging z-retrying >/dev/null
 z_lease=$(lease_one aging)
 fail_one aging z-retrying "$z_lease" >/dev/null
+# A task that failed finally long ago and has been put again is pending.
+put_one aging f-again >/dev/null
+f_again_lease=$(lease_one aging)
+fail_one aging f-again "$f_again_lease" --no-retry >/dev/null
+put_one aging f-again | jq -e '.status == "inserted"' >/dev/null; check
 age_record "$work/aging/results/$a_new_lease.json" finished_at 60
 age_record "$work/aging/results/$a_old_lease.json" finished_at 3600
 age_record "$work/aging/failed/$f_old_lease.json" failed_at 3000
 age_record "$work/aging/failed/$z_lease.json" failed_at 7200
+age_record "$work/aging/failed/$f_again_lease.json" failed_at 5000
 in_spool aging gc --older-than 1800 > "$work/gc.out"
 jq -s -e '. == [ {task_id:"a-old", status:"expired"}
                , {task_id:"f-old", status:"expired"} ]' "$work/gc.out" >/dev/null; check
-in_spool aging status --json | jq -e '. == {pending:1,leased:1,done:1,failed:1}' >/dev/null; check
+in_spool aging status --json | jq -e '. == {pending:2,leased:1,done:1,failed:2}' >/dev/null; check
 in_spool aging results | jq -s -e 'map(.task_id) == ["a-new"]' >/dev/null; check
-in_spool aging failures | jq -s -e 'map(.task_id) == ["z-retrying"]' >/dev/null; check
+in_spool aging failures | jq -s -e 'map(.task_id) == ["z-retrying","f-again"]' >/dev/null; check
+test -f "$work/aging/pending/f-again.json"; check
 test -z "$(records_of aging a-old)$(records_of aging f-old)"; check
 in_spool aging gc --older-than 1800 > "$work/gc-again.out"
 test ! -s "$work/gc-again.out"; check
 put_one aging a-old | jq -e '.status == "inserted"' >/dev/null; check
 in_spool aging gc --older-than 0 | jq -s -e '. == [{task_id:"a-new", status:"expired"}]' >/dev/null; check
-in_spool aging status --json | jq -e '. == {pending:2,leased:1,done:0,failed:1}' >/dev/null; check
+in_spool aging status --json | jq -e '. == {pending:3,leased:1,done:0,failed:2}' >/dev/null; check
 expect_exit 2 in_spool aging gc --older-than -1
 expect_exit 2 in_spool aging gc
 
