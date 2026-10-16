@@ -17,6 +17,7 @@ module Spool.Types
   , newLeaseId
   , leaseIdText
   , leaseStarted
+  , leaseSerialAndTask
   , WorkerName
   , mkWorkerName
   , workerNameText
@@ -28,12 +29,13 @@ module Spool.Types
   , timestamp
   , storedTimestamp
   , timestampText
+  , timestampTime
   ) where
 
 import Data.Aeson (ToJSON (..), ToJSONKey (..))
 import Data.Aeson.Types (toJSONKeyText)
 import qualified Data.Text as T
-import Data.Time (UTCTime, defaultTimeLocale, formatTime)
+import Data.Time (UTCTime, defaultTimeLocale, formatTime, parseTimeM)
 
 -- | A name: 1 to 128 of ASCII letters, digits, @.@, @_@, and @-@.  Every
 -- identifier a caller chooses is one, so that it is the same wherever it is
@@ -128,6 +130,22 @@ leaseStarted (LeaseId value) =
     [(number, "")] -> Just number
     _ -> Nothing
 
+-- | The serial and the task of a lease this spool made, read back from its
+-- name: nothing for a name of any other form.  Only the spool that made a
+-- lease reads it; its holder never does.
+leaseSerialAndTask :: LeaseId -> Maybe (Integer, TaskId)
+leaseSerialAndTask (LeaseId value) = do
+  rest <- T.stripPrefix "lease_" value
+  let (micros, afterMicros) = T.span asciiDigit rest
+  afterFirst <- T.stripPrefix "_" afterMicros
+  let (serial, afterSerial) = T.span asciiDigit afterFirst
+  task <- T.stripPrefix "_" afterSerial
+  if T.null micros || T.null serial
+    then Nothing
+    else case (reads (T.unpack serial), mkTaskId task) of
+      ([(number, "")], Right ident) -> Just (number, ident)
+      _ -> Nothing
+
 instance ToJSON LeaseId where
   toJSON = toJSON . leaseIdText
 
@@ -183,6 +201,12 @@ storedTimestamp = Timestamp
 
 timestampText :: Timestamp -> T.Text
 timestampText (Timestamp value) = value
+
+-- | The time a timestamp names, or nothing if it is not one this spool
+-- writes.
+timestampTime :: Timestamp -> Maybe UTCTime
+timestampTime (Timestamp value) =
+  parseTimeM False defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" (T.unpack value)
 
 instance ToJSON Timestamp where
   toJSON = toJSON . timestampText
