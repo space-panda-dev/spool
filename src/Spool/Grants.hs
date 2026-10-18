@@ -90,11 +90,9 @@ import Spool.Types (WorkerName, workerNameText)
 import Spool.Wire
   ( Ack (..)
   , FailRequest (..)
-  , FetchRequest (..)
   , LeaseRef (..)
   , ResultRecord (..)
   , canonical
-  , parseFetchRequest
   )
 
 accountGrantPaths :: IO (FilePath, FilePath)
