@@ -49,13 +49,12 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Directory (createDirectoryIfMissing, listDirectory, removeFile,
                          removePathForcibly, renameDirectory, renameFile)
 import System.FilePath (takeDirectory, takeExtension, (</>))
-import System.IO (Handle, IOMode (AppendMode), hClose, hFlush, openBinaryTempFile,
-                  openFile)
+import System.IO (Handle, hClose, hFlush, openBinaryTempFile)
 import GHC.IO.Handle.Lock (LockMode (ExclusiveLock), hLock)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.Posix.Files (FileStatus, createLink, getFileStatus)
-import System.Posix.IO (OpenFileFlags (creat, exclusive), OpenMode (ReadOnly, WriteOnly), closeFd,
-                        defaultFileFlags, handleToFd, openFd)
+import System.Posix.IO (OpenFileFlags (cloexec, creat, exclusive), OpenMode (ReadOnly, WriteOnly),
+                        closeFd, defaultFileFlags, fdToHandle, handleToFd, openFd)
 import System.Posix.Types (Fd)
 import System.Posix.Unistd (fileSynchronise)
 import qualified Data.Text as T
@@ -89,15 +88,23 @@ data Paths = Paths
 -- lock (flock(2) under the hood) is scoped to the OS process, so two threads
 -- in the same process racing to open and lock the same path is not the
 -- cross-process case it was designed for, and observably (macOS, GHC 9.14) a
--- losing "openFile" can raise "resource busy" instead of blocking. The
+-- losing open can raise "resource busy" instead of blocking. The
 -- spool's own mutex serialises those threads before any of them touches the
 -- file, leaving the file lock doing only what it always did: keeping a
 -- second "spool" process out.
+--
+-- The lock belongs to the open file, not to the descriptor, so a program
+-- started while it is held, by another thread, would hold it until that
+-- program ended. The file is opened close-on-exec, and programs are started
+-- with only their three pipes, so no program ever holds it.
 withLock :: Paths -> IO a -> IO a
 withLock paths action = withMVar (processLock paths) $ \() ->
-  bracket (openFile (lockPath paths) AppendMode) hClose $ \handle -> do
+  bracket openLock hClose $ \handle -> do
     hLock handle ExclusiveLock
     action
+  where
+    openLock = openFd (lockPath paths) WriteOnly defaultFileFlags
+      { creat = Just 0o644, cloexec = True } >>= fdToHandle
 
 -- | The spool in a directory. A process opens its spool once and passes it
 -- on: the mutex that keeps its threads apart is made here, so two openings

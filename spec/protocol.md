@@ -516,7 +516,7 @@ names an absolute executable, optional arguments, a timeout, a payload limit,
 and an output limit; the configuration also sets the concurrency limit, the
 renew interval, and the complete environment a program receives. A program
 gets the payload on stdin in a fresh temporary directory, in its own process
-group. Exit 0 with JSON on stdout is a result; anything else is a failure,
+group, and inherits no open file but its stdin, stdout, and stderr. Exit 0 with JSON on stdout is a result; anything else is a failure,
 retried, up to the task's last attempt, unless the capability was unknown,
 the payload too large, or the program exited 65. `work` acknowledges with
 that result.
