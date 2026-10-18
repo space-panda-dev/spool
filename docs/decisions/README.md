@@ -28,3 +28,4 @@ document and the implementation say nothing of it until it is accepted.
 | [0017](0017-a-task-has-three-attempts.md) | A task has three attempts, and a program can say it is hopeless |
 | [0018](0018-finished-work-is-collected-or-ages-out.md) | Finished work is collected, or ages out |
 | [0019](0019-a-worker-may-follow-its-spool.md) | A worker may follow its spool |
+| [0020](0020-a-result-may-carry-attachments.md) | A result may carry attachments |
