@@ -1454,6 +1454,77 @@ spoolw results | jq -s -e \
   'map(select(.task_id == "work-concurrent-a" or .task_id == "work-concurrent-b")) | length == 2' >/dev/null
 check
 
+# A program gets its three pipes and no other descriptor, so one run from
+# max_concurrent threads holds neither the spool's lock nor another program's
+# pipes. Each of six programs notes its open descriptors beyond 0-2, marks its
+# start, sleeps two seconds, and waits for a release. All six are running at
+# once before any finishes, and the spool answers another process meanwhile.
+spoolcc() { "$spool_binary" --dir "$work/cc-spool" "$@"; }
+spoolcc init
+cc_n=6
+cc_started="$work/cc-started"
+cc_release="$work/cc-release"
+mkdir "$cc_started"
+# Run by sh -c rather than from a script file, so the shell holds no
+# descriptor of its own to be counted.
+cc_probe='
+cat >/dev/null
+fd_dir=/dev/fd
+if [ -d /proc/self/fd ]; then fd_dir=/proc/self/fd; fi
+fds=
+n=3
+while [ "$n" -lt 256 ]; do
+  if [ -e "$fd_dir/$n" ]; then fds="$fds,$n"; fi
+  n=$((n + 1))
+done
+: > "$1/$$"
+sleep 2
+i=0
+while [ ! -e "$2" ] && [ "$i" -lt 80 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+set -- "$1"/*
+printf "{\"fds\":[%s],\"started\":%d}\n" "${fds#,}" "$#"
+'
+jq -nc --arg path "$worker_path" --arg probe "$cc_probe" \
+  --arg started "$cc_started" --arg release "$cc_release" --argjson n "$cc_n" \
+  '{max_concurrent: $n, renew_seconds: 30, env: {PATH: $path},
+    capabilities: {"probe@1": {exec: "/bin/sh",
+      args: ["-c", $probe, "probe", $started, $release],
+      timeout_seconds: 30, max_payload_bytes: 1024, max_output_bytes: 1024}}}' \
+  > "$work/cc-config.json"
+for i in $(seq 1 "$cc_n"); do
+  printf '{"task_id":"cc-%s","capability":"probe@1","payload":{}}\n' "$i"
+done | spoolcc put >/dev/null
+cc_count() { find "$cc_started" -type f | wc -l | tr -d ' '; }
+(
+  i=0
+  while [ "$(cc_count)" -lt 1 ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  before=$SECONDS
+  spoolcc status --json > "$work/cc-status.json"
+  echo $((SECONDS - before)) > "$work/cc-status-seconds"
+  i=0
+  while [ "$(cc_count)" -lt "$cc_n" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  : > "$cc_release"
+) &
+cc_releaser=$!
+cc_before=$SECONDS
+spoolcc work --worker w1 --config "$work/cc-config.json" --max-tasks "$cc_n"
+cc_seconds=$((SECONDS - cc_before))
+wait "$cc_releaser"
+spoolcc failures | jq -s -e 'length == 0' >/dev/null; check
+spoolcc results | jq -s -e --argjson n "$cc_n" 'length == $n' >/dev/null; check
+# Every program saw all six started before it finished.
+spoolcc results | jq -s -e --argjson n "$cc_n" 'all(.[]; .result.started == $n)' >/dev/null; check
+# No program held a descriptor beyond its three pipes.
+spoolcc results | jq -s -e 'all(.[]; .result.fds == [])' >/dev/null; check
+# Six two-second programs at once take nowhere near twelve seconds.
+test "$cc_seconds" -lt 6; check
+# status, from another process, answered while the programs ran.
+jq -e '.leased >= 1' "$work/cc-status.json" >/dev/null; check
+test "$(cat "$work/cc-status-seconds")" -le 1; check
+
 # A lease reclaimed while work is running fences the worker's eventual ack.
 # The worker surfaces exit 4, stores no result, and leaves the re-pended task
 # for a replacement worker.

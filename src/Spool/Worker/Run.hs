@@ -313,6 +313,9 @@ startProgram capConfig envPairs cwdPath = do
     , std_out = CreatePipe
     , std_err = CreatePipe
     , create_group = True
+      -- Only the three pipes: not the spool's lock, nor another program's
+      -- pipes, held by a thread while this one was started.
+    , close_fds = True
     }
   case started of
     (Just input, Just output, Just errors, process) -> do

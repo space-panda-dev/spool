@@ -106,7 +106,9 @@ remoteConnection program arguments = Connection
   }
   where
     speaking word = (proc program (arguments <> [word]))
-      { std_in = CreatePipe, std_out = CreatePipe, std_err = Inherit }
+      { std_in = CreatePipe, std_out = CreatePipe, std_err = Inherit
+        -- Only those three: not another request's pipes, nor a program's.
+      , close_fds = True }
 
     feed writing line = BL.hPut writing (line <> "\n") >> hClose writing
 
