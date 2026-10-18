@@ -78,7 +78,7 @@ import Spool.Store
   , renewStep
   , failStep
   , abandonLease
-  , fetchFor
+  , fetchAttachment
   , checkStaged
   , liveLeaseOwned
   , Sender (..)
@@ -278,10 +278,11 @@ runRemote requested = do
         recover paths
         pure current
   case operation of
-    -- The two words that move bytes take the lock only on either side of
-    -- them (ADR 0020).
+    -- The words that move bytes take the lock only on either side of them
+    -- (ADR 0020).
     Access.RemoteSend -> sendCommand paths (void guarded)
       (GrantedWorker (Access.grantWorker grant) (Access.grantMaxResultBytes grant))
+    Access.RemoteFetch -> fetchAttachment paths (void guarded) (Just (Access.grantWorker grant))
     -- Taking a result attachment goes with reading the result (ADR 0016).
     Access.RemoteTake
       | Access.grantPut grant -> takeCommand paths (void guarded)
@@ -339,10 +340,7 @@ dispatchRemote paths grant operation = case operation of
   -- Handled before the lock is taken, by runRemote.
   Access.RemoteSend -> throwIO (malformed "send is not dispatched under the lock")
   Access.RemoteTake -> throwIO (malformed "take is not dispatched under the lock")
-  Access.RemoteFetch -> do
-    request <- orThrow malformed . parseFetchRequest =<< BL.getContents
-    either throwIO pure =<< ownedLive (fetchRef request)
-    fetchFor paths request
+  Access.RemoteFetch -> throwIO (malformed "fetch is not dispatched under the lock")
   where
     worker = Access.grantWorker grant
     reading command

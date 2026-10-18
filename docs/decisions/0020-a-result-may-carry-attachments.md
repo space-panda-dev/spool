@@ -102,7 +102,12 @@ Remote `put` with attachments is still exit 2, and still an
 carry them as it is; a request naming a task to be put would be another
 word.
 
-### Details the implementer decided, for the operator to confirm
+`fetch` follows the same rule. It held the lock while it wrote a task's
+attachment, so a large file sent to a slow reader stopped every other
+command on the spool; it now opens the file under the lock and writes it
+after letting go, as `take` does.
+
+### Details the implementer decided, confirmed by the operator on 2026-10-18
 
 1. A refused `outputs/`, and outputs over `max_result_attachment_bytes`, are
    failed without retry. The second could instead be retried as output past

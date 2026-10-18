@@ -56,15 +56,15 @@ data StoreCommand
   | Fail Retry
   | Failures
   | Results
-  | Fetch
   | GrantCommand T.Text WorkerName FilePath GrantOptions
   | RevokeCommand T.Text
   deriving (Eq, Show)
 
--- | The two commands that move a result attachment's bytes (ADR 0020).
+-- | The commands that move an attachment's bytes (ADR 0020).
 data Transfer
-  = Send  -- ^ a worker sends one under its lease
+  = Send  -- ^ a worker sends one of a result under its lease
   | Take  -- ^ a reader takes one of a done task
+  | Fetch  -- ^ a worker fetches one of its task under its lease
   deriving (Eq, Show)
 
 parseCommand :: [String] -> Either String (FilePath, Command)
@@ -87,7 +87,7 @@ parseSubcommand ["fail"] = store (Fail Retry)
 parseSubcommand ["fail", "--no-retry"] = store (Fail NoRetry)
 parseSubcommand ["failures"] = store Failures
 parseSubcommand ["results"] = store Results
-parseSubcommand ["fetch"] = store Fetch
+parseSubcommand ["fetch"] = Right (Moving Fetch)
 parseSubcommand ["send"] = Right (Moving Send)
 parseSubcommand ["take"] = Right (Moving Take)
 parseSubcommand ("grant" : "--peer" : peer : "--worker" : worker : "--key" : key : options) =

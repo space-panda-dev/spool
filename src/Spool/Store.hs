@@ -40,7 +40,6 @@ module Spool.Store
   , failuresCommand
   , resultsCommand
   , fetchAttachment
-  , fetchFor
   , Sender (..)
   , fitsLimit
   , sendCommand
@@ -72,7 +71,7 @@ import System.Directory (createDirectory, listDirectory, removeFile)
 import System.FilePath (takeBaseName, (</>))
 import System.IO (Handle, IOMode (ReadMode), SeekMode (AbsoluteSeek), hClose,
                   hSeek, hSetBinaryMode, openBinaryFile, openBinaryTempFile,
-                  stdin, withBinaryFile)
+                  stdin)
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.Files (fileSize, getFileStatus)
 import qualified Spool.Attachments as SA
@@ -766,34 +765,49 @@ resultsCommand paths = do
   records <- mapM readResultRecordFile files
   mapM_ (BLC.putStrLn . encode) (sortOn resultFinishedAt records)
 
-fetchAttachment :: Paths -> IO ()
-fetchAttachment paths =
-  BL.getContents >>= orThrow malformed . parseFetchRequest >>= fetchFor paths
+-- | Write one verified attachment of a leased task to stdout, for a request
+-- on stdin. As for 'takeCommand', the lease is checked and the file opened
+-- under the lock, and its bytes are verified and written after it is let
+-- go: a reader that is slow to read holds up nobody else. When a worker is
+-- named, the lease must be that worker's.
+fetchAttachment :: Paths -> IO () -> Maybe WorkerName -> IO ()
+fetchAttachment paths guard worker = do
+  request <- BL.getContents >>= orThrow malformed . parseFetchRequest
+  (attachment, handle) <- withLock paths $ do
+    guard
+    either throwIO pure =<< liveLeaseOwned paths worker (fetchRef request)
+    openFetched paths request
+  (`finally` hClose handle) $ do
+    verified <- SA.verifyHandle attachment handle
+    case verified of
+      Left message -> throwIO (corrupt
+        ("corrupt attachment for " <> showTask (refTask (fetchRef request))
+          <> ": " <> message))
+      Right () -> do
+        hSeek handle AbsoluteSeek 0
+        copyToOutput handle
 
--- | Write one verified attachment to stdout, for a request already read.
-fetchFor :: Paths -> FetchRequest -> IO ()
-fetchFor paths (FetchRequest (LeaseRef ident leaseIdent) digest) = do
-  let leasePath = leasedPath paths leaseIdent
-  present <- fileExists leasePath
-  unless present (throwIO (stale "lease is unknown or stale"))
-  task <- readTaskFile leasePath
-  unless (taskId task == ident)
-    (throwIO (stale "lease does not belong to task_id"))
+-- | Write what is left of a file to stdout.
+copyToOutput :: Handle -> IO ()
+copyToOutput handle = do
+  chunk <- BS.hGetSome handle 65536
+  unless (BS.null chunk) (BS.putStr chunk >> copyToOutput handle)
+
+-- | The declared attachment a current lease asks for, opened for reading.
+openFetched :: Paths -> FetchRequest -> IO (SA.Attachment, Handle)
+openFetched paths (FetchRequest (LeaseRef ident leaseIdent) digest) = do
+  task <- readTaskFile (leasedPath paths leaseIdent)
   attachment <- case
       [declaration | declaration <- taskAttachments task,
         SA.attachmentSha256 declaration == digest] of
     declaration : _ -> pure declaration
     [] -> throwIO (malformed "attachment is not declared by the task")
   let path = SA.attachmentPath (attachmentsDir paths) ident attachment
-  verified <- SA.verifyAttachmentFile attachment path
-  case verified of
-    Left message -> throwIO (corrupt
-      ("corrupt attachment for " <> showTask ident <> ": " <> message))
-    Right () -> withBinaryFile path ReadMode copyToOutput
-  where
-    copyToOutput handle = do
-      chunk <- BS.hGetSome handle 65536
-      unless (BS.null chunk) (BS.putStr chunk >> copyToOutput handle)
+  present <- fileExists path
+  unless present (throwIO (corrupt
+    ("attachment " <> digestOf attachment <> " of " <> showTask ident <> " is missing")))
+  handle <- openBinaryFile path ReadMode
+  pure (attachment, handle)
 
 writeResultRecord
   :: Paths -> Task -> LeaseId -> WorkerName -> A.Value -> [SA.Attachment]
@@ -1052,10 +1066,6 @@ takeCommand paths guard = do
       Right () -> do
         hSeek handle AbsoluteSeek 0
         copyToOutput handle
-  where
-    copyToOutput handle = do
-      chunk <- BS.hGetSome handle 65536
-      unless (BS.null chunk) (BS.putStr chunk >> copyToOutput handle)
 
 -- | The result records of a task, found by their names and checked to be
 -- its own.

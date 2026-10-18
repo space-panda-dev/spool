@@ -33,6 +33,9 @@ writes each only where it holds something:
   `max_result_attachment_bytes`; a 0.0.3 worker refuses it (exit 2).
 - Exit 6 is new: a grant's limit on result attachments refuses a send.
 - `collect` and `gc` delete a done task's result attachments with it.
+- `fetch` no longer holds the spool's lock while it writes: the lease is
+  checked and the file opened under it, and the bytes are verified and
+  written after it is let go. Its requests and answers are unchanged.
 
 A run whose program leaves nothing in `outputs/` is sent and acknowledged
 exactly as under 0.0.3, so a 0.0.4 worker may work a 0.0.3 spool for such
@@ -375,7 +378,11 @@ that history from terminal failure.
 
 The task and lease must be current and the digest must be declared by that
 task. The spool verifies the stored bytes against both the declared SHA-256
-and size before writing the raw bytes to stdout. Diagnostics use stderr. The
+and size before writing the raw bytes to stdout. It checks the lease and
+opens the file under the spool's lock, and verifies and writes the bytes
+after letting it go, so a reader slow to read holds up no other command; a
+lease that ends meanwhile does not stop a fetch already begun. Diagnostics
+use stderr. The
 receiver verifies digest and size again before exposing the file. Ranges,
 resumption, paths, and multiple requests in one invocation are unsupported.
 Malformed requests and undeclared digests are exit 2. An unknown, stale, or

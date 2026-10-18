@@ -72,7 +72,7 @@ acceptedForms =
   , (["fail", "--no-retry"], Store (Fail NoRetry))
   , (["failures"], Store Failures)
   , (["results"], Store Results)
-  , (["fetch"], Store Fetch)
+  , (["fetch"], Moving Fetch)
   , (["send"], Moving Send)
   , (["take"], Moving Take)
   , (["reclaim", "--older-than", "0"], Store (Reclaim 0))

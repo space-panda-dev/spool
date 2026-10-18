@@ -92,6 +92,7 @@ run args = case args of
         case transfer of
           Send -> sendCommand paths (recover paths) HostWorker
           Take -> takeCommand paths (recover paths)
+          Fetch -> fetchAttachment paths (recover paths) Nothing
 
 runStoreCommand :: StoreCommand -> Paths -> IO ()
 runStoreCommand command paths = case command of
@@ -103,7 +104,6 @@ runStoreCommand command paths = case command of
   Fail retry -> failTasks retry paths
   Failures -> failuresCommand paths
   Results -> resultsCommand paths
-  Fetch -> fetchAttachment paths
   Reclaim age -> reclaimTasks paths age
   Collect -> collectTasks paths
   Gc age -> gcTasks paths age

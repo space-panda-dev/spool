@@ -1887,6 +1887,54 @@ remote_attachment_ack=$(jq -nc --arg lease "$remote_attachment_lease" \
   '{task_id:"remote-attachment",lease_id:$lease,result:{fetched:true}}')
 printf '%s\n' "$remote_attachment_ack" | remote_primary 'ack' >/dev/null
 
+# The lock is not held while fetch writes. A fetch whose reader has stopped
+# reading is blocked on its output, and status answers from another process
+# meanwhile, locally and through the remote command; the bytes then arrive
+# whole.
+head -c 2000000 /dev/urandom > "$work/fetch-big"
+if command -v sha256sum >/dev/null 2>&1; then
+  fetch_big_digest=$(sha256sum "$work/fetch-big" | awk '{print $1}')
+else
+  fetch_big_digest=$(shasum -a 256 "$work/fetch-big" | awk '{print $1}')
+fi
+cp "$work/fetch-big" "$attachment_source/$fetch_big_digest"
+slow_fetch() {
+  local name=$1 status_command=$2; shift 2
+  mkfifo "$work/$name-pipe"
+  "$@" > "$work/$name-pipe" &
+  local pid=$!
+  exec 9<"$work/$name-pipe"
+  dd bs=1 count=1 <&9 > "$work/$name-first" 2>/dev/null
+  test -s "$work/$name-first"; check
+  $status_command > /dev/null; check
+  cat <&9 > "$work/$name-rest"
+  exec 9<&-
+  wait "$pid"; check
+  cat "$work/$name-first" "$work/$name-rest" | cmp - "$work/fetch-big"; check
+}
+for spool_kind in local remote; do
+  jq -nc --arg task "slow-fetch-$spool_kind" --arg digest "$fetch_big_digest" \
+    '{task_id:$task,capability:"remote@1",payload:{},attachments:[{sha256:$digest,size:2000000}]}' \
+    | spoolg put --attachments "$attachment_source" >/dev/null
+done
+"$spool_binary" --dir "$work/grant-spool" lease --worker slow-local > "$work/slow-local-lease.json"
+jq -e '.task_id == "slow-fetch-local"' "$work/slow-local-lease.json" >/dev/null; check
+slow_local_lease=$(jq -r '.lease_id' "$work/slow-local-lease.json")
+slow_status_local() { timeout 5 "$spool_binary" --dir "$work/grant-spool" status --json; }
+slow_fetch slow-fetch-local slow_status_local sh -c \
+  "printf '%s\n' '$(jq -nc --arg l "$slow_local_lease" --arg d "$fetch_big_digest" '{task_id:"slow-fetch-local",lease_id:$l,sha256:$d}')' \
+    | '$spool_binary' --dir '$work/grant-spool' fetch"
+remote_primary 'lease' > "$work/slow-remote-lease.json"
+jq -e '.task_id == "slow-fetch-remote"' "$work/slow-remote-lease.json" >/dev/null; check
+slow_remote_lease=$(jq -r '.lease_id' "$work/slow-remote-lease.json")
+slow_remote_request=$(jq -nc --arg l "$slow_remote_lease" --arg d "$fetch_big_digest" '{task_id:"slow-fetch-remote",lease_id:$l,sha256:$d}')
+slow_fetch slow-fetch-remote slow_status_local sh -c \
+  "printf '%s\n' '$slow_remote_request' | HOME='$grant_home' SSH_ORIGINAL_COMMAND=fetch '$spool_binary' remote --grant '$grant_id'"
+for slow_lease in "$slow_local_lease" "$slow_remote_lease"; do
+  jq -nc --arg l "$slow_lease" --arg t "$(jq -r .task_id "$work/grant-spool/leased/$slow_lease.json")" \
+    '{task_id:$t,lease_id:$l,result:{}}' | spoolg ack >/dev/null
+done
+
 # The remote command is an exact byte grammar.  Shell metacharacters,
 # whitespace variants, local-only operations, options, and non-canonical
 # counts never reach a handler.  The Cabal test suite covers NUL; these
