@@ -62,3 +62,47 @@ the tested commit hash and the A/B/C role-to-machine mapping. On failure,
 preserve the same files plus stderr; inspect state with local commands on A.
 The script removes only the exact attachment staging file and exact B/C files
 it created. It leaves the spool and its durable result/failure evidence intact.
+
+## Observed in production
+
+Use is not a gate, and does not replace a run of the script above: nothing
+below killed a worker, reclaimed a lease, or answered a late ack. It records
+what spool 0.0.3 (ef7bd7f) did under real load, so the gate's evidence and
+the field's agree.
+
+### 2026-10-17: a two-machine calibration batch
+
+A caller split one long computation into 175 tasks of one capability, with
+content-derived task IDs. Payloads were a digest and two indices; each
+machine held a copy of the 94 MB input beforehand, so nothing travelled as
+an attachment. The spool lived on a Linux laptop (8 cores, 14 GiB); both
+that laptop and a macOS laptop (8 cores, 16 GB) worked it through their own
+grants with `work --via`, at 6 and 4 concurrent tasks. One task alone took
+22 min 32 s on the macOS worker.
+
+| | |
+|---|---|
+| tasks put (remote, through a grant) | 175: one first, then 174 at once |
+| wall time, put to last result | 6 h 04 min (5 h 40 min for the 174) |
+| failures, retries, reclaims, stale answers | 0 at every status taken |
+| results read, then `collect`ed | 175 of 175; the spool ended with its prior counts |
+| Linux worker unit | 31 h 14 min CPU in 5 h 40 min wall, 5.4 GB peak memory |
+| lease renewals over SSH, every 30 s | about 7,000, none refused |
+| first worker done to last worker done | 23 min: the last two tasks ran on one machine |
+
+On the spool's host, against a quiet window of the same length the next
+night, the run added at most 0.14 cores of system time and 3.7 process
+creations a second, beside 5.9 cores of the capability's own work. Disk
+writes were no higher than at rest. Spool's own cost did not register.
+
+Measured afterwards against the same spool:
+
+- One remote request from the macOS worker cost 788 ms at the median and
+  1.7 s at p95, almost all of it SSH connection setup over a 59 ms link. With
+  OpenSSH connection sharing (`ControlMaster`/`ControlPersist` in the
+  `--via` command) the same request cost 147 ms, p95 160 ms. On the host,
+  over loopback, a request cost 188 ms.
+- A local worker's resident memory stayed at 38 MB across 1,500 tasks.
+
+What it did not exercise: worker death and reclaim, the retry cap and exit
+65 under load, attachments, revocation, and `gc`.
