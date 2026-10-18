@@ -106,3 +106,34 @@ Measured afterwards against the same spool:
 
 What it did not exercise: worker death and reclaim, the retry cap and exit
 65 under load, attachments, revocation, and `gc`.
+
+### 2026-10-18: result attachments across two machines
+
+Spool 0.0.4 before release (this branch), as a check of
+[ADR 0020](decisions/0020-a-result-may-carry-attachments.md), not the
+scripted gate: a scratch spool on the Linux laptop, a grant with
+`--max-result-bytes 300000000`, and a macOS worker reaching it over the
+tailnet with `work --via ssh …`. The grant's forced command was stood in for
+by a wrapper that sets `SSH_ORIGINAL_COMMAND` and runs `spool remote
+--grant`, so the authorized-keys line itself was not exercised.
+
+Three tasks each carried a 40 MB attachment; the capability hashed it and
+left two 60 MB files in `outputs/`.
+
+| | |
+|---|---|
+| attachments fetched by the worker, then verified by its program | 3 of 3, digests equal |
+| result files sent, staged, and acked | 4 (two tasks), 240 MB |
+| the third task against the grant's limit | its first file staged (300 MB held), its second refused (exit 6); failed with retry, and the next two attempts the same, so it ended failed after 3 attempts |
+| `take`, local and remote, by the caller on the host | 4 of 4 files, digests equal |
+| `collect` | everything gone: no attachment, staged, or result file left |
+| `status` from another process every 0.5 s throughout | 492 answers, mean 12 ms, slowest 71 ms |
+
+Then the third task was put again and a worker killed with SIGKILL while it
+was sending: the host's `send` saw a short stream and kept nothing, `reclaim`
+returned the task, and a fresh worker finished it; both files were taken and
+collected, leaving the spool empty.
+
+What it showed beyond the tests: a send refused for the limit counts as an
+attempt, and a worker that leases again at once spends all three in about a
+minute, rerunning the program each time.
