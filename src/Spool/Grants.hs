@@ -65,7 +65,6 @@ import Spool.Input
 import Spool.Store
   ( recover
   , putTasks
-  , readTaskFile
   , readResultRecordFile
   , readWorkerSidecar
   , leaseIdOfFile
@@ -80,6 +79,11 @@ import Spool.Store
   , failStep
   , abandonLease
   , fetchFor
+  , checkStaged
+  , liveLeaseOwned
+  , Sender (..)
+  , sendCommand
+  , takeCommand
   )
 import Spool.Cli (GrantOptions (..))
 import Spool.Types (WorkerName, workerNameText)
@@ -89,7 +93,6 @@ import Spool.Wire
   , FetchRequest (..)
   , LeaseRef (..)
   , ResultRecord (..)
-  , Task (..)
   , canonical
   , parseFetchRequest
   )
@@ -121,7 +124,7 @@ grantAccess paths peer worker keyPath options = do
   identifier <- freshGrantId grants
   grant <- orThrow malformed (Access.validateGrant
     (Access.grantIdText identifier) peer (workerNameText worker) canonicalSpool
-    (Access.publicKeyText publicKey) put expiry)
+    (Access.publicKeyText publicKey) put (grantOptionMaxResultBytes options) expiry)
   -- The forced command names a program by absolute path. By default that is
   -- this binary's own canonical path, which under a store such as Nix's is
   -- one build of it; a path chosen by the owner, kept pointing at whatever
@@ -267,11 +270,23 @@ runRemote requested = do
     (Access.parseRemoteCommand (fromMaybe BS.empty command))
   paths <- openSpool (Access.grantSpool grant)
   initialise paths
-  withLock paths $ do
-    current <- loadActiveRemoteGrant identifier path
-    unless (Access.grantSpool current == rootDir paths) (throwIO noGrant)
-    recover paths
-    dispatchRemote paths current operation
+  -- Under the lock, before anything is done: the grant is read again, and
+  -- the spool recovered.
+  let guarded = do
+        current <- loadActiveRemoteGrant identifier path
+        unless (Access.grantSpool current == rootDir paths) (throwIO noGrant)
+        recover paths
+        pure current
+  case operation of
+    -- The two words that move bytes take the lock only on either side of
+    -- them (ADR 0020).
+    Access.RemoteSend -> sendCommand paths (void guarded)
+      (GrantedWorker (Access.grantWorker grant) (Access.grantMaxResultBytes grant))
+    -- Taking a result attachment goes with reading the result (ADR 0016).
+    Access.RemoteTake
+      | Access.grantPut grant -> takeCommand paths (void guarded)
+      | otherwise -> throwIO (grantRefused "grant does not permit reading the spool")
+    _ -> withLock paths (guarded >>= \current -> dispatchRemote paths current operation)
 
 -- | A peer learns that it has no grant, and never why.
 noGrant :: SpoolError
@@ -313,6 +328,7 @@ dispatchRemote paths grant operation = case operation of
   -- the grant's worker's is answered stale, and the others are acted on.
   Access.RemoteAck -> do
     acks <- mapM parseAckLine =<< inputLines
+    mapM_ (checkStaged paths) acks
     answerEach ackRef (ownedAck `before` ackStep paths) acks
   Access.RemoteRenew -> do
     references <- mapM parseLeaseRefLine =<< inputLines
@@ -320,6 +336,9 @@ dispatchRemote paths grant operation = case operation of
   Access.RemoteFail retry -> do
     requests <- mapM parseFailLine =<< inputLines
     answerEach failRef ((ownedLive . failRef) `before` failStep retry paths) requests
+  -- Handled before the lock is taken, by runRemote.
+  Access.RemoteSend -> throwIO (malformed "send is not dispatched under the lock")
+  Access.RemoteTake -> throwIO (malformed "take is not dispatched under the lock")
   Access.RemoteFetch -> do
     request <- orThrow malformed . parseFetchRequest =<< BL.getContents
     either throwIO pure =<< ownedLive (fetchRef request)
@@ -329,7 +348,7 @@ dispatchRemote paths grant operation = case operation of
     reading command
       | Access.grantPut grant = command
       | otherwise = throwIO (grantRefused "grant does not permit reading the spool")
-    ownedLive = liveLeaseOwned paths worker
+    ownedLive = liveLeaseOwned paths (Just worker)
     ownedAck ack = ackOwned paths worker (ackRef ack)
     -- Act on an item only if its lease is the grant's worker's.
     before owned step item = do
@@ -338,30 +357,13 @@ dispatchRemote paths grant operation = case operation of
         Left refusal -> pure (Left refusal)
         Right () -> step item
 
--- | Whether a live lease is this worker's to act on.
-liveLeaseOwned :: Paths -> WorkerName -> LeaseRef -> IO (Either SpoolError ())
-liveLeaseOwned paths worker (LeaseRef ident leaseIdent) = do
-  let path = leasedPath paths leaseIdent
-  present <- fileExists path
-  if not present
-    then pure (Left (stale "lease is unknown or stale"))
-    else do
-      task <- readTaskFile path
-      if taskId task /= ident
-        then pure (Left (stale "lease does not belong to task_id"))
-        else do
-          owner <- readWorkerSidecar paths leaseIdent
-          pure $ if owner == worker
-            then Right ()
-            else Left (stale "lease belongs to a different worker")
-
 -- | Whether a lease is this worker's to acknowledge: live and its own, or
 -- already done by it, so that repeating an acknowledgement is allowed.
 ackOwned :: Paths -> WorkerName -> LeaseRef -> IO (Either SpoolError ())
 ackOwned paths worker reference@(LeaseRef ident leaseIdent) = do
   live <- fileExists (leasedPath paths leaseIdent)
   if live
-    then liveLeaseOwned paths worker reference
+    then liveLeaseOwned paths (Just worker) reference
     else do
       let path = resultPath paths leaseIdent
       present <- fileExists path

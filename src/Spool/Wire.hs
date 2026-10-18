@@ -17,12 +17,16 @@ module Spool.Wire
   , Ack (..)
   , FailRequest (..)
   , FetchRequest (..)
+  , SendRequest (..)
+  , TakeRequest (..)
   , Answer (..)
   , parseAnswer
   , parseLeaseRef
   , parseAck
   , parseFail
   , parseFetchRequest
+  , parseSendRequest
+  , parseTakeRequest
   , parseCollectRequest
     -- * What the spool keeps
   , ResultRecord (..)
@@ -38,6 +42,7 @@ module Spool.Wire
   , encodeAckResult
   , encodeRenewResult
   , encodeFailResult
+  , encodeSendResult
   , encodeStaleResult
   , encodeReclaimResult
   , encodeCollectResult
@@ -127,13 +132,24 @@ referenceFields :: LeaseRef -> [AT.Pair]
 referenceFields reference =
   ["task_id" .= refTask reference, "lease_id" .= refLease reference]
 
+-- | An acknowledgement: the result, and the result attachments sent under
+-- the lease that it files with the task (ADR 0020).
 data Ack = Ack
   { ackRef :: LeaseRef
   , ackResult :: A.Value
+  , ackAttachments :: [SA.Attachment]
   } deriving (Eq, Show)
 
 instance ToJSON Ack where
-  toJSON ack = A.object (referenceFields (ackRef ack) <> ["result" .= ackResult ack])
+  toJSON ack = A.object (referenceFields (ackRef ack) <> ["result" .= ackResult ack]
+    <> attachmentsField (ackAttachments ack))
+
+-- | Result attachments are written only when there are some, so that an
+-- acknowledgement or a result without them is what 0.0.3 wrote, byte for
+-- byte, and an older reader meets the field only where it matters.
+attachmentsField :: [SA.Attachment] -> [AT.Pair]
+attachmentsField [] = []
+attachmentsField attachments = ["attachments" .= attachments]
 
 data FailRequest = FailRequest
   { failRef :: LeaseRef
@@ -153,6 +169,29 @@ instance ToJSON FetchRequest where
   toJSON request =
     A.object (referenceFields (fetchRef request) <> ["sha256" .= fetchDigest request])
 
+-- | One result attachment a worker sends under its lease: the bytes follow
+-- this request on the same stream.
+data SendRequest = SendRequest
+  { sendRef :: LeaseRef
+  , sendAttachment :: SA.Attachment
+  } deriving (Eq, Show)
+
+instance ToJSON SendRequest where
+  toJSON request = A.object (referenceFields (sendRef request)
+    <> [ "sha256" .= SA.attachmentSha256 (sendAttachment request)
+       , "size" .= SA.attachmentSize (sendAttachment request) ])
+
+-- | One result attachment of a done task, asked for by whoever reads its
+-- result.
+data TakeRequest = TakeRequest
+  { takeTask :: TaskId
+  , takeDigest :: SA.Sha256
+  } deriving (Eq, Show)
+
+instance ToJSON TakeRequest where
+  toJSON request =
+    A.object ["task_id" .= takeTask request, "sha256" .= takeDigest request]
+
 -- | The record of an acknowledged task, kept until whoever put the task
 -- reads it.
 data ResultRecord = ResultRecord
@@ -162,17 +201,18 @@ data ResultRecord = ResultRecord
   , resultWorker :: WorkerName
   , resultFinishedAt :: Timestamp
   , resultValue :: A.Value
+  , resultAttachments :: [SA.Attachment]
   } deriving (Eq, Show)
 
 instance ToJSON ResultRecord where
-  toJSON record = A.object
+  toJSON record = A.object $
     [ "task_id" .= resultTask record
     , "lease_id" .= resultLease record
     , "capability" .= resultCapability record
     , "worker" .= resultWorker record
     , "finished_at" .= resultFinishedAt record
     , "result" .= resultValue record
-    ]
+    ] <> attachmentsField (resultAttachments record)
 
 -- | The record of one reported failure, whether or not the task went back
 -- to pending.
@@ -288,12 +328,22 @@ parseLeaseRef = strictObject "lease reference" ["task_id", "lease_id"] $ \object
   leaseRef identText leaseText
 
 parseAck :: BL.ByteString -> Either String Ack
-parseAck = strictObject "ack" ["task_id", "lease_id", "result"] $ \object -> do
-  identText <- requiredText "task_id" object
-  leaseText <- requiredText "lease_id" object
-  result <- required "ack is missing result" "result" object
-  reference <- leaseRef identText leaseText
-  pure (Ack reference result)
+parseAck = strictObject "ack" ["task_id", "lease_id", "result", "attachments"] $
+  \object -> do
+    identText <- requiredText "task_id" object
+    leaseText <- requiredText "lease_id" object
+    result <- required "ack is missing result" "result" object
+    attachments <- optionalAttachments object
+    reference <- leaseRef identText leaseText
+    pure (Ack reference result attachments)
+
+-- | An attachments field that may be left out, and is then empty.
+optionalAttachments :: Object -> Either String [SA.Attachment]
+optionalAttachments object = case KM.lookup "attachments" object of
+  Nothing -> Right []
+  Just value -> case A.fromJSON value of
+    A.Error message -> Left message
+    A.Success declarations -> SA.validateAttachments declarations
 
 parseFail :: BL.ByteString -> Either String FailRequest
 parseFail = strictObject "fail" ["task_id", "lease_id", "reason"] $ \object -> do
@@ -313,6 +363,33 @@ parseFetchRequest = strictObject "fetch request"
     digest <- SA.mkSha256 digestText
     pure (FetchRequest reference digest)
 
+parseSendRequest :: BL.ByteString -> Either String SendRequest
+parseSendRequest = strictObject "send request"
+  ["task_id", "lease_id", "sha256", "size"] $ \object -> do
+    identText <- requiredText "task_id" object
+    leaseText <- requiredText "lease_id" object
+    digestText <- requiredText "sha256" object
+    size <- case KM.lookup "size" object of
+      Nothing -> Left "missing size"
+      Just value -> case A.fromJSON value of
+        A.Error message -> Left message
+        A.Success declared -> Right declared
+    reference <- leaseRef identText leaseText
+    digest <- SA.mkSha256 digestText
+    attachment <- case SA.validateAttachments [SA.Attachment digest size] of
+      Right [declared] -> Right declared
+      Right _ -> Left "send request must declare one attachment"
+      Left message -> Left message
+    pure (SendRequest reference attachment)
+
+parseTakeRequest :: BL.ByteString -> Either String TakeRequest
+parseTakeRequest = strictObject "take request" ["task_id", "sha256"] $ \object -> do
+  identText <- requiredText "task_id" object
+  digestText <- requiredText "sha256" object
+  ident <- mkTaskId identText
+  digest <- SA.mkSha256 digestText
+  pure (TakeRequest ident digest)
+
 -- | A task a caller has read what came of, and is done with.
 parseCollectRequest :: BL.ByteString -> Either String TaskId
 parseCollectRequest = strictObject "collect request" ["task_id"] $ \object ->
@@ -326,11 +403,13 @@ leaseRef identText leaseText = LeaseRef <$> mkTaskId identText <*> mkLeaseId lea
 
 parseResultRecord :: BL.ByteString -> Either String ResultRecord
 parseResultRecord = strictObject "result record"
-  ["task_id", "lease_id", "capability", "worker", "finished_at", "result"] $
+  [ "task_id", "lease_id", "capability", "worker", "finished_at", "result"
+  , "attachments" ] $
   \object -> do
     (ident, lease, capability, worker) <- recordIdentity object
     finishedAt <- requiredText "finished_at" object
     result <- required "missing result" "result" object
+    attachments <- optionalAttachments object
     pure ResultRecord
       { resultTask = ident
       , resultLease = lease
@@ -338,6 +417,7 @@ parseResultRecord = strictObject "result record"
       , resultWorker = worker
       , resultFinishedAt = storedTimestamp finishedAt
       , resultValue = result
+      , resultAttachments = attachments
       }
 
 parseFailureRecord :: BL.ByteString -> Either String FailureRecord
@@ -411,6 +491,10 @@ encodeFailResult :: LeaseRef -> Retry -> BL.ByteString
 encodeFailResult reference retry = answer reference $ case retry of
   Retry -> "failed_retry"
   NoRetry -> "failed"
+
+-- | A result attachment is staged under its lease, for its ack to file.
+encodeSendResult :: LeaseRef -> BL.ByteString
+encodeSendResult reference = answer reference "staged"
 
 -- | The answer to a line whose lease is stale, unknown, another task's, or
 -- another worker's.  It does not say which.

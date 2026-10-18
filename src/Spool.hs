@@ -15,6 +15,7 @@ import System.Exit (ExitCode (..), exitWith)
 import Spool.Cli
   ( Command (..)
   , StoreCommand (..)
+  , Transfer (..)
   , parseCommand
   , parseWorkShow
   , parseWorkVia
@@ -35,7 +36,10 @@ import Spool.Store
   , recover
   , renewTasks
   , resultsCommand
+  , Sender (..)
+  , sendCommand
   , statusTasks
+  , takeCommand
   , withStore
   )
 import Spool.Worker.Config (runWorkShow)
@@ -82,6 +86,12 @@ run args = case args of
       WorkVia {} -> throwIO (Usage "spool: work --via takes no --dir")
       WorkShow configPath -> runWorkShow configPath
       Store transition -> withStore directory (runStoreCommand transition)
+      Moving transfer -> do
+        paths <- openSpool directory
+        initialise paths
+        case transfer of
+          Send -> sendCommand paths (recover paths) HostWorker
+          Take -> takeCommand paths (recover paths)
 
 runStoreCommand :: StoreCommand -> Paths -> IO ()
 runStoreCommand command paths = case command of

@@ -4,7 +4,7 @@
 }:
 mkDerivation {
   pname = "spool";
-  version = "0.0.3";
+  version = "0.0.4";
   src = ./.;
   isLibrary = true;
   isExecutable = true;

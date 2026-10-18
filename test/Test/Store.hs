@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The retry cap of ADR 0017: how many attempts a task has had, counted
--- from its failure records, and the lease names those records are found by.
+-- from its failure records, and the lease names those records are found by;
+-- and the room a grant's limit leaves for result attachments (ADR 0020).
 module Test.Store (tests) where
 
+import Data.Int (Int64)
 import qualified Data.Text as T
-import Spool.Store (attemptsBefore, retryCap)
+import Spool.Store (attemptsBefore, fitsLimit, retryCap)
 import Spool.Types
   ( Retry (..)
   , leaseSerialAndTask
@@ -25,7 +27,24 @@ import Test.Tasty.QuickCheck
   )
 
 tests :: TestTree
-tests = testGroup "retry cap"
+tests = testGroup "store" [retryCapTests, limitTests]
+
+limitTests :: TestTree
+limitTests = testGroup "a grant's limit on result attachments"
+  [ testCase "a limit of 0 holds nothing, not even an empty file" $
+      fitsLimit 0 0 0 @?= False
+  , testCase "a file may fill the limit exactly" $
+      fitsLimit 10 4 6 @?= True
+  , testCase "one byte past the limit is refused" $
+      fitsLimit 10 5 6 @?= False
+  , testCase "what is held counts" $
+      (fitsLimit 10 10 0, fitsLimit 10 11 0) @?= (True, False)
+  , testCase "the largest sizes do not wrap" $
+      fitsLimit maxBound (toInteger (maxBound :: Int64)) maxBound @?= False
+  ]
+
+retryCapTests :: TestTree
+retryCapTests = testGroup "retry cap"
   [ testCase "three attempts in all" (retryCap @?= 2)
   , testCase "a task with no records has had no attempt"
       (attemptsBefore [] @?= 0)

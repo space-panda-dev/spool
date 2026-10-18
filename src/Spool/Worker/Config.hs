@@ -37,6 +37,9 @@ data CapabilityConfig = CapabilityConfig
   , capTimeoutSeconds :: Int
   , capMaxPayloadBytes :: Int64
   , capMaxOutputBytes :: Int64
+  , capMaxResultAttachmentBytes :: Maybe Int64
+    -- ^ The most bytes a run may leave in outputs/ to send back with its
+    -- result. A capability without it may leave none (ADR 0020).
   } deriving (Eq, Show)
 
 data WorkConfig = WorkConfig
@@ -102,6 +105,14 @@ positiveField limit key def object = case KM.lookup (K.fromText key) object of
     outOfRange = T.unpack key <> " must be a positive integer no greater than "
       <> show limit
 
+-- | A whole number from 1 through `limit`, or nothing when it is left out.
+optionalPositiveField
+  :: (A.FromJSON a, Integral a, Show a)
+  => a -> T.Text -> Object -> Either String (Maybe a)
+optionalPositiveField limit key object = case KM.lookup (K.fromText key) object of
+  Nothing -> Right Nothing
+  Just _ -> Just <$> positiveField limit key Nothing object
+
 -- | The largest number of seconds whose microseconds still fit the Int that
 -- `threadDelay` takes.
 maxDelaySeconds :: Int
@@ -139,7 +150,8 @@ parseCapabilityEntry key value = do
   case value of
     A.Object object -> do
       rejectUnknown
-        ["exec", "args", "timeout_seconds", "max_payload_bytes", "max_output_bytes"]
+        [ "exec", "args", "timeout_seconds", "max_payload_bytes", "max_output_bytes"
+        , "max_result_attachment_bytes" ]
         object
       execPath <- requiredCapText "exec" object
       unless (isAbsolute (T.unpack execPath))
@@ -148,7 +160,9 @@ parseCapabilityEntry key value = do
       timeoutSeconds <- positiveField maxDelaySeconds "timeout_seconds" Nothing object
       maxPayload <- positiveField maxBound "max_payload_bytes" Nothing object
       maxOutput <- positiveField maxBound "max_output_bytes" Nothing object
-      pure (capability, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload maxOutput)
+      maxResultAttachments <- optionalPositiveField maxBound "max_result_attachment_bytes" object
+      pure (capability, CapabilityConfig (T.unpack execPath) args timeoutSeconds maxPayload
+        maxOutput maxResultAttachments)
     _ -> Left (T.unpack capText <> " must be an object")
 
 checkExecutables :: WorkConfig -> IO (Either String ())
@@ -184,10 +198,11 @@ encodeWorkConfig config = canonical (A.object
   ])
 
 encodeCapabilityConfig :: CapabilityConfig -> A.Value
-encodeCapabilityConfig capConfig = A.object
+encodeCapabilityConfig capConfig = A.object $
   [ "exec" .= capExec capConfig
   , "args" .= capArgs capConfig
   , "timeout_seconds" .= capTimeoutSeconds capConfig
   , "max_payload_bytes" .= capMaxPayloadBytes capConfig
   , "max_output_bytes" .= capMaxOutputBytes capConfig
-  ]
+  ] <> maybe [] (\limit -> ["max_result_attachment_bytes" .= limit])
+    (capMaxResultAttachmentBytes capConfig)

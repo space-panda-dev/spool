@@ -91,7 +91,8 @@ import System.Process
 import System.Timeout (timeout)
 import qualified Spool.Attachments as SA
 import Spool.Error
-  ( SpoolError
+  ( ErrorClass (..)
+  , SpoolError (..)
   , corrupt
   , exitStatus
   , report
@@ -113,10 +114,15 @@ import Spool.Worker.Config
   )
 import Spool.Worker.Connection (Connection (..))
 import Spool.Worker.Follow (awaitLease)
+import Spool.Worker.Outputs (collectOutputs)
 
 -- | The outcome of running a capability's executable to completion: a
 -- failure says whether the task is to be tried again.
 data RunOutcome = RunSuccess BL.ByteString | RunFailure Retry T.Text
+
+-- | What a run comes to once its outputs are sent: a result and the result
+-- attachments sent with it, or a failure.
+data Returned = Returned A.Value [SA.Attachment] | Failed Retry T.Text
 
 -- | Whether a program that exited with this status is to be tried again.
 -- Under ADR 0017, exit 65 (EX_DATAERR) says the task can never succeed.
@@ -222,17 +228,44 @@ runExecutable spool config task leaseIdent capConfig payloadBytes = do
       \renewing -> do
         outcome <- bracket freshTempDir removeWorkerDirectory $ \tempDir -> do
           receiveTaskAttachments spool task leaseIdent tempDir
-          runCapability capConfig (wcEnv config) tempDir payloadBytes
+          ran <- runCapability capConfig (wcEnv config) tempDir payloadBytes
+          returned spool (LeaseRef (taskId task) leaseIdent) capConfig tempDir ran
         renewal <- poll renewing
         pure (outcome, renewal)
   case renewal of
     Just (Right refusal) -> throwIO (withContext "work: renewal failed: " refusal)
     Just (Left exception) -> throwIO exception
     Nothing -> case outcome of
-      RunFailure retry reason -> completeFailure spool (taskId task) leaseIdent reason retry
-      RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
-        Left _ -> completeFailure spool (taskId task) leaseIdent "output is not JSON" Retry
-        Right outputValue -> completeSuccess spool task leaseIdent outputValue
+      Failed retry reason -> completeFailure spool (taskId task) leaseIdent reason retry
+      Returned outputValue attachments ->
+        completeSuccess spool task leaseIdent outputValue attachments
+
+-- | A run that exited 0 with JSON returns that result, and sends what it
+-- left in outputs/, while its lease is still renewed. outputs/ that breaks
+-- the rules is the program's doing, and fails the task for good; a grant
+-- with no room for a file fails it with retry, for later or for another
+-- worker.
+returned
+  :: Connection -> LeaseRef -> CapabilityConfig -> FilePath -> RunOutcome -> IO Returned
+returned spool reference capConfig tempDir ran = case ran of
+  RunFailure retry reason -> pure (Failed retry reason)
+  RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
+    Left _ -> pure (Failed Retry "output is not JSON")
+    Right outputValue -> do
+      outputs <- collectOutputs (capMaxResultAttachmentBytes capConfig) (tempDir </> "outputs")
+      case outputs of
+        Left reason -> pure (Failed NoRetry reason)
+        Right files -> sendAll outputValue files []
+  where
+    sendAll outputValue [] sent = pure (Returned outputValue (reverse sent))
+    sendAll outputValue ((attachment, path) : rest) sent = do
+      result <- sendResultAttachment spool reference attachment path
+      case result of
+        Right () -> sendAll outputValue rest (attachment : sent)
+        Left (SpoolError OverLimit message) -> pure (Failed Retry
+          ("result attachment " <> SA.sha256Text (SA.attachmentSha256 attachment)
+            <> " refused: " <> T.pack message))
+        Left refusal -> throwIO (withContext "work: send: " refusal)
 
 -- | Receive every declared attachment into the working directory, verified.
 receiveTaskAttachments :: Connection -> Task -> LeaseId -> FilePath -> IO ()
@@ -264,9 +297,9 @@ renewalLoop spool taskIdent leaseIdent renewSeconds = do
     Right () -> renewalLoop spool taskIdent leaseIdent renewSeconds
     Left refusal -> pure refusal
 
-completeSuccess :: Connection -> Task -> LeaseId -> A.Value -> IO ()
-completeSuccess spool task leaseIdent output = do
-  result <- ackLease spool (LeaseRef (taskId task) leaseIdent) output
+completeSuccess :: Connection -> Task -> LeaseId -> A.Value -> [SA.Attachment] -> IO ()
+completeSuccess spool task leaseIdent output attachments = do
+  result <- ackLease spool (LeaseRef (taskId task) leaseIdent) output attachments
   case result of
     Left refusal -> throwIO (withContext "work: " refusal)
     Right () -> pure ()

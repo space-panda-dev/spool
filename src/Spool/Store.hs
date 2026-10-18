@@ -16,6 +16,7 @@ module Spool.Store
   , readTaskFile
   , readResultRecordFile
   , readWorkerSidecar
+  , liveLeaseOwned
   , removeSidecars
   , leaseIdOfFile
   , leaseTasks
@@ -24,6 +25,7 @@ module Spool.Store
   , ackTasks
   , ackStep
   , ackOne
+  , checkStaged
   , renewTasks
   , renewStep
   , renewOne
@@ -39,29 +41,40 @@ module Spool.Store
   , resultsCommand
   , fetchAttachment
   , fetchFor
+  , Sender (..)
+  , fitsLimit
+  , sendCommand
+  , sendFrom
+  , takeCommand
   , reclaimTasks
   , collectTasks
   , gcTasks
   , statusTasks
   ) where
 
-import Control.Exception (IOException, displayException, throwIO, try)
+import Control.Exception (IOException, displayException, finally, onException,
+                          throwIO, try)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import qualified Data.Aeson as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
-import Data.List (sortOn)
+import Data.Char (isDigit)
+import Data.Int (Int64)
+import Data.List (isSuffixOf, sortOn, stripPrefix)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (listToMaybe)
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
-import System.Directory (listDirectory)
+import System.Directory (createDirectory, listDirectory, removeFile)
 import System.FilePath (takeBaseName, (</>))
-import System.IO (IOMode (ReadMode), withBinaryFile)
+import System.IO (Handle, IOMode (ReadMode), SeekMode (AbsoluteSeek), hClose,
+                  hSeek, hSetBinaryMode, openBinaryFile, openBinaryTempFile,
+                  stdin, withBinaryFile)
 import System.IO.Error (isDoesNotExistError)
+import System.Posix.Files (fileSize, getFileStatus)
 import qualified Spool.Attachments as SA
 import Spool.Error
   ( SpoolError (..)
@@ -69,6 +82,7 @@ import Spool.Error
   , corrupt
   , malformed
   , orThrow
+  , overLimit
   , report
   , retryable
   , stale
@@ -102,6 +116,12 @@ import Spool.Files
   , pendingPath
   , renewedSidecarPath
   , resultPath
+  , resultLeaseDir
+  , resultLeasesDir
+  , resultTaskDir
+  , resultTasksDir
+  , syncDirectory
+  , syncHandle
   , syncedRemove
   , syncedRemoveDirectory
   , syncedRename
@@ -145,6 +165,8 @@ import Spool.Wire
   , FailureRecord (..)
   , FetchRequest (..)
   , Lease (..)
+  , SendRequest (..)
+  , TakeRequest (..)
   , LeaseRef (..)
   , PutStatus (..)
   , ResultRecord (..)
@@ -157,10 +179,13 @@ import Spool.Wire
   , encodePutResult
   , encodeReclaimResult
   , encodeRenewResult
+  , encodeSendResult
   , encodeStaleResult
   , parseFailureRecord
   , parseFetchRequest
   , parseResultRecord
+  , parseSendRequest
+  , parseTakeRequest
   , parseTask
   , readInteger
   )
@@ -180,6 +205,7 @@ recover paths = do
   finishCommitted paths
   finishTaskCleanup paths
   recoverAttachmentState paths
+  recoverResultAttachments paths
 
 -- | Finish every transition whose record is written and whose lease still
 -- stands. The record is the commit: an ack has happened once its result is
@@ -197,7 +223,9 @@ finishCommitted paths = do
     when (acked || failed) $ do
       task <- readTaskFile path
       if acked
-        then completeAck paths task leaseIdent
+        then do
+          record <- readResultRecordFile (resultPath paths leaseIdent)
+          completeAck paths task leaseIdent (resultAttachments record)
         else do
           record <- readFailureRecordFile (failedPath paths leaseIdent)
           completeFail paths task leaseIdent (failureRetried record)
@@ -479,15 +507,16 @@ answerEach reference step items = do
 -- a malformed line stops it with nothing done.
 
 ackTasks :: Paths -> IO ()
-ackTasks paths =
-  inputLines >>= mapM parseAckLine >>= answerEach ackRef (ackStep paths)
+ackTasks paths = do
+  acks <- inputLines >>= mapM parseAckLine
+  mapM_ (checkStaged paths) acks
+  answerEach ackRef (ackStep paths) acks
 
 ackStep :: Paths -> Ack -> IO (Either SpoolError BL.ByteString)
-ackStep paths ack =
-  fmap (encodeAckResult (ackRef ack)) <$> ackOne paths (ackRef ack) (ackResult ack)
+ackStep paths ack = fmap (encodeAckResult (ackRef ack)) <$> ackOne paths ack
 
-ackOne :: Paths -> LeaseRef -> A.Value -> IO (Either SpoolError AckStatus)
-ackOne paths (LeaseRef ident leaseIdent) output = do
+ackOne :: Paths -> Ack -> IO (Either SpoolError AckStatus)
+ackOne paths ack@(Ack (LeaseRef ident leaseIdent) output attachments) = do
   let source = leasedPath paths leaseIdent
   sourceExists <- fileExists source
   if sourceExists
@@ -496,18 +525,38 @@ ackOne paths (LeaseRef ident leaseIdent) output = do
       if taskId task /= ident
         then pure (Left (stale "lease does not belong to task_id"))
         else do
+          checkStaged paths ack
           worker <- readWorkerSidecar paths leaseIdent
-          stored <- writeResultRecord paths task leaseIdent worker output
+          stored <- writeResultRecord paths task leaseIdent worker output attachments
           case stored of
             Left failure -> pure (Left failure)
-            Right () -> Right Acked <$ completeAck paths task leaseIdent
-    else repeatedAck paths ident leaseIdent output
+            Right () -> Right Acked <$ completeAck paths task leaseIdent attachments
+    else repeatedAck paths ident leaseIdent output attachments
+
+-- | An ack whose lease is in flight may name only result attachments sent
+-- under that lease, each whole; otherwise it is malformed input, refused
+-- before anything is done (ADR 0020). An ack whose lease is not in flight
+-- is answered from its record, as any repeat is.
+checkStaged :: Paths -> Ack -> IO ()
+checkStaged paths (Ack (LeaseRef ident leaseIdent) _ attachments) =
+  unless (null attachments) $ do
+    let leasePath = leasedPath paths leaseIdent
+    live <- fileExists leasePath
+    when live $ do
+      task <- readTaskFile leasePath
+      when (taskId task == ident) $ forM_ attachments $ \attachment -> do
+        size <- sizeOf (stagedPath paths leaseIdent attachment)
+        unless (size == Just (SA.attachmentSize attachment)) (throwIO (malformed
+          ("result attachment " <> digestOf attachment
+            <> " is not staged whole under lease " <> showLease leaseIdent)))
 
 -- | An ack for a lease that is no longer in flight, answered from that
 -- lease's own result record alone: the same result is already done, and
 -- anything else is stale, an ack whose task has been collected included.
-repeatedAck :: Paths -> TaskId -> LeaseId -> A.Value -> IO (Either SpoolError AckStatus)
-repeatedAck paths ident leaseIdent output = do
+repeatedAck
+  :: Paths -> TaskId -> LeaseId -> A.Value -> [SA.Attachment]
+  -> IO (Either SpoolError AckStatus)
+repeatedAck paths ident leaseIdent output attachments = do
   let path = resultPath paths leaseIdent
   present <- fileExists path
   if not present
@@ -516,26 +565,31 @@ repeatedAck paths ident leaseIdent output = do
       stored <- readResultRecordFile path
       pure $ if resultTask stored /= ident
         then Left (stale "lease does not belong to task_id")
-        else if resultValue stored == output
+        else if resultValue stored == output && resultAttachments stored == attachments
           then Right AlreadyDone
           else Left (stale "ack result differs from completed result")
 
--- | The steps after an ack's commit: the lease moves to done, filed under
--- its task, its sidecars go, and the task's attachments go.
-completeAck :: Paths -> Task -> LeaseId -> IO ()
-completeAck paths task leaseIdent = do
+-- | The steps after an ack's commit: the result attachments are filed with
+-- the task, the lease's staging goes, the lease moves to done, filed under
+-- its task, its sidecars go, and the task's attachments go. The lease moves
+-- after the result attachments, so that recovery, which looks for leases,
+-- finds one whose attachments a crash left unfiled.
+completeAck :: Paths -> Task -> LeaseId -> [SA.Attachment] -> IO ()
+completeAck paths task leaseIdent attachments = do
+  fileResultAttachments paths (taskId task) leaseIdent attachments
+  removeResultLease paths leaseIdent
   syncedRename (leasedPath paths leaseIdent) (donePath paths (taskId task))
   removeSidecars paths leaseIdent
   tombstoneAndDelete paths (taskId task)
 
-completedResultMatches :: Paths -> LeaseId -> A.Value -> IO Bool
-completedResultMatches paths leaseIdent output = do
+completedResultMatches :: Paths -> LeaseId -> A.Value -> [SA.Attachment] -> IO Bool
+completedResultMatches paths leaseIdent output attachments = do
   let path = resultPath paths leaseIdent
   present <- fileExists path
   unless present (throwIO (retryable
     ("completed lease has no result: " <> showLease leaseIdent)))
   stored <- readResultRecordFile path
-  pure (resultValue stored == output)
+  pure (resultValue stored == output && resultAttachments stored == attachments)
 
 renewTasks :: Paths -> IO ()
 renewTasks paths =
@@ -643,10 +697,12 @@ failureHistory paths ident leaseIdent = do
 
 -- | The steps after a fail's commit: the task goes back to pending if it is
 -- to be retried, the lease and its sidecars go, and for a task left failed
--- its attachments go.
+-- its attachments go. Whatever result attachments the lease sent go with
+-- it, since no result will name them.
 completeFail :: Paths -> Task -> LeaseId -> Retry -> IO ()
 completeFail paths task leaseIdent retry = do
   when (retry == Retry) (returnToPending paths task)
+  removeResultLease paths leaseIdent
   syncedRemove (leasedPath paths leaseIdent)
   removeSidecars paths leaseIdent
   when (retry == NoRetry) (tombstoneAndDelete paths (taskId task))
@@ -740,8 +796,9 @@ fetchFor paths (FetchRequest (LeaseRef ident leaseIdent) digest) = do
       unless (BS.null chunk) (BS.putStr chunk >> copyToOutput handle)
 
 writeResultRecord
-  :: Paths -> Task -> LeaseId -> WorkerName -> A.Value -> IO (Either SpoolError ())
-writeResultRecord paths task leaseIdent worker output = do
+  :: Paths -> Task -> LeaseId -> WorkerName -> A.Value -> [SA.Attachment]
+  -> IO (Either SpoolError ())
+writeResultRecord paths task leaseIdent worker output attachments = do
   now <- getCurrentTime
   let record = ResultRecord
         { resultTask = taskId task
@@ -750,16 +807,286 @@ writeResultRecord paths task leaseIdent worker output = do
         , resultWorker = worker
         , resultFinishedAt = timestamp now
         , resultValue = output
+        , resultAttachments = attachments
         }
   created <- atomicCreate (resultPath paths leaseIdent) (encode record)
   case created of
     Created -> pure (Right ())
     AlreadyThere -> do
-      same <- completedResultMatches paths leaseIdent output
+      same <- completedResultMatches paths leaseIdent output attachments
       pure $ if same
         then Right ()
         else Left (stale
           "ack result differs from the result already stored for this lease")
+
+-- Result attachments (ADR 0020). A worker sends each file its program left
+-- in outputs/ under its lease, before it acknowledges; the ack names them,
+-- and is the commit that files them with the task. Bytes are never moved
+-- while the lock is held: it is taken before a send, to check the lease and
+-- reserve the file's place, and after, to check the lease again and give the
+-- file its name.
+
+-- | Who is sending: a worker on the spool's host, or one whose grant fixes
+-- its name and limits the bytes the spool holds from it.
+data Sender = HostWorker | GrantedWorker WorkerName Int64
+
+-- | Whether a grant's limit leaves room for this many more bytes beside
+-- those it holds. A limit of 0 holds none, not even an empty file.
+fitsLimit :: Int64 -> Integer -> Int64 -> Bool
+fitsLimit limit held size = limit > 0 && held + toInteger size <= toInteger limit
+
+-- | The longest request line a send reads before its bytes.
+sendLineLimit :: Int
+sendLineLimit = 4096
+
+-- | Send one result attachment: its request line on stdin, then its bytes.
+-- The guard is run first in each locked step: recovery, and for a peer, the
+-- check that its grant still stands.
+sendCommand :: Paths -> IO () -> Sender -> IO ()
+sendCommand paths guard sender = do
+  hSetBinaryMode stdin True
+  (line, already) <- SA.readHeaderLine sendLineLimit stdin >>= orThrow malformed
+  request <- orThrow malformed (parseSendRequest (BL.fromStrict line))
+  sendFrom paths guard sender request already stdin
+  BLC.putStrLn (encodeSendResult (sendRef request))
+
+-- | Stage one result attachment under its lease: the bytes already read,
+-- then the rest of the stream. Under the lock, the lease must be in flight
+-- and the sender's, and its grant must have room; a temporary file is made,
+-- whose name carries the size declared, so that it is counted against the
+-- limit while it fills. The bytes are copied, counted, hashed, and synced
+-- with the lock let go. Under the lock again, the lease must still stand,
+-- and the file is given its digest for a name.
+sendFrom :: Paths -> IO () -> Sender -> SendRequest -> BS.ByteString -> Handle -> IO ()
+sendFrom paths guard sender (SendRequest reference attachment) already source = do
+  let leaseIdent = refLease reference
+      directory = resultLeaseDir paths leaseIdent
+  (temporary, handle) <- withLock paths $ do
+    guard
+    either throwIO pure =<< liveLeaseOwned paths (senderWorker sender) reference
+    withinLimit paths sender attachment
+    present <- fileExists directory
+    unless present $ do
+      createDirectory directory
+      syncDirectory (resultLeasesDir paths)
+    openBinaryTempFile directory (sendingTemplate (SA.attachmentSize attachment))
+  received <- (do
+      copied <- SA.receiveExactly attachment already source handle
+      case copied of
+        Left message -> pure (Left message)
+        Right () -> Right () <$ syncHandle handle)
+    `onException` abandon temporary handle
+  case received of
+    Left message -> do
+      abandon temporary handle
+      throwIO (malformed ("send: " <> message))
+    Right () -> pure ()
+  withLock paths $ do
+    guard
+    allowed <- liveLeaseOwned paths (senderWorker sender) reference
+    case allowed of
+      Left refusal -> discard temporary >> throwIO refusal
+      Right () -> syncedRename temporary (stagedPath paths leaseIdent attachment)
+  where
+    senderWorker HostWorker = Nothing
+    senderWorker (GrantedWorker worker _) = Just worker
+    abandon temporary handle = do
+      closed <- try (hClose handle) :: IO (Either IOException ())
+      either (const (pure ())) pure closed
+      discard temporary
+    -- The failure in hand is the one to report. A temporary that cannot be
+    -- removed is counted against the grant until its lease ends, and goes
+    -- with it.
+    discard temporary = do
+      removed <- try (removeFile temporary) :: IO (Either IOException ())
+      either (const (pure ())) pure removed
+
+-- | The name a result attachment has while it is being sent: the size it
+-- declared, then what the system makes unique.
+sendingTemplate :: Int64 -> FilePath
+sendingTemplate size = ".send-" <> show size <> "-.part"
+
+-- | The size a file being sent declared, read from its name.
+sendingSize :: FilePath -> Maybe Integer
+sendingSize name = do
+  rest <- stripPrefix ".send-" name
+  let (digits, after) = span isDigit rest
+  if not (null digits) && take 1 after == "-" && ".part" `isSuffixOf` after
+    then Just (read digits)
+    else Nothing
+
+withinLimit :: Paths -> Sender -> SA.Attachment -> IO ()
+withinLimit _ HostWorker _ = pure ()
+withinLimit paths (GrantedWorker worker limit) attachment = do
+  held <- heldBytes paths worker
+  unless (fitsLimit limit held (SA.attachmentSize attachment)) (throwIO (overLimit
+    ("a result attachment of " <> show (SA.attachmentSize attachment)
+      <> " bytes is over this grant's max_result_bytes of " <> show limit
+      <> ", with " <> show held <> " bytes held")))
+
+-- | The bytes of result attachments the spool holds from a worker: those
+-- staged and being sent under its leases in flight, and those its acks
+-- filed with tasks not yet collected or expired.
+heldBytes :: Paths -> WorkerName -> IO Integer
+heldBytes paths worker = do
+  leases <- jsonFiles (leasedDir paths)
+  staged <- forM leases $ \path -> do
+    leaseIdent <- leaseIdOfFile path
+    handedOut <- fileExists (workerSidecarPath paths leaseIdent)
+    owner <- if handedOut then Just <$> readWorkerSidecar paths leaseIdent else pure Nothing
+    if owner == Just worker then stagedBytes paths leaseIdent else pure 0
+  records <- jsonFiles (resultsDir paths) >>= mapM readResultRecordFile
+  pure (sum staged + sum
+    [ toInteger (SA.attachmentSize attachment)
+    | record <- records, resultWorker record == worker
+    , attachment <- resultAttachments record ])
+
+-- | The bytes staged under one lease, each file being sent counted at the
+-- size it declared.
+stagedBytes :: Paths -> LeaseId -> IO Integer
+stagedBytes paths leaseIdent = do
+  let directory = resultLeaseDir paths leaseIdent
+  present <- fileExists directory
+  names <- if present then listDirectory directory else pure []
+  sizes <- forM names $ \name -> case (sendingSize name, SA.mkSha256 (T.pack name)) of
+    (Just declared, _) -> pure declared
+    (Nothing, Right _) -> maybe 0 toInteger <$> sizeOf (directory </> name)
+    _ -> throwIO (corrupt ("unexpected entry in result attachments of "
+      <> showLease leaseIdent <> ": " <> name))
+  pure (sum sizes)
+
+stagedPath :: Paths -> LeaseId -> SA.Attachment -> FilePath
+stagedPath paths leaseIdent attachment =
+  resultLeaseDir paths leaseIdent </> digestOf attachment
+
+digestOf :: SA.Attachment -> FilePath
+digestOf = T.unpack . SA.sha256Text . SA.attachmentSha256
+
+-- | A file's size, or nothing if it is not there.
+sizeOf :: FilePath -> IO (Maybe Int64)
+sizeOf path = do
+  status <- try (getFileStatus path)
+  case status of
+    Right found -> pure (Just (fromIntegral (fileSize found)))
+    Left exception
+      | isDoesNotExistError exception -> pure Nothing
+      | otherwise -> ioError exception
+
+-- | File an ack's result attachments with its task. Recovery repeats this,
+-- so a file already moved is looked for where it went.
+fileResultAttachments :: Paths -> TaskId -> LeaseId -> [SA.Attachment] -> IO ()
+fileResultAttachments _ _ _ [] = pure ()
+fileResultAttachments paths ident leaseIdent attachments = do
+  let target = resultTaskDir paths ident
+  present <- fileExists target
+  unless present $ do
+    createDirectory target
+    syncDirectory (resultTasksDir paths)
+  forM_ attachments $ \attachment -> do
+    let from = stagedPath paths leaseIdent attachment
+        to = target </> digestOf attachment
+    staged <- fileExists from
+    if staged
+      then syncedRename from to
+      else do
+        filed <- fileExists to
+        unless filed (throwIO (corrupt
+          ("result attachment " <> digestOf attachment <> " of "
+            <> showTask ident <> " is neither staged nor filed")))
+
+-- | What a lease staged goes when the lease ends.
+removeResultLease :: Paths -> LeaseId -> IO ()
+removeResultLease paths leaseIdent = removeIfPresent (resultLeaseDir paths leaseIdent)
+
+removeIfPresent :: FilePath -> IO ()
+removeIfPresent directory = do
+  present <- fileExists directory
+  when present (syncedRemoveDirectory directory)
+
+-- | Remove what no lease in flight staged and no done task keeps: what a
+-- crash left between a lease's end and the removal of its staging.
+recoverResultAttachments :: Paths -> IO ()
+recoverResultAttachments paths = do
+  leases <- listDirectory (resultLeasesDir paths)
+  forM_ leases $ \name -> do
+    leaseIdent <- orThrow (corrupt . (("unexpected entry in result attachments: "
+      <> name <> ": ") <>)) (mkLeaseId (T.pack name))
+    live <- fileExists (leasedPath paths leaseIdent)
+    unless live (syncedRemoveDirectory (resultLeasesDir paths </> name))
+  tasks <- listDirectory (resultTasksDir paths)
+  forM_ tasks $ \name -> do
+    ident <- orThrow (corrupt . (("unexpected entry in result attachments: "
+      <> name <> ": ") <>)) (mkTaskId (T.pack name))
+    done <- fileExists (donePath paths ident)
+    unless done (syncedRemoveDirectory (resultTasksDir paths </> name))
+
+-- | Write one result attachment of a done task to stdout, for a request on
+-- stdin. The file is opened under the lock and read after it is let go: it
+-- is hashed and counted to its end, and only if it matches its declaration
+-- is it read again and written.
+takeCommand :: Paths -> IO () -> IO ()
+takeCommand paths guard = do
+  TakeRequest ident digest <- BL.getContents >>= orThrow malformed . parseTakeRequest
+  (attachment, handle) <- withLock paths $ do
+    guard
+    done <- fileExists (donePath paths ident)
+    unless done (throwIO (malformed ("task " <> showTask ident <> " is not done")))
+    records <- resultRecordsOf paths ident
+    attachment <- case [ declared | record <- records
+                       , declared <- resultAttachments record
+                       , SA.attachmentSha256 declared == digest ] of
+      declared : _ -> pure declared
+      [] -> throwIO (malformed "attachment is not declared by the task's result")
+    let path = resultTaskDir paths ident </> digestOf attachment
+    present <- fileExists path
+    unless present (throwIO (corrupt
+      ("result attachment " <> digestOf attachment <> " of " <> showTask ident
+        <> " is missing")))
+    handle <- openBinaryFile path ReadMode
+    pure (attachment, handle)
+  (`finally` hClose handle) $ do
+    verified <- SA.verifyHandle attachment handle
+    case verified of
+      Left message -> throwIO (corrupt
+        ("corrupt result attachment of " <> showTask ident <> ": " <> message))
+      Right () -> do
+        hSeek handle AbsoluteSeek 0
+        copyToOutput handle
+  where
+    copyToOutput handle = do
+      chunk <- BS.hGetSome handle 65536
+      unless (BS.null chunk) (BS.putStr chunk >> copyToOutput handle)
+
+-- | The result records of a task, found by their names and checked to be
+-- its own.
+resultRecordsOf :: Paths -> TaskId -> IO [ResultRecord]
+resultRecordsOf paths ident = do
+  files <- (`filedUnder` ident) <$> filedUnderTasks (resultsDir paths)
+  forM files $ \path -> do
+    record <- readResultRecordFile path
+    unless (resultTask record == ident) (throwIO (corrupt
+      ("record filed under " <> showTask ident <> " is another task's: " <> path)))
+    pure record
+
+-- | Whether a live lease is on this task and, when a worker is named, is
+-- that worker's to act on.
+liveLeaseOwned :: Paths -> Maybe WorkerName -> LeaseRef -> IO (Either SpoolError ())
+liveLeaseOwned paths worker (LeaseRef ident leaseIdent) = do
+  let path = leasedPath paths leaseIdent
+  present <- fileExists path
+  if not present
+    then pure (Left (stale "lease is unknown or stale"))
+    else do
+      task <- readTaskFile path
+      if taskId task /= ident
+        then pure (Left (stale "lease does not belong to task_id"))
+        else case worker of
+          Nothing -> pure (Right ())
+          Just name -> do
+            owner <- readWorkerSidecar paths leaseIdent
+            pure $ if owner == name
+              then Right ()
+              else Left (stale "lease belongs to a different worker")
 
 reclaimTasks :: Paths -> Integer -> IO ()
 reclaimTasks paths age = do
@@ -790,6 +1117,7 @@ abandonLease paths reason leasedFile leaseIdent = do
   if not handedOut
     then do
       returnToPending paths task
+      removeResultLease paths leaseIdent
       syncedRemove leasedFile
       removeSidecars paths leaseIdent
       pure (taskId task, Retry)
@@ -878,11 +1206,13 @@ retire paths ident records = do
   createMarker (taskCleanupPath paths ident)
   removeTask paths ident records
 
--- | The steps after the marker: the done file, then the records, then the
--- marker itself, each removal synced.
+-- | The steps after the marker: the done file, then its result
+-- attachments, then the records, then the marker itself, each removal
+-- synced.
 removeTask :: Paths -> TaskId -> [FilePath] -> IO ()
 removeTask paths ident records = do
   ignoreMissing (syncedRemove (donePath paths ident))
+  removeIfPresent (resultTaskDir paths ident)
   mapM_ (ignoreMissing . syncedRemove) records
   syncedRemove (taskCleanupPath paths ident)
 
