@@ -10,6 +10,7 @@ import qualified Test.Cli
 import qualified Test.Error
 import qualified Test.Files
 import qualified Test.Follow
+import qualified Test.Outputs
 import qualified Test.Store
 import Test.Tasty (defaultMain, testGroup)
 import qualified Test.Types
@@ -26,6 +27,7 @@ main = do
     , Test.Error.tests
     , Test.Files.tests
     , Test.Follow.tests
+    , Test.Outputs.tests
     , Test.Store.tests
     , Test.Types.tests
     , Test.Wire.tests

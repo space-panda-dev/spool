@@ -37,8 +37,11 @@ collected or has aged out, it is new again.
 digest when staged and when received. The spool deletes its copies when the
 task is done or finally failed. A worker deletes its copies when the program
 exits, but Spool cannot confirm that, so a worker's machine remains somewhere a
-copy may survive.
-([ADR 0004](decisions/0004-attachments.md))
+copy may survive. A result's attachments live only as long as its done task:
+the spool deletes them when the task is collected or ages out, and deletes
+what a lease sent when the lease ends without a result.
+([ADR 0004](decisions/0004-attachments.md),
+[ADR 0020](decisions/0020-a-result-may-carry-attachments.md))
 
 **INV-9. A spool is coordination, not a record.** Deleting a spool loses only
 coordination history. Whatever must last is made from results by whoever asked

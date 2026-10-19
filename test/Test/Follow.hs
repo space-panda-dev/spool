@@ -120,6 +120,7 @@ fake steps = do
     , ackLease = unused "ack"
     , failLeaseWith = unused "fail"
     , withAttachment = unused "fetch"
+    , sendResultAttachment = unused "send"
     })
 
 -- | Await one lease with this cap and these steps: the lease or the

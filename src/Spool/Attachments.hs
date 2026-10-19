@@ -21,6 +21,10 @@ module Spool.Attachments
   , isStagingLeftover
   , receiveAttachment
   , verifyAttachmentFile
+  , verifyHandle
+  , digestOfHandle
+  , readHeaderLine
+  , receiveExactly
   , attemptRemoveWorkerDirectory
   ) where
 
@@ -201,6 +205,75 @@ verifyAttachmentFile attachment path =
     Right () -> withBinaryFile path ReadMode $ \handle -> do
       (context, size) <- hashStream handle hashInit 0
       pure (verifyDigest attachment context size)
+
+-- | Check what a handle reads, from where it stands to its end.
+verifyHandle :: Attachment -> Handle -> IO (Either String ())
+verifyHandle attachment handle =
+  case validateAttachment attachment of
+    Left message -> pure (Left message)
+    Right () -> do
+      (context, size) <- hashStream handle hashInit 0
+      pure (verifyDigest attachment context size)
+
+-- | The digest and size of what a handle reads, to its end.
+digestOfHandle :: Handle -> IO (Sha256, Int64)
+digestOfHandle handle = do
+  (context, size) <- hashStream handle hashInit 0
+  pure (Sha256 (renderDigest (hashFinalize context)), size)
+
+-- | The first line of a stream that carries a line and then bytes, and the
+-- bytes read past its newline. A line longer than the limit, or a stream
+-- that ends before its newline, is refused before more is read.
+readHeaderLine :: Int -> Handle -> IO (Either String (BS.ByteString, BS.ByteString))
+readHeaderLine limit handle = go BS.empty
+  where
+    go held = case BS.elemIndex 10 held of
+      Just at
+        | at > limit -> pure (Left tooLong)
+        | otherwise -> pure (Right (BS.take at held, BS.drop (at + 1) held))
+      Nothing
+        | BS.length held > limit -> pure (Left tooLong)
+        | otherwise -> do
+            chunk <- BS.hGetSome handle 4096
+            if BS.null chunk
+              then pure (Left "the request ended before its line did")
+              else go (held <> chunk)
+    tooLong = "the request line is longer than " <> show limit <> " bytes"
+
+-- | Copy exactly the declared number of bytes into a handle: those already
+-- read, then the rest of the stream, which must end there. The bytes are
+-- hashed and counted on the way, and must match the declaration.
+receiveExactly
+  :: Attachment -> BS.ByteString -> Handle -> Handle -> IO (Either String ())
+receiveExactly attachment already source destination =
+  case validateAttachment attachment of
+    Left message -> pure (Left message)
+    Right () -> go already hashInit 0
+  where
+    declared = attachmentSize attachment
+    go held context size
+      | not (BS.null held) = do
+          let room = fromIntegral (declared - size)
+              (taken, extra) = BS.splitAt room held
+          if not (BS.null extra)
+            then pure (Left longer)
+            else do
+              BS.hPut destination taken
+              go BS.empty (hashUpdate context taken)
+                (size + fromIntegral (BS.length taken))
+      | size == declared = do
+          after <- BS.hGetSome source 1
+          pure $ if BS.null after
+            then verifyDigest attachment context size
+            else Left longer
+      | otherwise = do
+          chunk <- BS.hGetSome source
+            (fromIntegral (min (64 * 1024) (declared - size)))
+          if BS.null chunk
+            then pure (Left ("the stream ended after " <> show size <> " of "
+              <> show declared <> " bytes"))
+            else go chunk context size
+    longer = "the stream holds more than " <> show declared <> " bytes"
 
 copyVerified :: Attachment -> FilePath -> FilePath -> FilePath -> IO (Either String ())
 copyVerified attachment source temporary destination =

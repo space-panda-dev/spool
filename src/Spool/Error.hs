@@ -10,6 +10,7 @@ module Spool.Error
   , conflict
   , stale
   , grantRefused
+  , overLimit
   , corrupt
   , retryable
   , orThrow
@@ -32,6 +33,7 @@ data ErrorClass
   | Conflict      -- ^ 3: task conflict
   | Stale         -- ^ 4: stale or unknown lease
   | GrantRefused  -- ^ 5: grant missing, revoked, or expired
+  | OverLimit     -- ^ 6: a grant's limit on result attachments refuses it
   | Corrupt       -- ^ 70: corrupt durable state
   | Retryable     -- ^ 75: retryable filesystem failure
   deriving (Bounded, Enum, Eq, Show)
@@ -47,11 +49,13 @@ data SpoolError
 
 instance Exception SpoolError
 
-malformed, conflict, stale, grantRefused, corrupt, retryable :: String -> SpoolError
+malformed, conflict, stale, grantRefused, overLimit, corrupt, retryable
+  :: String -> SpoolError
 malformed = SpoolError Malformed
 conflict = SpoolError Conflict
 stale = SpoolError Stale
 grantRefused = SpoolError GrantRefused
+overLimit = SpoolError OverLimit
 corrupt = SpoolError Corrupt
 retryable = SpoolError Retryable
 
@@ -77,6 +81,7 @@ exitStatus failure = case failure of
   SpoolError Conflict _ -> 3
   SpoolError Stale _ -> 4
   SpoolError GrantRefused _ -> 5
+  SpoolError OverLimit _ -> 6
   SpoolError Corrupt _ -> 70
   SpoolError Retryable _ -> 75
 
@@ -89,6 +94,7 @@ fromExitStatus status message = case status of
   3 -> Just (conflict message)
   4 -> Just (stale message)
   5 -> Just (grantRefused message)
+  6 -> Just (overLimit message)
   70 -> Just (corrupt message)
   75 -> Just (retryable message)
   _ -> Nothing

@@ -16,6 +16,7 @@ import Spool.Access
   , RemoteCommand (..)
   , filterManagedGrantLine
   , grantExpiresAt
+  , grantMaxResultBytes
   , grantPut
   , grantWorker
   , mkGrantId
@@ -49,6 +50,8 @@ acceptedCommands =
   , ("fail", RemoteFail Retry)
   , ("fail --no-retry", RemoteFail NoRetry)
   , ("fetch", RemoteFetch)
+  , ("send", RemoteSend)
+  , ("take", RemoteTake)
   , ("put", RemotePut)
   , ("results", RemoteResults)
   , ("failures", RemoteFailures)
@@ -78,6 +81,10 @@ rejectedCommands =
   , ("substitution", "$(status)")
   , ("glob", "lease*")
   , ("option injection", "lease --worker other")
+  , ("send with a digest", "send 0123456789abcdef")
+  , ("send with a path", "send /etc/passwd")
+  , ("take with a task", "take task-one")
+  , ("send twice", "send send")
   , ("put with a word", "put --attachments x")
   , ("status with another option", "status --text")
   , ("results with an option", "results --json")
@@ -119,7 +126,7 @@ publicKey =
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 grantWith :: T.Text -> Maybe T.Text -> Either String Grant
-grantWith worker = validateGrant identifierText "peer-one" worker "/srv/spool" publicKey False
+grantWith worker = validateGrant identifierText "peer-one" worker "/srv/spool" publicKey False 0
 
 grantRecord :: [TestTree]
 grantRecord =
@@ -139,10 +146,10 @@ grantRecord =
         @?= Right "worker.two_3-4"
   , testCase "a peer may be a label with spaces" $
       assertBool "accepted" $ isRight $
-        validateGrant identifierText "Alice's laptop" "worker-one" "/srv/spool" publicKey False Nothing
+        validateGrant identifierText "Alice's laptop" "worker-one" "/srv/spool" publicKey False 0 Nothing
   , testCase "a peer of 129 characters is refused" $
       assertBool "refused" $ isLeft $
-        validateGrant identifierText (T.replicate 129 "p") "worker-one" "/srv/spool" publicKey False Nothing
+        validateGrant identifierText (T.replicate 129 "p") "worker-one" "/srv/spool" publicKey False 0 Nothing
   , testCase "a record is written in canonical form" $ do
       grant <- either assertFailure pure
         (grantWith "worker-one" (Just "2026-10-01T00:00:00Z"))
@@ -152,9 +159,34 @@ grantRecord =
             <> "\",\"put\":false,\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}" )
   , testCase "a grant that may put reads back as one that may" $ do
       grant <- either assertFailure pure
-        (validateGrant identifierText "peer-one" "worker-one" "/srv/spool" publicKey True Nothing)
+        (validateGrant identifierText "peer-one" "worker-one" "/srv/spool" publicKey True 0 Nothing)
       assertBool "may put" (grantPut grant)
       fmap grantPut (parseGrantJSON (renderGrant grant)) @?= Right True
+  , testCase "a record without max_result_bytes, as 0.0.3 wrote it, may send none" $
+      fmap grantMaxResultBytes (parseGrantJSON
+        ("{\"expires_at\":null,\"grant_id\":\"" <> TE.encodeUtf8 identifierText
+          <> "\",\"peer\":\"peer-one\",\"public_key\":\"" <> TE.encodeUtf8 publicKey
+          <> "\",\"put\":false,\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}"))
+        @?= Right 0
+  , testCase "a limit on result attachments is written, and reads back" $ do
+      grant <- either assertFailure pure
+        (validateGrant identifierText "peer-one" "worker-one" "/srv/spool" publicKey False
+          9223372036854775807 Nothing)
+      renderGrant grant @?= TE.encodeUtf8
+        ( "{\"expires_at\":null,\"grant_id\":\"" <> identifierText
+            <> "\",\"max_result_bytes\":9223372036854775807,\"peer\":\"peer-one\",\"public_key\":\""
+            <> publicKey <> "\",\"put\":false,\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}" )
+      parseGrantJSON (renderGrant grant) @?= Right grant
+  , testCase "a negative limit is refused" $
+      assertBool "refused" $ isLeft $
+        validateGrant identifierText "peer-one" "worker-one" "/srv/spool" publicKey False (-1) Nothing
+  , testGroup "a limit that is not a whole number of bytes is refused"
+      [ testCase (show value) $ assertBool "refused" $ isLeft $ parseGrantJSON
+          ("{\"expires_at\":null,\"grant_id\":\"" <> TE.encodeUtf8 identifierText
+            <> "\",\"max_result_bytes\":" <> value <> ",\"peer\":\"peer-one\",\"public_key\":\""
+            <> TE.encodeUtf8 publicKey <> "\",\"put\":false,\"spool\":\"/srv/spool\",\"worker\":\"worker-one\"}")
+      | value <- ["-1", "1.5", "\"1\"", "null", "9223372036854775808"]
+      ]
   , testCase "a record without put is refused" $
       assertBool "refused" $ isLeft $ parseGrantJSON
         "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"expires_at\":null}"
@@ -166,7 +198,7 @@ grantRecord =
         "{\"grant_id\":\"grant_0123456789abcdef0123456789abcdef\",\"peer\":\"p\",\"worker\":\"w\",\"spool\":\"/s\",\"expires_at\":null}"
   , testCase "a relative spool path is refused" $
       assertBool "refused" $ isLeft $
-        validateGrant identifierText "peer-one" "worker-one" "srv/spool" publicKey False Nothing
+        validateGrant identifierText "peer-one" "worker-one" "srv/spool" publicKey False 0 Nothing
   , testCase "a worker name with a control character is refused" $
       assertBool "refused" (isLeft (grantWith "one\ntwo" Nothing))
   , testCase "a key with a comment is refused" $

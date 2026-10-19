@@ -30,7 +30,13 @@ tests = testGroup "worker configuration"
   , testCase "a capability reads as written" $ do
       config <- parsed (document "" capabilityBody)
       Map.toList (wcCapabilities config)
-        @?= [(classify, CapabilityConfig "/bin/cat" ["-u"] 5 1024 65536)]
+        @?= [(classify, CapabilityConfig "/bin/cat" ["-u"] 5 1024 65536 Nothing)]
+  , testCase "a capability may set how many bytes of result attachments it sends" $ do
+      config <- parsed (document "" (withResultLimit "4096"))
+      capabilityField' capMaxResultAttachmentBytes config @?= Just (Just 4096)
+  , testCase "what --show prints keeps a limit on result attachments" $ do
+      config <- parsed (document "" (withResultLimit "4096"))
+      parseWorkConfig (encodeWorkConfig config) @?= Right config
   , testCase "what --show prints reads back as the same configuration" $ do
       config <- parsed
         (document "\"max_concurrent\":4,\"renew_seconds\":9,\"env\":{\"PATH\":\"/bin\"}," capabilityBody)
@@ -46,6 +52,9 @@ tests = testGroup "worker configuration"
           (capabilityField capMaxPayloadBytes)
       , atLimit "max_output_bytes" int64Max (document "" (capability 1 1 int64Max))
           (capabilityField capMaxOutputBytes)
+      , atLimit "max_result_attachment_bytes" int64Max
+          (document "" (withResultLimit (BLC.pack (show int64Max))))
+          (capabilityField (maybe (-1) id . capMaxResultAttachmentBytes))
       ]
   , testGroup "each limit is refused one above it"
       [ refused "max_concurrent" (document (field "max_concurrent" (intMax + 1)) capabilityBody)
@@ -53,6 +62,12 @@ tests = testGroup "worker configuration"
       , refused "timeout_seconds" (document "" (capability (secondsMax + 1) 1 1))
       , refused "max_payload_bytes" (document "" (capability 1 (int64Max + 1) 1))
       , refused "max_output_bytes" (document "" (capability 1 1 (int64Max + 1)))
+      , refused "max_result_attachment_bytes"
+          (document "" (withResultLimit (BLC.pack (show (int64Max + 1)))))
+      ]
+  , testGroup "a limit on result attachments that is not a whole number of at least 1 is refused"
+      [ refused label (document "" (withResultLimit value))
+      | (label, value) <- [("zero", "0"), ("negative", "-1"), ("a fraction", "1.5"), ("a string", "\"1\""), ("null", "null")]
       ]
   , testGroup "a number that is not a whole number of at least 1 is refused"
       [ refused "zero" (document (field "max_concurrent" 0) capabilityBody)
@@ -110,6 +125,14 @@ capability timeout payload output =
   "{\"exec\":\"/bin/cat\",\"timeout_seconds\":" <> BLC.pack (show timeout)
     <> ",\"max_payload_bytes\":" <> BLC.pack (show payload)
     <> ",\"max_output_bytes\":" <> BLC.pack (show output) <> "}"
+
+withResultLimit :: BL.ByteString -> BL.ByteString
+withResultLimit value =
+  "{\"exec\":\"/bin/cat\",\"timeout_seconds\":5,\"max_payload_bytes\":1,\"max_output_bytes\":1,\"max_result_attachment_bytes\":"
+    <> value <> "}"
+
+capabilityField' :: (CapabilityConfig -> a) -> WorkConfig -> Maybe a
+capabilityField' get config = get <$> Map.lookup classify (wcCapabilities config)
 
 capabilityField :: Integral a => (CapabilityConfig -> a) -> WorkConfig -> Integer
 capabilityField get config =

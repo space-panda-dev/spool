@@ -32,12 +32,15 @@ import Spool.Wire
   , Lease (..)
   , LeaseRef (..)
   , ResultRecord (..)
+  , SendRequest (..)
+  , TakeRequest (..)
   , Task (..)
   , canonical
   , encode
   , encodeCollectResult
   , encodeExpiredResult
   , encodeFailResult
+  , encodeSendResult
   , encodeStaleResult
   , parseAck
   , parseCollectRequest
@@ -46,6 +49,8 @@ import Spool.Wire
   , parseFetchRequest
   , parseLeaseRef
   , parseResultRecord
+  , parseSendRequest
+  , parseTakeRequest
   , parseTask
   )
 import Test.Tasty (TestTree, testGroup)
@@ -188,7 +193,67 @@ requestTests :: [TestTree]
 requestTests =
   [ testCase "ack carries its result whatever it is" $
       parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":null}"
-        @?= Right (Ack reference A.Null)
+        @?= Right (Ack reference A.Null [])
+  , testCase "ack carries the result attachments it names" $
+      parseAck ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":1,\"attachments\":["
+        <> declared 'a' 3 <> "," <> declared 'b' 0 <> "]}")
+        @?= Right (Ack reference (A.toJSON (1 :: Int)) [Attachment (sha 'a') 3, Attachment (sha 'b') 0])
+  , testCase "ack with no result attachments is written as 0.0.3 wrote it" $
+      encode (Ack reference A.Null [])
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"result\":null,\"task_id\":\"t\"}"
+  , testCase "ack with an empty list of result attachments has none" $
+      parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":null,\"attachments\":[]}"
+        @?= Right (Ack reference A.Null [])
+  , testCase "ack with result attachments reads back as written" $ do
+      let ack = Ack reference A.Null [Attachment (sha 'a') 3, Attachment (sha 'c') 7]
+      parseAck (encode ack) @?= Right ack
+  , testGroup "ack result attachments are refused when they"
+      [ testCase label (assertBool "refused" (isLeft (parseAck
+          ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"result\":1,\"attachments\":"
+            <> list <> "}"))))
+      | (label, list) <-
+          [ ("are out of order", "[" <> declared 'b' 1 <> "," <> declared 'a' 1 <> "]")
+          , ("repeat a digest", "[" <> declared 'a' 1 <> "," <> declared 'a' 2 <> "]")
+          , ("have a negative size", "[" <> declared 'a' (-1) <> "]")
+          , ("name a path", "[{\"sha256\":\"../x\",\"size\":1}]")
+          , ("carry a name", "[{\"sha256\":\"" <> digest <> "\",\"size\":1,\"name\":\"x\"}]")
+          , ("are not a list", declared 'a' 1)
+          ]
+      ]
+  , testCase "a send request names one digest and its size" $
+      parseSendRequest
+        ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\",\"size\":5}")
+        @?= Right (SendRequest reference (Attachment (sha 'a') 5))
+  , testCase "a send request reads back as written" $ do
+      let request = SendRequest reference (Attachment (sha 'a') 9223372036854775807)
+      parseSendRequest (encode request) @?= Right request
+  , testGroup "a send request is refused when it"
+      [ testCase label (assertBool "refused" (isLeft (parseSendRequest bytes)))
+      | (label, bytes) <-
+          [ ("has no size", "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\"}")
+          , ("has a negative size", sendWith "-1")
+          , ("has a fractional size", sendWith "1.5")
+          , ("has a size past 64 bits", sendWith "9223372036854775808")
+          , ("has a size as a string", sendWith "\"1\"")
+          , ("names a path", "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"../x\",\"size\":1}")
+          , ("names a file", "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\",\"size\":1,\"name\":\"x\"}")
+          ]
+      ]
+  , testCase "a take request names a task and a digest" $
+      parseTakeRequest ("{\"task_id\":\"t\",\"sha256\":\"" <> digest <> "\"}")
+        @?= Right (TakeRequest taskOne (sha 'a'))
+  , testGroup "a take request is refused when it"
+      [ testCase label (assertBool "refused" (isLeft (parseTakeRequest bytes)))
+      | (label, bytes) <-
+          [ ("has no digest", "{\"task_id\":\"t\"}")
+          , ("names a lease", "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\"}")
+          , ("names a path", "{\"task_id\":\"t\",\"sha256\":\"../x\"}")
+          , ("names a task outside the grammar", "{\"task_id\":\"../t\",\"sha256\":\"" <> digest <> "\"}")
+          ]
+      ]
+  , testCase "a send is answered staged" $
+      encodeSendResult reference
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"staged\",\"task_id\":\"t\"}"
   , testCase "ack without a result is refused" $
       assertBool "refused" $ isLeft $
         parseAck "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\"}"
@@ -247,6 +312,10 @@ requestTests =
   where
     digest = BL.pack (replicate 64 0x61)
     reference = LeaseRef taskOne leaseOne
+    declared character size = "{\"sha256\":\"" <> BLC.pack (replicate 64 character)
+      <> "\",\"size\":" <> BLC.pack (show (size :: Int)) <> "}"
+    sendWith size = "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\""
+      <> digest <> "\",\"size\":" <> size <> "}"
 
 recordTests :: [TestTree]
 recordTests =
@@ -258,6 +327,7 @@ recordTests =
         , resultWorker = made mkWorkerName "worker-one"
         , resultFinishedAt = storedTimestamp "2026-09-29T12:00:00Z"
         , resultValue = A.object ["anything" A..= ("opaque" :: T.Text)]
+        , resultAttachments = []
         }
   , testCase "the protocol's failure record reads as its fields" $
       parseFailureRecord failureRecord @?= Right FailureRecord
@@ -271,6 +341,18 @@ recordTests =
         }
   , testCase "a result record is written back as the bytes it was read from" $
       fmap encode (parseResultRecord resultRecord) @?= Right (recanonical resultRecord)
+  , testCase "a result record with attachments is written back as the bytes it was read from" $ do
+      let withAttachments = replacing "attachments"
+            (A.toJSON [Attachment (sha 'a') 3, Attachment (sha 'b') 4]) resultRecord
+      fmap resultAttachments (parseResultRecord withAttachments)
+        @?= Right [Attachment (sha 'a') 3, Attachment (sha 'b') 4]
+      fmap encode (parseResultRecord withAttachments) @?= Right (recanonical withAttachments)
+  , testCase "a result record with no attachments is written without the field" $
+      fmap encode (parseResultRecord (replacing "attachments" (A.toJSON ([] :: [Attachment])) resultRecord))
+        @?= Right (recanonical resultRecord)
+  , testCase "a result record whose attachments are out of order is corrupt" $
+      assertBool "refused" $ isLeft $ parseResultRecord
+        (replacing "attachments" (A.toJSON [Attachment (sha 'b') 3, Attachment (sha 'a') 4]) resultRecord)
   , testCase "a failure record is written back as the bytes it was read from" $
       fmap encode (parseFailureRecord failureRecord) @?= Right (recanonical failureRecord)
   , testCase "a failure that was not retried reads as not retried" $

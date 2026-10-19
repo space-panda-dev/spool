@@ -8,6 +8,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, bracket, finally, try)
 import Control.Monad (when)
+import qualified Data.ByteString as BS
 import Data.Either (isLeft)
 import qualified Data.Text as T
 import Spool.Attachments
@@ -15,14 +16,16 @@ import Spool.Attachments
   , Sha256
   , isStagingLeftover
   , mkSha256
+  , readHeaderLine
   , receiveAttachment
+  , receiveExactly
   , sha256Text
   , validateAttachments
   )
 import System.Directory (getTemporaryDirectory, listDirectory,
                          removeDirectoryRecursive)
 import System.FilePath ((</>))
-import System.IO (hClose)
+import System.IO (IOMode (ReadMode, WriteMode), hClose, withBinaryFile)
 import System.Posix.Files (setFileMode)
 import System.Posix.Temp (mkdtemp)
 import System.Posix.User (getEffectiveUserID)
@@ -36,6 +39,7 @@ tests = do
   pure $ testGroup "attachments"
     [ testGroup "declarations" declarations
     , testGroup "staging leftovers" leftovers
+    , testGroup "a send's framing" framing
     , if user == 0
         then testCase
           "SKIPPED, the superuser is never refused a removal: a refused cleanup"
@@ -71,6 +75,51 @@ declarations =
   , testCase "a negative size is refused" $
       assertBool "refused" (isLeft (validateAttachments [Attachment (digest 'a') (-1)]))
   ]
+
+-- | A send is one request line, then exactly the bytes it declares. The
+-- digest of "abc" is from FIPS 180-2, known apart from the code under test.
+framing :: [TestTree]
+framing =
+  [ testCase "the line and the bytes read past it are told apart" $
+      withSource "{\"x\":1}\nabc" (readHeaderLine 64) >>= (@?= Right ("{\"x\":1}", "abc"))
+  , testCase "a line longer than the limit is refused" $
+      withSource (BS.replicate 100 0x61 <> "\n") (readHeaderLine 64) >>= refused
+  , testCase "a stream that ends before its newline is refused" $
+      withSource "{\"x\":1}" (readHeaderLine 64) >>= refused
+  , testCase "exactly the declared bytes are received" $ do
+      (outcome, written) <- received abcDeclared "a" "bc"
+      outcome @?= Right ()
+      written @?= "abc"
+  , testCase "bytes all read with the line are received" $ do
+      (outcome, written) <- received abcDeclared "abc" ""
+      outcome @?= Right ()
+      written @?= "abc"
+  , testCase "a stream that ends early is refused" $
+      fst <$> received abcDeclared "" "ab" >>= refused
+  , testCase "a stream with a byte more is refused" $
+      fst <$> received abcDeclared "" "abcd" >>= refused
+  , testCase "bytes read with the line past the size are refused" $
+      fst <$> received abcDeclared "abcd" "" >>= refused
+  , testCase "bytes that are not the digest are refused" $
+      fst <$> received abcDeclared "" "abd" >>= refused
+  ]
+  where
+    abcDeclared = Attachment
+      (either error id (mkSha256 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")) 3
+    refused outcome = assertBool ("refused: " <> show outcome) (isLeft outcome)
+    withSource bytes action = inScratch $ \scratch -> do
+      BS.writeFile (scratch </> "source") bytes
+      withBinaryFile (scratch </> "source") ReadMode action
+    received declared already rest = inScratch $ \scratch -> do
+      BS.writeFile (scratch </> "source") rest
+      outcome <- withBinaryFile (scratch </> "source") ReadMode $ \source ->
+        withBinaryFile (scratch </> "destination") WriteMode $ \destination ->
+          receiveExactly declared already source destination
+      written <- BS.readFile (scratch </> "destination")
+      pure (outcome, written)
+    inScratch action = do
+      base <- getTemporaryDirectory
+      bracket (mkdtemp (base </> "spool-framing-test")) removeDirectoryRecursive action
 
 leftovers :: [TestTree]
 leftovers =

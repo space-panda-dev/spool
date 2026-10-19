@@ -9,6 +9,7 @@ import Spool.Cli
   ( Command (..)
   , GrantOptions (..)
   , StoreCommand (..)
+  , Transfer (..)
   , parseCommand
   , parseWorkShow
   , parseWorkVia
@@ -71,7 +72,9 @@ acceptedForms =
   , (["fail", "--no-retry"], Store (Fail NoRetry))
   , (["failures"], Store Failures)
   , (["results"], Store Results)
-  , (["fetch"], Store Fetch)
+  , (["fetch"], Moving Fetch)
+  , (["send"], Moving Send)
+  , (["take"], Moving Take)
   , (["reclaim", "--older-than", "0"], Store (Reclaim 0))
   , (["reclaim", "--older-than", "90"], Store (Reclaim 90))
   , (["collect"], Store Collect)
@@ -91,21 +94,26 @@ acceptedForms =
     , Work w "c.json" Nothing (Just 9223372036854) )
   , (["work", "--config", "c.json", "--show"], WorkShow "c.json")
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"]
-    , Store (GrantCommand "p" w "k.pub" (GrantOptions False Nothing Nothing)) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions False Nothing Nothing 0)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--expires-at", "2026-10-01T00:00:00Z"]
-    , Store (GrantCommand "p" w "k.pub" (GrantOptions False (Just "2026-10-01T00:00:00Z") Nothing)) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions False (Just "2026-10-01T00:00:00Z") Nothing 0)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub", "--put"]
-    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing Nothing)) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing Nothing 0)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--put", "--expires-at", "2026-10-01T00:00:00Z"]
-    , Store (GrantCommand "p" w "k.pub" (GrantOptions True (Just "2026-10-01T00:00:00Z") Nothing)) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True (Just "2026-10-01T00:00:00Z") Nothing 0)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--expires-at", "2026-10-01T00:00:00Z", "--put"]
-    , Store (GrantCommand "p" w "k.pub" (GrantOptions True (Just "2026-10-01T00:00:00Z") Nothing)) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True (Just "2026-10-01T00:00:00Z") Nothing 0)) )
   , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
       , "--executable", "/usr/local/bin/spool", "--put"]
-    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing (Just "/usr/local/bin/spool"))) )
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing (Just "/usr/local/bin/spool") 0)) )
+  , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub", "--max-result-bytes", "1"]
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions False Nothing Nothing 1)) )
+  , ( ["grant", "--peer", "p", "--worker", "w", "--key", "k.pub"
+      , "--max-result-bytes", "9223372036854775807", "--put"]
+    , Store (GrantCommand "p" w "k.pub" (GrantOptions True Nothing Nothing 9223372036854775807)) )
   , (["revoke", "--grant", "g"], Store (RevokeCommand "g"))
   ]
 
@@ -139,6 +147,12 @@ rejectedForms =
   , ("grant with --put twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--put", "--put"])
   , ("grant with --executable twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--executable", "/a", "--executable", "/b"])
   , ("grant with an empty executable", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--executable", ""])
+  , ("send with a word", ["send", "file"])
+  , ("take with a word", ["take", "file"])
+  , ("grant with no result bytes", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--max-result-bytes", "0"])
+  , ("grant with negative result bytes", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--max-result-bytes", "-1"])
+  , ("grant with result bytes that would wrap", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--max-result-bytes", "9223372036854775808"])
+  , ("grant with result bytes twice", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--max-result-bytes", "1", "--max-result-bytes", "2"])
   , ("grant with an unknown option", ["grant", "--peer", "p", "--worker", "w", "--key", "k", "--pull"])
   ]
 

@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               spool
-version:            0.0.3
+version:            0.0.4
 build-type:         Simple
 synopsis:           A standalone file-backed JSONL task spool
 description:        Builds spool as a native executable with no runtime compiler or source-tree dependency.
@@ -51,6 +51,7 @@ library
     , Spool.Worker.Config
     , Spool.Worker.Connection
     , Spool.Worker.Follow
+    , Spool.Worker.Outputs
     , Spool.Worker.Run
   build-depends:
       aeson      >=2.2    && <2.4
@@ -88,6 +89,7 @@ test-suite spool-test
     , Test.Error
     , Test.Files
     , Test.Follow
+    , Test.Outputs
     , Test.Store
     , Test.Types
     , Test.Wire

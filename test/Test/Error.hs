@@ -8,6 +8,7 @@ import Spool.Error
   ( ErrorClass (..)
   , SpoolError (..)
   , exitStatus
+  , fromExitStatus
   , malformed
   , orThrow
   , render
@@ -25,6 +26,10 @@ tests = testGroup "failures"
       ]
   , testCase "the table names every kind there is" $
       map fst table @?= [minBound .. maxBound]
+  , testGroup "a status read back from a spool is the kind it was"
+      [ testCase (show kind) (fromExitStatus status "x" @?= Just (SpoolError kind "x"))
+      | (kind, status) <- table
+      ]
   , testCase "no two kinds share an exit status" $ do
       let statuses = map snd table <> [exitStatus NothingPending]
       statuses @?= nub statuses
@@ -57,6 +62,7 @@ table =
   , (Conflict, 3)
   , (Stale, 4)
   , (GrantRefused, 5)
+  , (OverLimit, 6)
   , (Corrupt, 70)
   , (Retryable, 75)
   ]

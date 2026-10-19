@@ -42,7 +42,9 @@ use revocable or expiring grants whose forced command exposes only worker
 operations, and `put` for a grant that allows it, and fixes the worker
 identity. A worker on another machine runs `spool work --via "ssh account@host"`
 and speaks that command. Attachments are declared by digest, verified when
-staged and received, and deleted when their task resolves.
+staged and received, and deleted when their task resolves. A result may carry
+attachments too: files a program leaves named by digest, sent back by its
+worker under its lease, kept with the done task, and deleted with it.
 
 The implementation is a library with a thin executable over it. The Nix flake
 builds a static binary. Unit and property tests cover the grammars, the
@@ -60,7 +62,7 @@ stale-ack path.
 | capability | `name@version`; a worker's owner maps it to a program |
 | worker | a named process that leases tasks and runs them |
 | lease | a worker's claim on one task, fenced by its ID |
-| attachment | a file staged with a task and deleted with it |
+| attachment | a file staged with a task, or sent back with its result, and deleted with it |
 | grant | one peer's permission to lease from one spool, until revoked or expired |
 
 ## Where to look

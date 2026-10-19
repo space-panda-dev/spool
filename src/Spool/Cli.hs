@@ -3,6 +3,7 @@
 module Spool.Cli
   ( Command (..)
   , StoreCommand (..)
+  , Transfer (..)
   , GrantOptions (..)
   , parseCommand
   , parseWorkShow
@@ -10,6 +11,7 @@ module Spool.Cli
   , usageText
   ) where
 
+import Data.Int (Int64)
 import qualified Data.Text as T
 import Data.Maybe (fromMaybe)
 import Spool.Worker.Config (maxDelaySeconds)
@@ -27,6 +29,9 @@ import Spool.Types
 -- makes, so that no executable runs while it is held.
 data Command
   = Store StoreCommand
+  | Moving Transfer
+    -- ^ A command that moves an attachment's bytes. It takes the lock only
+    -- for the transitions on either side of them, never while they move.
   | Work WorkerName FilePath (Maybe Int) (Maybe Int)
     -- ^ The last field is the longest a worker that follows its spool
     -- waits between two leases; a worker that does not follow stops once
@@ -51,9 +56,15 @@ data StoreCommand
   | Fail Retry
   | Failures
   | Results
-  | Fetch
   | GrantCommand T.Text WorkerName FilePath GrantOptions
   | RevokeCommand T.Text
+  deriving (Eq, Show)
+
+-- | The commands that move an attachment's bytes (ADR 0020).
+data Transfer
+  = Send  -- ^ a worker sends one of a result under its lease
+  | Take  -- ^ a reader takes one of a done task
+  | Fetch  -- ^ a worker fetches one of its task under its lease
   deriving (Eq, Show)
 
 parseCommand :: [String] -> Either String (FilePath, Command)
@@ -76,7 +87,9 @@ parseSubcommand ["fail"] = store (Fail Retry)
 parseSubcommand ["fail", "--no-retry"] = store (Fail NoRetry)
 parseSubcommand ["failures"] = store Failures
 parseSubcommand ["results"] = store Results
-parseSubcommand ["fetch"] = store Fetch
+parseSubcommand ["fetch"] = Right (Moving Fetch)
+parseSubcommand ["send"] = Right (Moving Send)
+parseSubcommand ["take"] = Right (Moving Take)
 parseSubcommand ("grant" : "--peer" : peer : "--worker" : worker : "--key" : key : options) =
   grantCommand peer worker key options
 parseSubcommand ["revoke", "--grant", identifier] =
@@ -165,7 +178,7 @@ workerArgument = either (Left . ("spool: " <>)) Right . mkWorkerName . T.pack
 grantCommand :: String -> String -> FilePath -> [String] -> Either String Command
 grantCommand peer worker key options = case mkWorkerName (T.pack worker) of
   Right name | not (null peer) -> do
-    chosen <- grantOptions (GrantOptions False Nothing Nothing) options
+    chosen <- grantOptions (GrantOptions False Nothing Nothing 0) options
     store (GrantCommand (T.pack peer) name key chosen)
   _ -> Left "spool: grant requires non-empty peer and worker values"
 
@@ -177,6 +190,9 @@ data GrantOptions = GrantOptions
     -- ^ The program the forced command runs, in place of this binary's own
     -- canonical path. A stable path, such as a symlink kept pointing at the
     -- installed binary, outlives the binary it points at.
+  , grantOptionMaxResultBytes :: Int64
+    -- ^ How many bytes of result attachments the spool holds from the
+    -- grant at once. 0, when it is not given, is none (ADR 0020).
   } deriving (Eq, Show)
 
 -- | The optional words of grant, in any order, each at most once.
@@ -189,6 +205,12 @@ grantOptions options words' = case words' of
     grantOptions options { grantOptionExpiry = Just (T.pack value) } rest
   "--executable" : value : rest | grantOptionExecutable options == Nothing && not (null value) ->
     grantOptions options { grantOptionExecutable = Just value } rest
+  "--max-result-bytes" : value : rest | grantOptionMaxResultBytes options == 0 ->
+    case reads value :: [(Integer, String)] of
+      [(number, "")] | number > 0 && number <= toInteger (maxBound :: Int64) ->
+        grantOptions options { grantOptionMaxResultBytes = fromInteger number } rest
+      _ -> Left ("spool: --max-result-bytes requires a positive integer no greater than "
+        <> show (maxBound :: Int64))
   _ -> Left usageText
 
 leaseCommand :: String -> String -> Either String Command
@@ -218,4 +240,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|reclaim --older-than SECONDS|collect|gc --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\nFOLLOW: --follow [--idle-seconds N]"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|send|take|reclaim --older-than SECONDS|collect|gc --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH] [--max-result-bytes N]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\nFOLLOW: --follow [--idle-seconds N]"

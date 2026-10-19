@@ -1,12 +1,45 @@
 # Spool protocol
 
-Version: 0.0.3
+Version: 0.0.4
 Status: draft
 
 The protocol a spool and its workers follow. It is dedicated to the public
 domain under CC0 1.0: anyone may implement it. The version above must match
 [`VERSION`](VERSION). Matters that are not settled remain listed in
 [`docs/open-questions.md`](../docs/open-questions.md).
+
+## Since 0.0.3
+
+Version 0.0.4 adds one decision,
+[ADR 0020](../docs/decisions/0020-a-result-may-carry-attachments.md): a
+result may carry attachments. It adds the first new fields since 0.0.1, and
+writes each only where it holds something:
+
+- `ack` may carry `attachments`, and a result record and a `results` line
+  carry them when the result has some. An ack or a result without them is
+  written as 0.0.3 wrote it, byte for byte. A 0.0.3 binary refuses a result
+  record that has them as corrupt (exit 70), so it must not be run on a spool
+  that holds one.
+- A grant record may carry `max_result_bytes`. A record without it, as every
+  0.0.3 grant is, may send no result attachment, and works as before for
+  everything else. A grant made without `--max-result-bytes` is written as
+  0.0.3 wrote it; a 0.0.3 binary refuses one made with it, and denies its
+  peer (exit 5).
+- `send` and `take` are new commands and remote words. A 0.0.3 spool, local
+  or remote, refuses them as malformed input (exit 2). A 0.0.4 worker given
+  that answer to `send` ends with it and acknowledges nothing, so a result
+  whose files did not arrive is never recorded.
+- A worker's capability configuration may carry
+  `max_result_attachment_bytes`; a 0.0.3 worker refuses it (exit 2).
+- Exit 6 is new: a grant's limit on result attachments refuses a send.
+- `collect` and `gc` delete a done task's result attachments with it.
+- `fetch` no longer holds the spool's lock while it writes: the lease is
+  checked and the file opened under it, and the bytes are verified and
+  written after it is let go. Its requests and answers are unchanged.
+
+A run whose program leaves nothing in `outputs/` is sent and acknowledged
+exactly as under 0.0.3, so a 0.0.4 worker may work a 0.0.3 spool for such
+capabilities, and a 0.0.3 worker a 0.0.4 spool.
 
 ## Since 0.0.2
 
@@ -102,10 +135,12 @@ A task is **pending**, **leased**, **done**, or **failed**.
 - `lease` moves a pending task to leased under a new lease ID, naming the
   worker.
 - `ack` with that lease ID moves it to done, carrying the task's result: any
-  JSON value, `{"task_id", "lease_id", "result"}`. The result is kept with the
-  done task until the task is collected or expires (below). Repeating an
-  equal ack is a no-op. Repeating the task and lease with a different result
-  is a stale-lease error and cannot replace the stored result.
+  JSON value, `{"task_id", "lease_id", "result"}`, and the result
+  attachments sent under the lease that it names (below). The result is kept
+  with the done task until the task is collected or expires (below).
+  Repeating an equal ack is a no-op. Repeating the task and lease with a
+  different result, or with other attachments, is a stale-lease error and
+  cannot replace the stored result.
 - `renew` with that lease ID keeps the lease from being reclaimed.
 - `fail` with that lease ID records a reason and returns the task to pending,
   or, with `--no-retry` or on the task's last attempt, moves it to failed. A
@@ -117,7 +152,8 @@ A task is **pending**, **leased**, **done**, or **failed**.
 - `collect` deletes a finished task, and `gc --older-than SECONDS` every
   finished task that finished that long ago: a done task, or one whose latest
   failure was final, whether by `--no-retry`, by exit 65, or by its last
-  attempt; with its result and all of its failure records.
+  attempt; with its result, its result attachments, and all of its failure
+  records.
 
 Under [ADR 0017](../docs/decisions/0017-a-task-has-three-attempts.md), a task
 has at most three attempts. Every lease that ends without a result is one,
@@ -157,7 +193,8 @@ that wants it.
 ## Commands
 
 Every command takes an explicit spool directory. Input and output are JSONL,
-except `fetch`, which writes one raw byte stream.
+except `fetch` and `take`, which each write one raw byte stream, and `send`,
+which reads one line and then raw bytes.
 
 ```sh
 spool --dir DIR init
@@ -170,6 +207,8 @@ spool --dir DIR fail [--no-retry] < failures.jsonl
 spool --dir DIR failures
 spool --dir DIR results
 spool --dir DIR fetch < attachment-request.json > attachment
+spool --dir DIR send < send-request-and-bytes
+spool --dir DIR take < take-request.json > attachment
 spool --dir DIR reclaim --older-than SECONDS
 spool --dir DIR collect < tasks.jsonl
 spool --dir DIR gc --older-than SECONDS
@@ -223,6 +262,7 @@ every answer names the lease it answers:
 | `fail` | `failed_retry` | the task is pending again |
 | `fail` | `failed` | the task is failed: that was its last attempt |
 | `fail --no-retry` | `failed` | the task is failed |
+| `send` | `staged` | the file is staged under the lease, for its ack to name |
 | `ack`, `renew`, `fail` | `stale` | nothing was done: see below |
 | `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
 | `reclaim` | `failed` | the task is failed: that was its last attempt |
@@ -255,6 +295,19 @@ line when nothing was pending:
 {"task_id":"task-one","lease_id":"lease_...","reason":"why"}
 ```
 
+An `ack` may also name the result attachments sent under its lease (see
+`send`, below), in an `attachments` array of the form a task's has: each
+entry exactly `sha256` and `size`, sorted by digest, without repeats.
+Without the field, or with it empty, the ack has none. Every attachment it
+names must be staged under the lease, whole, when the lease is in flight;
+otherwise the ack is malformed input (exit 2), and, as for any malformed
+line, no line is acted on. An ack whose lease is no longer in flight is
+answered from its record, as any repeat is.
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","result":{"vocals":"0123...cdef"},"attachments":[{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":123}]}
+```
+
 `collect` takes one line for each task:
 
 ```json
@@ -269,7 +322,9 @@ collected or expired, oldest first:
 ```
 
 The `result` value is exactly the value carried by `ack`. Spool does not
-interpret it.
+interpret it. A result that has result attachments is listed with them, as
+its ack named them, in an `attachments` field after `result`; one without
+has no such field.
 
 `failures` emits one JSON object per reported failure of a task that has not
 been collected or expired, oldest first:
@@ -323,7 +378,11 @@ that history from terminal failure.
 
 The task and lease must be current and the digest must be declared by that
 task. The spool verifies the stored bytes against both the declared SHA-256
-and size before writing the raw bytes to stdout. Diagnostics use stderr. The
+and size before writing the raw bytes to stdout. It checks the lease and
+opens the file under the spool's lock, and verifies and writes the bytes
+after letting it go, so a reader slow to read holds up no other command; a
+lease that ends meanwhile does not stop a fetch already begun. Diagnostics
+use stderr. The
 receiver verifies digest and size again before exposing the file. Ranges,
 resumption, paths, and multiple requests in one invocation are unsupported.
 Malformed requests and undeclared digests are exit 2. An unknown, stale, or
@@ -332,13 +391,64 @@ does not match is corrupt durable state and exit 70. A declaration whose
 source bytes do not match during `put` is malformed input and exit 2; source
 or staging I/O failure is exit 75.
 
+### `send`
+
+Under [ADR 0020](../docs/decisions/0020-a-result-may-carry-attachments.md),
+a worker sends each result attachment under its lease, one request each.
+A request is one line, at most 4096 bytes and ending in a newline:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":123}
+```
+
+followed by exactly `size` raw bytes, and then the end of the stream. The
+fields are exactly these four; `sha256` and `size` are as in a declaration.
+The task and lease must be current, and through the remote command the
+lease must be the grant's worker's; otherwise the request is exit 4 and
+nothing is stored. A grant that has no room for `size` more bytes is exit 6
+(below), and nothing is stored. The bytes are counted and hashed as they
+arrive; a stream that ends early, holds more, or does not match its digest
+is exit 2, and nothing is kept. A send answers one line:
+
+```json
+{"task_id":"task-one","lease_id":"lease_...","status":"staged"}
+```
+
+A file is staged only for the lease that sent it. Sending a file already
+staged answers the same and keeps one copy. A staged file is filed with the
+done task by the ack that names it; the lease's other staged files are
+deleted then. A lease that ends without a result, by `fail`, `reclaim`, or
+a revoke, deletes every file it staged.
+
+The spool's lock is not held while the bytes arrive. It is held to check the
+lease and the grant's room and make the file being sent, whose declared size
+counts against the grant from then on, and again to check that the lease
+still stands and give the file its name. A send that is killed leaves the
+file it was making; it counts against the grant until its lease ends, and
+goes with it.
+
+### `take`
+
+`take` accepts exactly one JSON object:
+
+```json
+{"task_id":"task-one","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+```
+
+The task must be done and the digest declared by its result; otherwise the
+request is exit 2. The spool verifies the stored bytes against both the
+declared SHA-256 and size before writing the raw bytes to stdout, and a
+mismatch is corrupt durable state, exit 70, with nothing written. The file
+is opened under the lock and read after the lock is let go. Ranges,
+resumption, paths, and multiple requests in one invocation are unsupported.
+
 ### Grants
 
 The design defined by
 [ADR 0006](../docs/decisions/0006-grants-are-account-records.md) adds:
 
 ```sh
-spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--put] [--expires-at RFC3339] [--executable PATH]
+spool --dir DIR grant --peer PEER --worker WORKER --key PUBLIC_KEY_FILE [--put] [--expires-at RFC3339] [--executable PATH] [--max-result-bytes N]
 spool --dir DIR revoke --grant GRANT_ID
 ```
 
@@ -355,6 +465,17 @@ the spool host's `now >= expires_at`. Under
 whether the holder may put tasks on the spool; `grant --put` makes it true.
 The remote command reads and validates the record on every request. Grant
 records contain no execution or disclosure limits.
+
+Under [ADR 0020](../docs/decisions/0020-a-result-may-carry-attachments.md),
+a record may also hold `max_result_bytes`, an integer from 0 through
+9223372036854775807: the bytes of result attachments the spool holds from
+the grant at once. They are those staged under its worker's leases in
+flight, each file being sent counted at its declared size, and those of its
+worker's results not yet collected or expired. A record without the field
+holds 0, and a grant that holds 0 may send none.
+`grant --max-result-bytes N`, N from 1 through 9223372036854775807, sets it;
+the field is written only when it is not 0. It is a limit on the spool
+host's disk, not on what runs or what is disclosed.
 
 `grant` writes one generated `restrict,command="..."` line to the dedicated
 account's `$HOME/.ssh/authorized_keys`; `revoke` removes that exact managed
@@ -401,6 +522,8 @@ renew
 fail
 fail --no-retry
 fetch
+send
+take
 put
 results
 failures
@@ -417,7 +540,12 @@ and unknown options are malformed input with exit 2.
 `lease` uses the grant's worker. `ack`, `renew`, and `fail` take and answer
 the same lines as they do locally. `fetch` accepts the single JSON request
 defined above on stdin and writes verified raw bytes to stdout; a request for
-a lease that is not the worker's is exit 4. `put` takes and answers the same
+a lease that is not the worker's is exit 4. `send` reads the request and
+bytes defined above, for a lease that is the worker's, against the grant's
+`max_result_bytes`. `take` reads the request defined above and writes what
+it writes locally, for a grant whose `put` is true; for one whose `put` is
+false it is exit 5 and the request is not read. Neither holds the spool's
+lock while bytes move. `put` takes and answers the same
 lines as it does locally, for a grant whose `put` is true; for one whose
 `put` is false it is exit 5 and the lines are not read. A task put this way
 may declare no attachments; one that does is exit 2. Under
@@ -438,9 +566,13 @@ holds a grant. `COMMAND` is split on whitespace into a program and its
 arguments, typically `ssh -i KEY account@host`; Spool appends one remote
 word to it for each request and speaks the forced command's grammar over its
 stdin and stdout. The worker's name is the grant's, so there is no
-`--worker`; attachments arrive through `fetch`. Everything else is as for a
-local worker: the configuration, the limits, renewal, and what is done with
-a program's exit and output.
+`--worker`; attachments arrive through `fetch`, and result attachments leave
+through `send`. Everything else is as for a local worker: the configuration,
+the limits, renewal, and what is done with a program's exit and output. A
+`send` refused with 4 ends the worker with it, as a stale `ack` does; one
+refused with 6 fails the lease with retry, and the worker goes on. A `send`
+refused with any other status, 2 from a spool that does not know the word
+among them, ends the worker with it, and the task is not acknowledged.
 
 A request the transport cannot carry, or that the spool denies, ends the
 worker with the status the spool gave, or 75 when the transport itself
@@ -465,8 +597,8 @@ expose reclaim.
 Under
 [ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md),
 a finished task is a done task, or a task whose latest failure was final. It
-is kept, with its result and every failure record, until whoever put it
-collects it or `gc` finds it old enough. A done task finished at its
+is kept, with its result, its result attachments, and every failure record,
+until whoever put it collects it or `gc` finds it old enough. A done task finished at its
 result's `finished_at`; a failed task at the latest `failed_at` of its final
 failures. Neither command touches a pending or leased task, or the failure
 records of one.
@@ -505,6 +637,7 @@ detect this.
 | 3 | task conflict |
 | 4 | stale or unknown lease |
 | 5 | grant missing, revoked, or expired |
+| 6 | `send`: over the grant's `max_result_bytes` |
 | 70 | corrupt durable state |
 | 75 | retryable filesystem failure |
 | 143 | `work`: stopped by SIGTERM |
@@ -560,6 +693,27 @@ it leases nothing more, every run is killed as above, each run's working
 directory is deleted, and `work` exits 143. It
 reports nothing for the tasks it was running. Their leases stand, for
 `reclaim` to return.
+
+### Result attachments
+
+Under [ADR 0020](../docs/decisions/0020-a-result-may-carry-attachments.md),
+a capability may set `max_result_attachment_bytes`, a whole number of at
+least 1: the most bytes a run may leave, all files together, to be sent back
+with its result. A program does that by leaving each file in `outputs/`
+below its working directory, named by the lower-case SHA-256 of its bytes.
+Its result may refer to a file by that digest; Spool does not read it.
+
+When the program exits 0 with JSON on stdout, `work` looks at each entry of
+`outputs/` without following it. Every one must be a regular file named by
+its digest, and hash to its name, and together they must be no larger than
+the limit; a capability without the limit may leave nothing there. A run
+that breaks any of these is failed with `--no-retry`, with a reason that
+says which. `work` then sends each file, while it still renews the lease,
+and acknowledges with the result and the files, sorted by digest. A run
+that leaves nothing in `outputs/`, or no `outputs/`, is acknowledged as it
+was before.
+
+### Task attachments
 
 With attachments, `work` fetches and verifies every
 declared attachment into `attachments/SHA256` below the fresh working

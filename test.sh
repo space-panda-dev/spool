@@ -27,7 +27,7 @@ if [[ -z ${SPOOL:-} ]]; then
     "$here/app/Main.hs" >/dev/null
 fi
 test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
-test "$($spool_binary --version)" = "spool 0.0.3"; check
+test "$($spool_binary --version)" = "spool 0.0.4"; check
 
 # Files the suite reads, beside it or where the flake check puts them.
 fixtures=${SPOOL_FIXTURES:-$here/test/fixtures}
@@ -1887,6 +1887,54 @@ remote_attachment_ack=$(jq -nc --arg lease "$remote_attachment_lease" \
   '{task_id:"remote-attachment",lease_id:$lease,result:{fetched:true}}')
 printf '%s\n' "$remote_attachment_ack" | remote_primary 'ack' >/dev/null
 
+# The lock is not held while fetch writes. A fetch whose reader has stopped
+# reading is blocked on its output, and status answers from another process
+# meanwhile, locally and through the remote command; the bytes then arrive
+# whole.
+head -c 2000000 /dev/urandom > "$work/fetch-big"
+if command -v sha256sum >/dev/null 2>&1; then
+  fetch_big_digest=$(sha256sum "$work/fetch-big" | awk '{print $1}')
+else
+  fetch_big_digest=$(shasum -a 256 "$work/fetch-big" | awk '{print $1}')
+fi
+cp "$work/fetch-big" "$attachment_source/$fetch_big_digest"
+slow_fetch() {
+  local name=$1 status_command=$2; shift 2
+  mkfifo "$work/$name-pipe"
+  "$@" > "$work/$name-pipe" &
+  local pid=$!
+  exec 9<"$work/$name-pipe"
+  dd bs=1 count=1 <&9 > "$work/$name-first" 2>/dev/null
+  test -s "$work/$name-first"; check
+  $status_command > /dev/null; check
+  cat <&9 > "$work/$name-rest"
+  exec 9<&-
+  wait "$pid"; check
+  cat "$work/$name-first" "$work/$name-rest" | cmp - "$work/fetch-big"; check
+}
+for spool_kind in local remote; do
+  jq -nc --arg task "slow-fetch-$spool_kind" --arg digest "$fetch_big_digest" \
+    '{task_id:$task,capability:"remote@1",payload:{},attachments:[{sha256:$digest,size:2000000}]}' \
+    | spoolg put --attachments "$attachment_source" >/dev/null
+done
+"$spool_binary" --dir "$work/grant-spool" lease --worker slow-local > "$work/slow-local-lease.json"
+jq -e '.task_id == "slow-fetch-local"' "$work/slow-local-lease.json" >/dev/null; check
+slow_local_lease=$(jq -r '.lease_id' "$work/slow-local-lease.json")
+slow_status_local() { timeout 5 "$spool_binary" --dir "$work/grant-spool" status --json; }
+slow_fetch slow-fetch-local slow_status_local sh -c \
+  "printf '%s\n' '$(jq -nc --arg l "$slow_local_lease" --arg d "$fetch_big_digest" '{task_id:"slow-fetch-local",lease_id:$l,sha256:$d}')' \
+    | '$spool_binary' --dir '$work/grant-spool' fetch"
+remote_primary 'lease' > "$work/slow-remote-lease.json"
+jq -e '.task_id == "slow-fetch-remote"' "$work/slow-remote-lease.json" >/dev/null; check
+slow_remote_lease=$(jq -r '.lease_id' "$work/slow-remote-lease.json")
+slow_remote_request=$(jq -nc --arg l "$slow_remote_lease" --arg d "$fetch_big_digest" '{task_id:"slow-fetch-remote",lease_id:$l,sha256:$d}')
+slow_fetch slow-fetch-remote slow_status_local sh -c \
+  "printf '%s\n' '$slow_remote_request' | HOME='$grant_home' SSH_ORIGINAL_COMMAND=fetch '$spool_binary' remote --grant '$grant_id'"
+for slow_lease in "$slow_local_lease" "$slow_remote_lease"; do
+  jq -nc --arg l "$slow_lease" --arg t "$(jq -r .task_id "$work/grant-spool/leased/$slow_lease.json")" \
+    '{task_id:$t,lease_id:$l,result:{}}' | spoolg ack >/dev/null
+done
+
 # The remote command is an exact byte grammar.  Shell metacharacters,
 # whitespace variants, local-only operations, options, and non-canonical
 # counts never reach a handler.  The Cabal test suite covers NUL; these
@@ -2545,4 +2593,491 @@ cap_follower_exit=$?
 set -e
 test "$cap_follower_exit" -eq 143; check
 
-printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits, following workers, attempts with retention (%d checks)\n' "$checks"
+#############################################################################
+# Result attachments (ADR 0020): a program leaves files in outputs/, named by
+# their digests; the worker sends each under its lease, the ack files them
+# with the task, take reads one back verified, and collect and gc delete
+# them with the task.
+#############################################################################
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+size_of() { wc -c < "$1" | tr -d ' '; }
+# The request line of a send for this file.
+send_line() {
+  jq -nc --arg task "$1" --arg lease "$2" --arg sha "$(sha256_of "$3")" --argjson size "$(size_of "$3")" \
+    '{task_id:$task,lease_id:$lease,sha256:$sha,size:$size}'
+}
+# send_file DIR TASK LEASE FILE: send the file under the lease, locally.
+send_file() { { send_line "$2" "$3" "$4"; cat "$4"; } | in_spool "$1" send; }
+take_line() { jq -nc --arg task "$1" --arg sha "$2" '{task_id:$task,sha256:$sha}'; }
+staged_in() { find "$work/$1/result-attachments/leases" -type f | wc -l | tr -d ' '; }
+filed_in() { find "$work/$1/result-attachments/tasks" -type f | wc -l | tr -d ' '; }
+
+# Writes the bytes the payload asks for to two files in outputs/, each named
+# by its digest, and a result that names them. It keeps a copy of each where
+# the payload says, so that what take returns can be compared with what the
+# program wrote.
+cat > "$bin/stems" <<'SCRIPT'
+#!/bin/sh
+payload=$(cat)
+keep=$(printf '%s' "$payload" | jq -r '.keep')
+bytes=$(printf '%s' "$payload" | jq -r '.bytes')
+digest() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+mkdir outputs
+head -c "$bytes" /dev/urandom > outputs/vocals
+printf 'drums of %s\n' "$payload" > outputs/drums
+vocals=$(digest outputs/vocals)
+drums=$(digest outputs/drums)
+mkdir -p "$keep"
+cp outputs/vocals "$keep/$vocals"
+cp outputs/drums "$keep/$drums"
+mv outputs/vocals "outputs/$vocals"
+mv outputs/drums "outputs/$drums"
+printf '{"vocals":"%s","drums":"%s"}\n' "$vocals" "$drums"
+SCRIPT
+chmod +x "$bin/stems"
+# Leaves in outputs/ whatever the payload's "make" says, then answers.
+cat > "$bin/leave" <<'SCRIPT'
+#!/bin/sh
+payload=$(cat)
+mkdir outputs
+sh -c "$(printf '%s' "$payload" | jq -r '.make')"
+printf '{"left":true}\n'
+SCRIPT
+chmod +x "$bin/leave"
+
+ra_config() {
+  # ra_config CAPABILITY EXEC [MAX_RESULT_ATTACHMENT_BYTES]
+  jq -nc --arg cap "$1" --arg exec "$2" --arg limit "${3:-}" --arg path "$worker_path" \
+    '{max_concurrent: 1, renew_seconds: 30, env: {PATH: $path},
+      capabilities: {($cap): ({exec: $exec, args: [], timeout_seconds: 20,
+        max_payload_bytes: 4096, max_output_bytes: 4096}
+        + (if $limit == "" then {} else {max_result_attachment_bytes: ($limit | tonumber)} end))}}'
+}
+ra_put() {
+  jq -nc --arg task "$2" --arg cap "$3" --argjson payload "$4" \
+    '{task_id:$task,capability:$cap,payload:$payload}' | in_spool "$1" put >/dev/null
+}
+
+# The whole chain, on the spool's host: two outputs are sent and filed, the
+# result names them, results lists them, take returns exactly the bytes the
+# program wrote, and collect leaves nothing of them in the spool directory.
+in_spool ra init
+ra_config stems@1 "$bin/stems" 1000000 > "$work/ra-stems.json"
+ra_put ra ra-one stems@1 "$(jq -nc --arg keep "$work/ra-kept/one" '{keep:$keep,bytes:300000}')"
+in_spool ra work --worker ra-local --config "$work/ra-stems.json" --max-tasks 1
+in_spool ra results | jq -s -e 'length == 1 and .[0].task_id == "ra-one"' >/dev/null; check
+ra_vocals=$(in_spool ra results | jq -r '.result.vocals')
+ra_drums=$(in_spool ra results | jq -r '.result.drums')
+test "$ra_vocals" != "$ra_drums"; check
+test "$(sha256_of "$work/ra-kept/one/$ra_vocals")" = "$ra_vocals"; check
+test "$(size_of "$work/ra-kept/one/$ra_vocals")" = 300000; check
+in_spool ra results | jq -s -e \
+  --arg v "$ra_vocals" --arg d "$ra_drums" --argjson dsize "$(size_of "$work/ra-kept/one/$ra_drums")" \
+  '.[0].attachments == ([{sha256:$v,size:300000},{sha256:$d,size:$dsize}] | sort_by(.sha256))' >/dev/null; check
+test -f "$work/ra/result-attachments/tasks/ra-one/$ra_vocals"; check
+test -f "$work/ra/result-attachments/tasks/ra-one/$ra_drums"; check
+test "$(staged_in ra)" = 0; check
+for digest in "$ra_vocals" "$ra_drums"; do
+  take_line ra-one "$digest" | in_spool ra take > "$work/ra-taken"
+  cmp "$work/ra-taken" "$work/ra-kept/one/$digest"; check
+done
+collect_ids ra ra-one | jq -e '.status == "collected"' >/dev/null; check
+test ! -e "$work/ra/result-attachments/tasks/ra-one"; check
+test "$(find "$work/ra/result-attachments" -type f | wc -l | tr -d ' ')" = 0; check
+expect_exit 2 sh -c "printf '%s\n' '$(take_line ra-one "$ra_vocals")' | '$spool_binary' --dir '$work/ra' take"
+test ! -s "$work/exit.stdout"; check
+
+# gc deletes them with the task too.
+ra_put ra ra-aged stems@1 "$(jq -nc --arg keep "$work/ra-kept/aged" '{keep:$keep,bytes:10}')"
+in_spool ra work --worker ra-local --config "$work/ra-stems.json" --max-tasks 1
+test "$(filed_in ra)" = 2; check
+in_spool ra gc --older-than 0 | jq -e '. == {task_id:"ra-aged",status:"expired"}' >/dev/null; check
+test "$(find "$work/ra/result-attachments" -type f | wc -l | tr -d ' ')" = 0; check
+
+# A run that leaves nothing in outputs/ acknowledges as 0.0.3 did: the result
+# record has no attachments field, and nothing is sent.
+ra_config leave@1 "$bin/leave" 100 > "$work/ra-leave.json"
+ra_put ra ra-none leave@1 '{"make":"true"}'
+in_spool ra work --worker ra-local --config "$work/ra-leave.json" --max-tasks 1
+jq -e 'has("attachments") | not' "$work"/ra/results/*_ra-none.json >/dev/null; check
+in_spool ra results | jq -e 'select(.task_id == "ra-none") | has("attachments") | not' >/dev/null; check
+
+# Every way outputs/ breaks the rules fails the task for good, sends nothing,
+# and says why.
+ra_refused() {
+  # ra_refused TASK CONFIG MAKE REASON
+  ra_put ra "$1" leave@1 "$(jq -nc --arg make "$3" '{make:$make}')"
+  in_spool ra work --worker ra-local --config "$2" --max-tasks 1
+  in_spool ra failures | jq -s -e --arg task "$1" --arg reason "$4" \
+    'map(select(.task_id == $task)) | length == 1 and .[0].retried == false
+     and (.[0].reason | contains($reason))' >/dev/null; check
+  in_spool ra results | jq -s -e --arg task "$1" 'map(select(.task_id == $task)) | length == 0' >/dev/null; check
+  test "$(staged_in ra)" = 0; check
+}
+abc_digest=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+ra_refused ra-link "$work/ra-leave.json" \
+  "printf abc > elsewhere; ln -s \"\$PWD/elsewhere\" outputs/$abc_digest" "is a symbolic link"
+ra_refused ra-dir "$work/ra-leave.json" "mkdir outputs/$abc_digest" "is a directory"
+ra_refused ra-misnamed "$work/ra-leave.json" "printf abc > outputs/vocals.flac" "is not named by a sha256 digest"
+ra_refused ra-unhashed "$work/ra-leave.json" "printf abd > outputs/$abc_digest" "does not hash to its name"
+ra_refused ra-outputs-file "$work/ra-leave.json" "rmdir outputs; printf abc > outputs" "outputs is not a directory"
+ra_config leave@1 "$bin/leave" > "$work/ra-leave-no-limit.json"
+ra_refused ra-no-limit "$work/ra-leave-no-limit.json" "printf abc > outputs/$abc_digest" \
+  "the capability sets no max_result_attachment_bytes"
+ra_config leave@1 "$bin/leave" 2 > "$work/ra-leave-two.json"
+ra_refused ra-over "$work/ra-leave-two.json" "printf abc > outputs/$abc_digest" \
+  "over max_result_attachment_bytes 2"
+# At the limit, it is sent.
+ra_config leave@1 "$bin/leave" 3 > "$work/ra-leave-three.json"
+ra_put ra ra-at-limit leave@1 "$(jq -nc --arg make "printf abc > outputs/$abc_digest" '{make:$make}')"
+in_spool ra work --worker ra-local --config "$work/ra-leave-three.json" --max-tasks 1
+in_spool ra results | jq -e --arg d "$abc_digest" \
+  'select(.task_id == "ra-at-limit") | .attachments == [{sha256:$d,size:3}]' >/dev/null; check
+
+# send, by hand: exactly the declared bytes, under a lease in flight. What
+# it refuses, it stores nothing of.
+printf 'abc' > "$work/ra-abc"
+printf 'hello, stems\n' > "$work/ra-hello"
+ra_put ra ra-hand leave@1 '{}'
+ra_hand_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
+ra_hand_dir="$work/ra/result-attachments/leases/$ra_hand_lease"
+{ jq -nc --arg lease "$ra_hand_lease" --arg sha "$abc_digest" '{task_id:"ra-hand",lease_id:$lease,sha256:$sha,size:4}'
+  printf 'abc'; } > "$work/ra-short"
+expect_exit 2 in_spool ra send < "$work/ra-short"
+{ jq -nc --arg lease "$ra_hand_lease" --arg sha "$abc_digest" '{task_id:"ra-hand",lease_id:$lease,sha256:$sha,size:3}'
+  printf 'abcd'; } > "$work/ra-long"
+expect_exit 2 in_spool ra send < "$work/ra-long"
+# The same past the bytes read with the request line, so that the end of
+# the stream is looked for in the stream itself.
+head -c 5000 /dev/urandom > "$work/ra-five-thousand"
+{ send_line ra-hand "$ra_hand_lease" "$work/ra-five-thousand"; cat "$work/ra-five-thousand"; printf x; } \
+  > "$work/ra-longer"
+expect_exit 2 in_spool ra send < "$work/ra-longer"
+{ jq -nc --arg lease "$ra_hand_lease" --arg sha "$abc_digest" '{task_id:"ra-hand",lease_id:$lease,sha256:$sha,size:3}'
+  printf 'abd'; } > "$work/ra-wrong"
+expect_exit 2 in_spool ra send < "$work/ra-wrong"
+{ jq -nc --arg lease "$ra_hand_lease" --arg sha "$abc_digest" '{task_id:"ra-hand",lease_id:$lease,sha256:$sha,size:3,name:"x.flac"}'
+  printf 'abc'; } > "$work/ra-named"
+expect_exit 2 in_spool ra send < "$work/ra-named"
+test -z "$(ls -A "$ra_hand_dir" 2>/dev/null)"; check
+send_file ra ra-hand "$ra_hand_lease" "$work/ra-abc" \
+  | jq -e --arg lease "$ra_hand_lease" '. == {task_id:"ra-hand",lease_id:$lease,status:"staged"}' >/dev/null; check
+cmp "$ra_hand_dir/$abc_digest" "$work/ra-abc"; check
+# Sending the same file again changes nothing.
+send_file ra ra-hand "$ra_hand_lease" "$work/ra-abc" | jq -e '.status == "staged"' >/dev/null; check
+test "$(ls -A "$ra_hand_dir" | tr '\n' ' ')" = "$abc_digest "; check
+# A send on a lease that is not in flight is stale, and stores nothing.
+expect_exit 4 send_file ra ra-hand lease_1_999_ra-hand "$work/ra-abc"
+test ! -e "$work/ra/result-attachments/leases/lease_1_999_ra-hand"; check
+expect_exit 4 send_file ra other-task "$ra_hand_lease" "$work/ra-abc"
+
+# An ack may name only what was staged, whole, under its lease. One that
+# names more is malformed input, refused before any line is acted on.
+hello_digest=$(sha256_of "$work/ra-hello")
+ra_ack_line() {
+  jq -nc --arg task "$1" --arg lease "$2" --argjson attachments "$3" \
+    '{task_id:$task,lease_id:$lease,result:{hand:true},attachments:$attachments}'
+}
+ra_put ra ra-hand-two leave@1 '{}'
+ra_hand_two_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
+ra_abc_only=$(jq -nc --arg d "$abc_digest" '[{sha256:$d,size:3}]')
+ra_unstaged=$(jq -nc --arg d "$abc_digest" --arg h "$hello_digest" \
+  '[{sha256:$d,size:3},{sha256:$h,size:13}] | sort_by(.sha256)')
+ra_wrong_size=$(jq -nc --arg d "$abc_digest" '[{sha256:$d,size:4}]')
+{ ra_ack_line ra-hand-two "$ra_hand_two_lease" '[]'
+  ra_ack_line ra-hand "$ra_hand_lease" "$ra_unstaged"; } > "$work/ra-unstaged-acks"
+expect_exit 2 in_spool ra ack < "$work/ra-unstaged-acks"
+test ! -s "$work/exit.stdout"; check
+expect_exit 2 sh -c "printf '%s\n' '$(ra_ack_line ra-hand "$ra_hand_lease" "$ra_wrong_size")' | '$spool_binary' --dir '$work/ra' ack"
+test -f "$work/ra/leased/$ra_hand_lease.json"; check
+test -f "$work/ra/leased/$ra_hand_two_lease.json"; check
+test -z "$(find "$work/ra/results" -name "*_ra-hand*.json")"; check
+# The ack that names what was staged files it, and a repeat of it is
+# already done; one naming other attachments is stale, as a different
+# result is.
+ra_ack_line ra-hand "$ra_hand_lease" "$ra_abc_only" | in_spool ra ack | jq -e '.status == "acked"' >/dev/null; check
+ra_ack_line ra-hand "$ra_hand_lease" "$ra_abc_only" | in_spool ra ack | jq -e '.status == "already_done"' >/dev/null; check
+expect_exit 4 sh -c "printf '%s\n' '$(ra_ack_line ra-hand "$ra_hand_lease" '[]')' | '$spool_binary' --dir '$work/ra' ack"
+jq -e '.status == "stale"' "$work/exit.stdout" >/dev/null; check
+test ! -e "$ra_hand_dir"; check
+cmp "$work/ra/result-attachments/tasks/ra-hand/$abc_digest" "$work/ra-abc"; check
+ra_ack_line ra-hand-two "$ra_hand_two_lease" '[]' | in_spool ra ack | jq -e '.status == "acked"' >/dev/null; check
+
+# take reads only a done task's declared result attachments.
+take_line ra-hand "$abc_digest" | in_spool ra take > "$work/ra-taken"
+cmp "$work/ra-taken" "$work/ra-abc"; check
+expect_exit 2 sh -c "printf '%s\n' '$(take_line ra-hand "$hello_digest")' | '$spool_binary' --dir '$work/ra' take"
+test ! -s "$work/exit.stdout"; check
+expect_exit 2 sh -c "printf '%s\n' '$(take_line ra-nobody "$abc_digest")' | '$spool_binary' --dir '$work/ra' take"
+ra_put ra ra-pending leave@1 '{}'
+expect_exit 2 sh -c "printf '%s\n' '$(take_line ra-pending "$abc_digest")' | '$spool_binary' --dir '$work/ra' take"
+ra_pending_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
+send_file ra ra-pending "$ra_pending_lease" "$work/ra-abc" >/dev/null
+expect_exit 2 sh -c "printf '%s\n' '$(take_line ra-pending "$abc_digest")' | '$spool_binary' --dir '$work/ra' take"
+test ! -s "$work/exit.stdout"; check
+# A stored file that is not what it was declared to be is corrupt, and
+# nothing of it is written.
+printf 'abd' > "$work/ra/result-attachments/tasks/ra-hand/$abc_digest"
+expect_exit 70 sh -c "printf '%s\n' '$(take_line ra-hand "$abc_digest")' | '$spool_binary' --dir '$work/ra' take"
+test ! -s "$work/exit.stdout"; check
+
+# A lease that ends without a result takes what it staged with it: fail,
+# fail --no-retry, and reclaim.
+test -f "$work/ra/result-attachments/leases/$ra_pending_lease/$abc_digest"; check
+fail_one ra ra-pending "$ra_pending_lease" | jq -e '.status == "failed_retry"' >/dev/null; check
+test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
+ra_pending_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
+send_file ra ra-pending "$ra_pending_lease" "$work/ra-abc" >/dev/null
+in_spool ra reclaim --older-than 0 | jq -e '.status == "reclaimed"' >/dev/null; check
+test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
+ra_pending_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
+send_file ra ra-pending "$ra_pending_lease" "$work/ra-abc" >/dev/null
+fail_one ra ra-pending "$ra_pending_lease" --no-retry | jq -e '.status == "failed"' >/dev/null; check
+test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
+test "$(staged_in ra)" = 0; check
+
+# The lock is not held while bytes move. A send whose bytes are still
+# coming has made its file and let the lock go: status answers from another
+# process, and the lease is renewed, while it waits. A send killed there
+# leaves its file, which its lease takes with it when it ends.
+ra_put ra ra-slow leave@1 '{}'
+ra_slow_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
+# An anonymous pipe, not a named one: macOS never wakes a reader waiting on
+# a FIFO when its last writer closes it, and the send must see its end.
+"$spool_binary" --dir "$work/ra" send > "$work/ra-slow.out" < <(
+  jq -nc --arg lease "$ra_slow_lease" --arg sha "$abc_digest" '{task_id:"ra-slow",lease_id:$lease,sha256:$sha,size:3}'
+  printf 'a'
+  until test -e "$work/ra-slow-go"; do sleep 0.1; done
+  printf 'bc'
+) &
+ra_slow_pid=$!
+ra_sending() { ls -A "$work/ra/result-attachments/leases/$ra_slow_lease" 2>/dev/null | grep -q '^\.send-3-'; }
+eventually ra_sending; check
+timeout 5 "$spool_binary" --dir "$work/ra" status --json | jq -e '.leased == 1' >/dev/null; check
+jq -nc --arg lease "$ra_slow_lease" '{task_id:"ra-slow",lease_id:$lease}' \
+  | timeout 5 "$spool_binary" --dir "$work/ra" renew | jq -e '.status == "renewed"' >/dev/null; check
+touch "$work/ra-slow-go"
+wait "$ra_slow_pid"; check
+jq -e '.status == "staged"' "$work/ra-slow.out" >/dev/null; check
+cmp "$work/ra/result-attachments/leases/$ra_slow_lease/$abc_digest" "$work/ra-abc"; check
+mkfifo "$work/ra-slow-pipe"
+"$spool_binary" --dir "$work/ra" send < "$work/ra-slow-pipe" > /dev/null 2>&1 &
+ra_killed_pid=$!
+exec 8>"$work/ra-slow-pipe"
+jq -nc --arg lease "$ra_slow_lease" --arg sha "$hello_digest" '{task_id:"ra-slow",lease_id:$lease,sha256:$sha,size:13}' >&8
+printf 'hel' >&8
+ra_sending_hello() { ls -A "$work/ra/result-attachments/leases/$ra_slow_lease" 2>/dev/null | grep -q '^\.send-13-'; }
+eventually ra_sending_hello; check
+kill -9 "$ra_killed_pid"
+set +e
+wait "$ra_killed_pid" 2>/dev/null
+set -e
+exec 8>&-
+in_spool ra status >/dev/null
+ra_sending_hello; check
+in_spool ra reclaim --older-than 0 >/dev/null
+test ! -e "$work/ra/result-attachments/leases/$ra_slow_lease"; check
+
+# An ack interrupted after its result was written is finished by the next
+# command: here, after one file was filed and before the other was. The
+# state is rebuilt from the real writer's own files: the ack is made, then
+# its lease, its worker, and one staged file are put back, and its done task
+# and the other filed file are taken away.
+in_spool ra-crash init
+ra_put ra-crash rc-one leave@1 '{}'
+rc_lease=$(in_spool ra-crash lease --worker ra-hand | jq -r '.lease_id')
+send_file ra-crash rc-one "$rc_lease" "$work/ra-abc" >/dev/null
+send_file ra-crash rc-one "$rc_lease" "$work/ra-hello" >/dev/null
+mkdir "$work/rc-saved"
+cp "$work/ra-crash/leased/$rc_lease.json" "$work/ra-crash/leased/$rc_lease.worker" "$work/rc-saved/"
+ra_ack_line rc-one "$rc_lease" "$ra_unstaged" | in_spool ra-crash ack | jq -e '.status == "acked"' >/dev/null; check
+cp "$work/rc-saved/$rc_lease.json" "$work/rc-saved/$rc_lease.worker" "$work/ra-crash/leased/"
+mkdir "$work/ra-crash/result-attachments/leases/$rc_lease"
+mv -f "$work/ra-crash/result-attachments/tasks/rc-one/$hello_digest" "$work/ra-crash/result-attachments/leases/$rc_lease/"
+rm -f "$work/ra-crash/done/rc-one.json"
+test -f "$work/ra-crash/results/$rc_lease.json"; check
+in_spool ra-crash reclaim --older-than 0 > "$work/rc-reclaim.out"
+test ! -s "$work/rc-reclaim.out"; check
+in_spool ra-crash status --json | jq -e '.leased == 0 and .done == 1' >/dev/null; check
+test ! -e "$work/ra-crash/result-attachments/leases/$rc_lease"; check
+take_line rc-one "$hello_digest" | in_spool ra-crash take | cmp - "$work/ra-hello"; check
+take_line rc-one "$abc_digest" | in_spool ra-crash take | cmp - "$work/ra-abc"; check
+
+# A collect interrupted after its marker is finished by the next command:
+# here, the result attachments could not be removed.
+chmod 555 "$work/ra-crash/result-attachments/tasks"
+expect_exit 75 collect_ids ra-crash rc-one
+chmod 755 "$work/ra-crash/result-attachments/tasks"
+test -e "$work/ra-crash/.task-cleanup/rc-one"; check
+in_spool ra-crash status >/dev/null
+test ! -e "$work/ra-crash/.task-cleanup/rc-one"; check
+test ! -e "$work/ra-crash/result-attachments/tasks/rc-one"; check
+test -z "$(records_of ra-crash rc-one)"; check
+
+# Another machine. The worker sends its outputs over its own grant, and the
+# grant holds a limit on the bytes the spool keeps from it: those staged for
+# its leases, and those of its results not yet collected.
+ra_home="$work/ra-home"
+mkdir -p "$ra_home/.ssh"
+cat > "$bin/fake-ssh-ra" <<SCRIPT
+#!/bin/sh
+grant=\$1
+word=\$2
+HOME="$ra_home" SSH_ORIGINAL_COMMAND="\$word" exec "$spool_binary" remote --grant "\$grant"
+SCRIPT
+chmod +x "$bin/fake-ssh-ra"
+# A 0.0.3 spool does not know the word send, and refuses it as malformed.
+cat > "$bin/fake-ssh-old" <<SCRIPT
+#!/bin/sh
+if [ "\$2" = send ]; then
+  echo "spool: unknown remote command" >&2
+  exit 2
+fi
+exec "$bin/fake-ssh-ra" "\$@"
+SCRIPT
+chmod +x "$bin/fake-ssh-old"
+in_spool ra-remote init
+ra_grant() {
+  # ra_grant WORKER KEYCHAR [OPTIONS...]: print the grant's ID.
+  printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%s\n' "$2" \
+    > "$work/ra-$1.pub"
+  HOME="$ra_home" "$spool_binary" --dir "$work/ra-remote" grant --peer "$1" --worker "$1" \
+    --key "$work/ra-$1.pub" "${@:3}" | jq -r '.grant_id'
+}
+ra_putter=$(ra_grant ra-putter AA --put)
+ra_worker=$(ra_grant ra-worker AB --max-result-bytes 1000000)
+ra_small=$(ra_grant ra-small AC --max-result-bytes 10)
+jq -e '.max_result_bytes == 1000000' "$ra_home/.spool/grants/$ra_worker.json" >/dev/null; check
+jq -e 'has("max_result_bytes") | not' "$ra_home/.spool/grants/$ra_putter.json" >/dev/null; check
+ra_remote_put() {
+  jq -nc --arg task "$1" --arg cap "$2" --argjson payload "$3" \
+    '{task_id:$task,capability:$cap,payload:$payload}' | "$bin/fake-ssh-ra" "$ra_putter" put >/dev/null
+}
+
+# The whole chain through the forced command.
+ra_remote_put rr-one stems@1 "$(jq -nc --arg keep "$work/ra-kept/remote" '{keep:$keep,bytes:200000}')"
+"$spool_binary" work --via "$bin/fake-ssh-ra $ra_worker" --config "$work/ra-stems.json" --max-tasks 1
+"$bin/fake-ssh-ra" "$ra_putter" results </dev/null > "$work/rr-results"
+jq -s -e 'length == 1 and .[0].task_id == "rr-one" and .[0].worker == "ra-worker"
+  and (.[0].attachments | length) == 2' "$work/rr-results" >/dev/null; check
+rr_vocals=$(jq -r '.result.vocals' "$work/rr-results")
+rr_drums=$(jq -r '.result.drums' "$work/rr-results")
+for digest in "$rr_vocals" "$rr_drums"; do
+  take_line rr-one "$digest" | "$bin/fake-ssh-ra" "$ra_putter" take > "$work/rr-taken"
+  cmp "$work/rr-taken" "$work/ra-kept/remote/$digest"; check
+done
+# Taking goes with reading results: a grant that may not put may not take.
+expect_exit 5 sh -c "printf '%s\n' '$(take_line rr-one "$rr_vocals")' | '$bin/fake-ssh-ra' '$ra_worker' take"
+test ! -s "$work/exit.stdout"; check
+collect_ids_remote() { printf '{"task_id":"%s"}\n' "$1" | "$bin/fake-ssh-ra" "$ra_putter" collect; }
+collect_ids_remote rr-one | jq -e '.status == "collected"' >/dev/null; check
+test "$(find "$work/ra-remote/result-attachments" -type f | wc -l | tr -d ' ')" = 0; check
+
+# The limit counts what is staged and what is done and not collected, and
+# collect frees it. The grant ra-small may hold 10 bytes.
+printf '123456' > "$work/ra-six"
+printf '12345' > "$work/ra-five"
+printf '1234' > "$work/ra-four"
+printf '1' > "$work/ra-one"
+ra_remote_put rs-one leave@1 '{}'
+rs_lease=$("$bin/fake-ssh-ra" "$ra_small" lease | jq -r '.lease_id')
+remote_send() { { send_line "$2" "$3" "$4"; cat "$4"; } | "$bin/fake-ssh-ra" "$1" send; }
+remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-six" | jq -e '.status == "staged"' >/dev/null; check
+expect_exit 6 remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-five"
+test "$(staged_in ra-remote)" = 1; check
+remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-four" | jq -e '.status == "staged"' >/dev/null; check
+rs_both=$(jq -nc --arg s "$(sha256_of "$work/ra-six")" --arg f "$(sha256_of "$work/ra-four")" \
+  '[{sha256:$s,size:6},{sha256:$f,size:4}] | sort_by(.sha256)')
+ra_ack_line rs-one "$rs_lease" "$rs_both" | "$bin/fake-ssh-ra" "$ra_small" ack | jq -e '.status == "acked"' >/dev/null; check
+ra_remote_put rs-two leave@1 '{}'
+rs_two_lease=$("$bin/fake-ssh-ra" "$ra_small" lease | jq -r '.lease_id')
+expect_exit 6 remote_send "$ra_small" rs-two "$rs_two_lease" "$work/ra-one"
+collect_ids_remote rs-one | jq -e '.status == "collected"' >/dev/null; check
+remote_send "$ra_small" rs-two "$rs_two_lease" "$work/ra-one" | jq -e '.status == "staged"' >/dev/null; check
+# Another worker's lease is stale to it.
+expect_exit 4 remote_send "$ra_worker" rs-two "$rs_two_lease" "$work/ra-one"
+# Revoking the grant takes its staged files with its leases.
+HOME="$ra_home" "$spool_binary" --dir "$work/ra-remote" revoke --grant "$ra_small" >/dev/null
+test ! -e "$work/ra-remote/result-attachments/leases/$rs_two_lease"; check
+test "$(staged_in ra-remote)" = 0; check
+rs_two_lease=$(in_spool ra-remote lease --worker ra-local | jq -r '.lease_id')
+ack_one ra-remote rs-two "$rs_two_lease" >/dev/null
+# A grant with no limit, as every grant was before, may send nothing.
+ra_remote_put rs-three leave@1 '{}'
+rs_three_lease=$("$bin/fake-ssh-ra" "$ra_putter" lease | jq -r '.lease_id')
+expect_exit 6 remote_send "$ra_putter" rs-three "$rs_three_lease" "$work/ra-one"
+test "$(staged_in ra-remote)" = 0; check
+jq -nc --arg lease "$rs_three_lease" '{task_id:"rs-three",lease_id:$lease,result:{}}' \
+  | "$bin/fake-ssh-ra" "$ra_putter" ack | jq -e '.status == "acked"' >/dev/null; check
+
+# A worker whose grant has no room fails the task with retry, says why, and
+# goes on: here, to lease the same task again, and be refused again.
+ra_tiny=$(ra_grant ra-tiny AD --max-result-bytes 2)
+ra_remote_put rt-big leave@1 "$(jq -nc --arg make "printf abc > outputs/$abc_digest" '{make:$make}')"
+"$spool_binary" work --via "$bin/fake-ssh-ra $ra_tiny" --config "$work/ra-leave-three.json" --max-tasks 2
+check
+in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "rt-big")) | length == 2
+  and all(.[]; .retried == true and (.reason | contains("max_result_bytes")))' >/dev/null; check
+in_spool ra-remote results | jq -s -e 'map(select(.task_id == "rt-big")) | length == 0' >/dev/null; check
+test "$(staged_in ra-remote)" = 0; check
+rt_big_lease=$(in_spool ra-remote lease --worker ra-local | jq -r '.lease_id')
+fail_one ra-remote rt-big "$rt_big_lease" --no-retry >/dev/null
+# The same for a file far larger than a pipe holds: the spool refuses it from
+# its request line and reads none of it, and the worker, whose writes then
+# fail, still learns why from the spool's status.
+ra_config leave@1 "$bin/leave" 4000000 > "$work/ra-leave-large.json"
+ra_large_make='head -c 3000000 /dev/urandom > big; if command -v sha256sum >/dev/null 2>&1; then d=$(sha256sum big | cut -d" " -f1); else d=$(shasum -a 256 big | cut -d" " -f1); fi; mv big "outputs/$d"'
+ra_remote_put rt-large leave@1 "$(jq -nc --arg make "$ra_large_make" '{make:$make}')"
+"$spool_binary" work --via "$bin/fake-ssh-ra $ra_tiny" --config "$work/ra-leave-large.json" --max-tasks 1
+check
+in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "rt-large")) | length == 1
+  and .[0].retried == true and (.[0].reason | contains("max_result_bytes"))' >/dev/null; check
+test "$(staged_in ra-remote)" = 0; check
+rt_large_lease=$(in_spool ra-remote lease --worker ra-local | jq -r '.lease_id')
+fail_one ra-remote rt-large "$rt_large_lease" --no-retry >/dev/null
+
+# A spool that does not know send refuses it: the worker ends with that
+# status and does not acknowledge the task, whose lease stands.
+ra_remote_put rt-old stems@1 "$(jq -nc --arg keep "$work/ra-kept/old" '{keep:$keep,bytes:10}')"
+expect_exit 2 "$spool_binary" work --via "$bin/fake-ssh-old $ra_worker" --config "$work/ra-stems.json" --max-tasks 1
+in_spool ra-remote results | jq -s -e 'map(select(.task_id == "rt-old")) | length == 0' >/dev/null; check
+in_spool ra-remote status --json | jq -e '.leased == 1' >/dev/null; check
+
+# What a 0.0.3 binary wrote still loads: its result record, read and
+# written back as it was, and its grants, which hold no limit and so may
+# send nothing, and otherwise work as they did. The fixture is made by
+# scripts/make-records-fixture.sh running the 0.0.3 binary; only the spool
+# path in each grant is changed, to where it is unpacked.
+mkdir "$work/old03"
+tar -xf "$fixtures/spool-0.0.3-records.tar" -C "$work/old03"
+for record in "$work"/old03/home/.spool/grants/*.json; do
+  jq -e 'has("max_result_bytes") | not' "$record" >/dev/null; check
+  jq -c --arg spool "$work/old03/spool" '.spool = $spool' "$record" > "$work/old03-grant.json"
+  mv -f "$work/old03-grant.json" "$record"
+done
+old_result=$(find "$work/old03/spool/results" -name '*.json')
+in_spool old03/spool results > "$work/old03-results"
+cmp "$work/old03-results" <(cat "$old_result"; echo); check
+old_grant_of() { grep -l "\"worker\":\"$1\"" "$work"/old03/home/.spool/grants/*.json | xargs basename | sed 's/\.json$//'; }
+old_worker=$(old_grant_of old-worker)
+old_putter=$(old_grant_of old-putter)
+cat > "$bin/fake-ssh-03" <<SCRIPT
+#!/bin/sh
+HOME="$work/old03/home" SSH_ORIGINAL_COMMAND="\$2" exec "$spool_binary" remote --grant "\$1"
+SCRIPT
+chmod +x "$bin/fake-ssh-03"
+diff <("$bin/fake-ssh-03" "$old_putter" results </dev/null) "$work/old03-results"; check
+old_lease=$(basename "$(find "$work/old03/spool/leased" -name '*.json')" .json)
+expect_exit 6 sh -c "{ printf '%s\n' '$(send_line old-leased "$old_lease" "$work/ra-abc")'; printf abc; } | '$bin/fake-ssh-03' '$old_worker' send"
+jq -nc --arg lease "$old_lease" '{task_id:"old-leased",lease_id:$lease,result:{new:true}}' \
+  | "$bin/fake-ssh-03" "$old_worker" ack | jq -e '.status == "acked"' >/dev/null; check
+expect_exit 2 sh -c "printf '%s\n' '$(take_line old-done "$abc_digest")' | '$bin/fake-ssh-03' '$old_putter' take"
+
+printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits, following workers, attempts with retention, result attachments (%d checks)\n' "$checks"

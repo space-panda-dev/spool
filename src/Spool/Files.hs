@@ -11,6 +11,8 @@ module Spool.Files
   , attachmentsDir
   , attachmentCleanupDir
   , taskCleanupDir
+  , resultLeasesDir
+  , resultTasksDir
   , layoutPath
   , lockPath
   , openSpool
@@ -22,6 +24,8 @@ module Spool.Files
   , failedPath
   , resultPath
   , taskCleanupPath
+  , resultLeaseDir
+  , resultTaskDir
   , workerSidecarPath
   , renewedSidecarPath
   , jsonFiles
@@ -71,6 +75,10 @@ data Paths = Paths
   , attachmentCleanupDir :: FilePath
   , taskCleanupDir :: FilePath
     -- ^ One empty marker for each finished task being deleted (ADR 0018).
+  , resultLeasesDir :: FilePath
+    -- ^ The result attachments sent under each lease in flight (ADR 0020).
+  , resultTasksDir :: FilePath
+    -- ^ The result attachments of each done task (ADR 0020).
   , layoutPath :: FilePath
     -- ^ Which layout the spool's files are in (ADR 0018).
   , lockPath :: FilePath
@@ -123,6 +131,8 @@ spoolAt directory lock = Paths
   , attachmentsDir = directory </> "attachments"
   , attachmentCleanupDir = directory </> ".attachment-cleanup"
   , taskCleanupDir = directory </> ".task-cleanup"
+  , resultLeasesDir = directory </> "result-attachments" </> "leases"
+  , resultTasksDir = directory </> "result-attachments" </> "tasks"
   , layoutPath = directory </> ".spool-layout"
   , lockPath = directory </> ".spool.lock"
   , processLock = lock
@@ -136,6 +146,14 @@ pendingPath, donePath, taskCleanupPath :: Paths -> TaskId -> FilePath
 pendingPath paths = underTask (pendingDir paths) ".json"
 donePath paths = underTask (doneDir paths) ".json"
 taskCleanupPath paths = underTask (taskCleanupDir paths) ""
+
+-- | Where a done task's result attachments are kept, and where a lease's
+-- are staged until its ack files them there.
+resultTaskDir :: Paths -> TaskId -> FilePath
+resultTaskDir paths = underTask (resultTasksDir paths) ""
+
+resultLeaseDir :: Paths -> LeaseId -> FilePath
+resultLeaseDir paths = underLease (resultLeasesDir paths) ""
 
 underTask :: FilePath -> String -> TaskId -> FilePath
 underTask directory extension ident =
@@ -158,7 +176,8 @@ initialise :: Paths -> IO ()
 initialise paths = mapM_ (createDirectoryIfMissing True)
   [rootDir paths, pendingDir paths, leasedDir paths, doneDir paths,
    failedDir paths, resultsDir paths, attachmentsDir paths,
-   attachmentCleanupDir paths, taskCleanupDir paths]
+   attachmentCleanupDir paths, taskCleanupDir paths, resultLeasesDir paths,
+   resultTasksDir paths]
 
 jsonFiles :: FilePath -> IO [FilePath]
 jsonFiles directory = do

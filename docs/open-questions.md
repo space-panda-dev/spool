@@ -5,18 +5,27 @@ than guessing.
 
 ## Protocol
 
-- How are large results returned? Results are small JSON; anything bigger is
-  the capability's business until a real need says otherwise.
 - How is the protocol versioned, and how does a worker learn the version a
   spool speaks? Every reader refuses a field it does not define, so the
   first field added to an envelope or a record makes every older reader
-  refuse it. The answer has to come before that field does. Version 0.0.3
-  added no field but new answers (`failed` from `reclaim`, `collected`,
-  `not_finished`, `unknown`, `expired`), which a client learns of only from
-  [the protocol](../spec/protocol.md#since-002).
+  refuse it. Version 0.0.3 added no field but new answers (`failed` from
+  `reclaim`, `collected`, `not_finished`, `unknown`, `expired`), which a
+  client learns of only from [the protocol](../spec/protocol.md#since-002).
+  Version 0.0.4 added the first fields, `attachments` on an ack and a result
+  record and `max_result_bytes` on a grant, and writes each only when it
+  holds something, so an older reader meets one only where it matters
+  ([ADR 0020](decisions/0020-a-result-may-carry-attachments.md)). That is a
+  way around the question, not an answer to it.
 - Is there a hard cancel for a running task?
 - How do an attachment's bytes reach the spool from another machine? A task
   put through the remote command may declare none ([ADR 0015](decisions/0015-a-grant-may-let-its-holder-put.md)).
+  A result's attachments do reach it, by `send` under a lease
+  ([ADR 0020](decisions/0020-a-result-may-carry-attachments.md)); a task's
+  would need a request naming a task not yet put.
+- Should a grant's limit on result attachments be taken for a whole result
+  before its first file is sent? Today each file is counted when it is sent,
+  so a result can have its first files staged and its last refused, and the
+  run is failed with retry after the bytes of the first have travelled.
 - Should a spool, or a task, choose its own number of attempts? Three is
   fixed ([ADR 0017](decisions/0017-a-task-has-three-attempts.md)) until a
   real need for another says what the setting should be.

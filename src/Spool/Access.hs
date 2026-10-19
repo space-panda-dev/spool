@@ -14,6 +14,7 @@ module Spool.Access
   , grantSpool
   , grantPublicKey
   , grantPut
+  , grantMaxResultBytes
   , grantExpiresAt
   , GrantId
   , mkGrantId
@@ -38,6 +39,8 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteArray.Encoding as BAE
+import Data.Int (Int64)
+import Control.Monad (when)
 import Data.List (isSuffixOf, sort)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -134,6 +137,9 @@ data Grant = Grant
   , grantPublicKey :: PublicKey
   , grantPut :: Bool
     -- ^ Whether the holder may put tasks on the spool (ADR 0015).
+  , grantMaxResultBytes :: Int64
+    -- ^ How many bytes of result attachments the spool holds from this
+    -- grant at once; none at all when 0 (ADR 0020).
   , grantExpiresAt :: Maybe UTCTime
   } deriving (Eq, Show)
 
@@ -144,6 +150,8 @@ data RemoteCommand
   | RemoteRenew
   | RemoteFail Retry
   | RemoteFetch
+  | RemoteSend
+  | RemoteTake
   | RemotePut
   | RemoteResults
   | RemoteFailures
@@ -162,12 +170,17 @@ grantKeys = sort
   , "expires_at"
   ]
 
+-- | A field a record may leave out: a grant from before ADR 0020 has no
+-- limit on result attachments, and that is a limit of 0.
+optionalGrantKeys :: [T.Text]
+optionalGrantKeys = ["max_result_bytes"]
+
 -- | The record as the bytes of one atomic file, in canonical form.
 renderGrant :: Grant -> BS.ByteString
 renderGrant = BL.toStrict . encode
 
 instance ToJSON Grant where
-  toJSON grant = A.object
+  toJSON grant = A.object $
     [ "grant_id" .= grantId grant
     , "peer" .= grantPeer grant
     , "worker" .= grantWorker grant
@@ -175,16 +188,21 @@ instance ToJSON Grant where
     , "public_key" .= grantPublicKey grant
     , "put" .= grantPut grant
     , "expires_at" .= fmap renderExpiry (grantExpiresAt grant)
-    ]
+    ] <> limit
     where
+      -- Left out when 0, so a grant made without the option is the record
+      -- 0.0.3 wrote.
+      limit
+        | grantMaxResultBytes grant == 0 = []
+        | otherwise = ["max_result_bytes" .= grantMaxResultBytes grant]
       renderExpiry :: UTCTime -> T.Text
       renderExpiry = T.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ"
 
 instance FromJSON Grant where
   parseJSON = A.withObject "grant" $ \object -> do
-    let actual = sort (map K.toText (KM.keys object))
+    let actual = sort (filter (`notElem` optionalGrantKeys) (map K.toText (KM.keys object)))
     if actual /= grantKeys
-      then fail "grant must contain exactly grant_id, peer, worker, spool, public_key, put, expires_at"
+      then fail "grant must contain exactly grant_id, peer, worker, spool, public_key, put, expires_at, and may contain max_result_bytes"
       else do
         identifier <- object .: "grant_id"
         peer <- object .: "peer"
@@ -193,7 +211,8 @@ instance FromJSON Grant where
         publicKey <- object .: "public_key"
         put <- object .: "put"
         expiry <- object .: "expires_at"
-        case validateGrant identifier peer worker spool publicKey put expiry of
+        limit <- maybe (pure 0) parseJSON (KM.lookup "max_result_bytes" object)
+        case validateGrant identifier peer worker spool publicKey put limit expiry of
           Left message -> fail message
           Right grant -> pure grant
 
@@ -212,14 +231,16 @@ validateGrant
   -> FilePath
   -> T.Text
   -> Bool
+  -> Int64
   -> Maybe T.Text
   -> Either String Grant
-validateGrant identifierText peer workerText spool publicKeyValue put expiryText = do
+validateGrant identifierText peer workerText spool publicKeyValue put limit expiryText = do
   identifier <- mkGrantId identifierText
   validatePeer peer
   worker <- mkWorkerName workerText
   validateGrantSpool spool
   publicKey <- mkPublicKey publicKeyValue
+  when (limit < 0) (Left "max_result_bytes must not be negative")
   expiry <- case expiryText of
     Nothing -> Right Nothing
     Just text -> Just <$> parseExpiry text
@@ -230,6 +251,7 @@ validateGrant identifierText peer workerText spool publicKeyValue put expiryText
     , grantSpool = spool
     , grantPublicKey = publicKey
     , grantPut = put
+    , grantMaxResultBytes = limit
     , grantExpiresAt = expiry
     }
 
@@ -316,6 +338,8 @@ parseRemoteCommand bytes
   | bytes == "fail" = Right (RemoteFail Retry)
   | bytes == "fail --no-retry" = Right (RemoteFail NoRetry)
   | bytes == "fetch" = Right RemoteFetch
+  | bytes == "send" = Right RemoteSend
+  | bytes == "take" = Right RemoteTake
   | bytes == "put" = Right RemotePut
   | bytes == "results" = Right RemoteResults
   | bytes == "failures" = Right RemoteFailures
