@@ -24,6 +24,8 @@ import Control.Concurrent.Async
   , cancel
   , poll
   , wait
+  , waitCatch
+  , waitCatchSTM
   , waitSTM
   , withAsync
   )
@@ -67,7 +69,7 @@ import GHC.IO.Exception (IOErrorType (ResourceVanished))
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO (Handle, hClose)
+import System.IO (Handle, hClose, stderr)
 import System.IO.Error (ioeGetErrorType)
 import System.Posix.Signals
   ( Handler (Catch)
@@ -91,11 +93,11 @@ import System.Process
 import System.Timeout (timeout)
 import qualified Spool.Attachments as SA
 import Spool.Error
-  ( ErrorClass (..)
-  , SpoolError (..)
+  ( SpoolError
   , corrupt
   , exitStatus
   , report
+  , stale
   , withContext
   )
 import Spool.Files (epochMicros)
@@ -115,14 +117,15 @@ import Spool.Worker.Config
 import Spool.Worker.Connection (Connection (..))
 import Spool.Worker.Follow (awaitLease)
 import Spool.Worker.Outputs (collectOutputs)
+import Spool.Worker.Room (Sent (..), roomWaits, sendOutputs)
 
 -- | The outcome of running a capability's executable to completion: a
 -- failure says whether the task is to be tried again.
 data RunOutcome = RunSuccess BL.ByteString | RunFailure Retry T.Text
 
 -- | What a run comes to once its outputs are sent: a result and the result
--- attachments sent with it, or a failure.
-data Returned = Returned A.Value [SA.Attachment] | Failed Retry T.Text
+-- attachments sent with it, a failure, or a lease lost while it waited.
+data Returned = Returned A.Value [SA.Attachment] | Failed Retry T.Text | Lost
 
 -- | Whether a program that exited with this status is to be tried again.
 -- Under ADR 0017, exit 65 (EX_DATAERR) says the task can never succeed.
@@ -229,8 +232,12 @@ runExecutable spool config task leaseIdent capConfig payloadBytes = do
         outcome <- bracket freshTempDir removeWorkerDirectory $ \tempDir -> do
           receiveTaskAttachments spool task leaseIdent tempDir
           ran <- runCapability capConfig (wcEnv config) tempDir payloadBytes
-          returned spool (LeaseRef (taskId task) leaseIdent) capConfig tempDir ran
-        renewal <- poll renewing
+          returned spool (LeaseRef (taskId task) leaseIdent) config capConfig
+            (whileLeased renewing) tempDir ran
+        -- A lease lost in a wait for room has its refusal in hand.
+        renewal <- case outcome of
+          Lost -> Just <$> waitCatch renewing
+          _ -> poll renewing
         pure (outcome, renewal)
   case renewal of
     Just (Right refusal) -> throwIO (withContext "work: renewal failed: " refusal)
@@ -239,15 +246,25 @@ runExecutable spool config task leaseIdent capConfig payloadBytes = do
       Failed retry reason -> completeFailure spool (taskId task) leaseIdent reason retry
       Returned outputValue attachments ->
         completeSuccess spool task leaseIdent outputValue attachments
+      Lost -> throwIO (stale "work: the lease was lost")
+
+-- | Wait so many seconds while the lease is renewed: false, at once, when
+-- its renewal has ended.
+whileLeased :: Async SpoolError -> Int -> IO Bool
+whileLeased renewing seconds = do
+  expired <- registerDelay (seconds * 1000000)
+  atomically $
+    (False <$ waitCatchSTM renewing) `orElse` (True <$ (readTVar expired >>= check))
 
 -- | A run that exited 0 with JSON returns that result, and sends what it
 -- left in outputs/, while its lease is still renewed. outputs/ that breaks
--- the rules is the program's doing, and fails the task for good; a grant
--- with no room for a file fails it with retry, for later or for another
--- worker.
+-- the rules is the program's doing, and fails the task for good. A grant
+-- with no room for a file now is waited for (ADR 0021), and one that could
+-- never hold it fails the task for good.
 returned
-  :: Connection -> LeaseRef -> CapabilityConfig -> FilePath -> RunOutcome -> IO Returned
-returned spool reference capConfig tempDir ran = case ran of
+  :: Connection -> LeaseRef -> WorkConfig -> CapabilityConfig -> (Int -> IO Bool)
+  -> FilePath -> RunOutcome -> IO Returned
+returned spool reference config capConfig pause tempDir ran = case ran of
   RunFailure retry reason -> pure (Failed retry reason)
   RunSuccess stdoutBytes -> case A.eitherDecode stdoutBytes of
     Left _ -> pure (Failed Retry "output is not JSON")
@@ -255,17 +272,16 @@ returned spool reference capConfig tempDir ran = case ran of
       outputs <- collectOutputs (capMaxResultAttachmentBytes capConfig) (tempDir </> "outputs")
       case outputs of
         Left reason -> pure (Failed NoRetry reason)
-        Right files -> sendAll outputValue files []
+        Right files -> do
+          sent <- sendOutputs (sendResultAttachment spool reference) pause say
+            (roomWaits (wcRenewSeconds config) (capTimeoutSeconds capConfig)) files
+          pure $ case sent of
+            AllSent attachments -> Returned outputValue attachments
+            NotSent retry reason -> Failed retry reason
+            LeaseGone -> Lost
   where
-    sendAll outputValue [] sent = pure (Returned outputValue (reverse sent))
-    sendAll outputValue ((attachment, path) : rest) sent = do
-      result <- sendResultAttachment spool reference attachment path
-      case result of
-        Right () -> sendAll outputValue rest (attachment : sent)
-        Left (SpoolError OverLimit message) -> pure (Failed Retry
-          ("result attachment " <> SA.sha256Text (SA.attachmentSha256 attachment)
-            <> " refused: " <> T.pack message))
-        Left refusal -> throwIO (withContext "work: send: " refusal)
+    say line = BS.hPut stderr (TE.encodeUtf8 (T.pack ("spool: work: task "
+      <> T.unpack (taskIdText (refTask reference)) <> ": " <> line)) <> BS.singleton 10)
 
 -- | Receive every declared attachment into the working directory, verified.
 receiveTaskAttachments :: Connection -> Task -> LeaseId -> FilePath -> IO ()

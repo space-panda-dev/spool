@@ -10,9 +10,11 @@ domain under CC0 1.0: anyone may implement it. The version above must match
 
 ## Since 0.0.3
 
-Version 0.0.4 adds one decision,
+Version 0.0.4 adds two decisions,
 [ADR 0020](../docs/decisions/0020-a-result-may-carry-attachments.md): a
-result may carry attachments. It adds the first new fields since 0.0.1, and
+result may carry attachments, and
+[ADR 0021](../docs/decisions/0021-a-send-refused-for-room-waits.md): a send
+refused for room waits. It adds the first new fields since 0.0.1, and
 writes each only where it holds something:
 
 - `ack` may carry `attachments`, and a result record and a `results` line
@@ -31,7 +33,9 @@ writes each only where it holds something:
   whose files did not arrive is never recorded.
 - A worker's capability configuration may carry
   `max_result_attachment_bytes`; a 0.0.3 worker refuses it (exit 2).
-- Exit 6 is new: a grant's limit on result attachments refuses a send.
+- Exits 6 and 7 are new: a grant's limit on result attachments has no room
+  for a send now (6), or could never hold it (7). A worker waits on 6, up
+  to its capability's `timeout_seconds`, and fails the task for good on 7.
 - `collect` and `gc` delete a done task's result attachments with it.
 - `fetch` no longer holds the spool's lock while it writes: the lease is
   checked and the file opened under it, and the bytes are verified and
@@ -405,8 +409,12 @@ followed by exactly `size` raw bytes, and then the end of the stream. The
 fields are exactly these four; `sha256` and `size` are as in a declaration.
 The task and lease must be current, and through the remote command the
 lease must be the grant's worker's; otherwise the request is exit 4 and
-nothing is stored. A grant that has no room for `size` more bytes is exit 6
-(below), and nothing is stored. The bytes are counted and hashed as they
+nothing is stored. Under
+[ADR 0021](../docs/decisions/0021-a-send-refused-for-room-waits.md), a
+grant whose limit could never hold `size` more bytes beside those already
+staged under the same lease, which includes every grant that holds 0, is
+exit 7; one that has no room for them now, beside everything it holds, is
+exit 6. Either way nothing is stored, and 7 is decided first. The bytes are counted and hashed as they
 arrive; a stream that ends early, holds more, or does not match its digest
 is exit 2, and nothing is kept. A send answers one line:
 
@@ -569,10 +577,11 @@ stdin and stdout. The worker's name is the grant's, so there is no
 `--worker`; attachments arrive through `fetch`, and result attachments leave
 through `send`. Everything else is as for a local worker: the configuration,
 the limits, renewal, and what is done with a program's exit and output. A
-`send` refused with 4 ends the worker with it, as a stale `ack` does; one
-refused with 6 fails the lease with retry, and the worker goes on. A `send`
-refused with any other status, 2 from a spool that does not know the word
-among them, ends the worker with it, and the task is not acknowledged.
+`send` refused with 4 ends the worker with it, as a stale `ack` does. One
+refused with 6 is waited out and one refused with 7 fails the task for good,
+as under [Result attachments](#result-attachments) below. A `send` refused
+with any other status, 2 from a spool that does not know the word among
+them, ends the worker with it, and the task is not acknowledged.
 
 A request the transport cannot carry, or that the spool denies, ends the
 worker with the status the spool gave, or 75 when the transport itself
@@ -637,7 +646,8 @@ detect this.
 | 3 | task conflict |
 | 4 | stale or unknown lease |
 | 5 | grant missing, revoked, or expired |
-| 6 | `send`: over the grant's `max_result_bytes` |
+| 6 | `send`: no room now under the grant's `max_result_bytes` |
+| 7 | `send`: the grant's `max_result_bytes` could never hold this result |
 | 70 | corrupt durable state |
 | 75 | retryable filesystem failure |
 | 143 | `work`: stopped by SIGTERM |
@@ -712,6 +722,19 @@ says which. `work` then sends each file, while it still renews the lease,
 and acknowledges with the result and the files, sorted by digest. A run
 that leaves nothing in `outputs/`, or no `outputs/`, is acknowledged as it
 was before.
+
+Under [ADR 0021](../docs/decisions/0021-a-send-refused-for-room-waits.md),
+a send refused with 6 is sent again after a wait, with the files already
+staged kept and the program not run again. It says on stderr once that it
+is waiting for room, and once that it is sending on. The first wait is 1
+second, and each after it twice the one before, up to `renew_seconds`; the
+lease is renewed throughout. A run whose waits come to the capability's
+`timeout_seconds`, all its files together, fails with retry and a reason
+that says it waited that long for room under `max_result_bytes`; the last
+wait is cut short to come to it exactly. A renewal refused while it waits
+ends the wait, and nothing is sent or acknowledged. SIGTERM ends it as
+above. A send refused with 7 is failed with `--no-retry` at once, with a
+reason that names `max_result_bytes`.
 
 ### Task attachments
 

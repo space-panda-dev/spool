@@ -136,4 +136,7 @@ collected, leaving the spool empty.
 
 What it showed beyond the tests: a send refused for the limit counts as an
 attempt, and a worker that leases again at once spends all three in about a
-minute, rerunning the program each time.
+minute, rerunning the program each time. Since changed by
+[ADR 0021](decisions/0021-a-send-refused-for-room-waits.md): such a send now
+waits for room under its lease, and a file the grant could never hold is
+refused with 7 and failed for good.

@@ -66,8 +66,8 @@ data Connection = Connection
     -- ^ Run an action on a handle that reads the attachment's bytes.
   , sendResultAttachment :: LeaseRef -> SA.Attachment -> FilePath -> IO (Either SpoolError ())
     -- ^ Send the file at this path as a result attachment under the lease.
-    -- A stale lease, or a grant with no room for it, is answered; any other
-    -- refusal is thrown.
+    -- A stale lease, or a grant with no room for it now or ever, is
+    -- answered; any other refusal is thrown.
   }
 
 -- | The spool in a directory on this machine.  Each operation is one
@@ -96,11 +96,12 @@ localConnection paths worker = Connection
   }
 
 -- | A refusal a send answers: its lease is stale, or its grant has no room
--- for it. Anything else ends the run.
+-- for it now, or could never have. Anything else ends the run.
 answeredOrThrown :: SpoolError -> IO (Either SpoolError ())
 answeredOrThrown refusal = case refusal of
   SpoolError Stale _ -> pure (Left refusal)
   SpoolError OverLimit _ -> pure (Left refusal)
+  SpoolError NeverFits _ -> pure (Left refusal)
   _ -> throwIO refusal
 
 -- | A spool on another machine, reached by running this program with these
@@ -174,6 +175,7 @@ remoteConnection program arguments = Connection
       unless (BS.null chunk) (BS.hPut writing chunk >> copy file writing)
 
     refused 6 = "the spool refused the result attachment: it is over the grant's max_result_bytes"
+    refused 7 = "the spool refused the result attachment: it could never fit under the grant's max_result_bytes"
     refused _ = "the spool refused the request"
 
     pipes (Just writing) (Just reading) = pure (writing, reading)
