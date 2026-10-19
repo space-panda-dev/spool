@@ -1,4 +1,4 @@
-# What spool needs from a fleet host (space-panda-dev/atelier-fleet,
+# What spool needs from a fleet host (the fleet repository's
 # docs/contracts.md, schema version 1). The fleet reads this file to place
 # spool, back up its state and check its health; spool reads nothing here.
 schemaVersion = 1
