@@ -20,6 +20,6 @@ SPDX-FileCopyrightText = "The Spool contributors"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
-path = ["*.md", "docs/**", "spec/**"]
+path = ["*.md", "docs/**", "spec/**", "fleet.toml"]
 SPDX-FileCopyrightText = "The Spool contributors"
 SPDX-License-Identifier = "CC0-1.0"

@@ -1,0 +1,49 @@
+# What spool needs from a fleet host (space-panda-dev/atelier-fleet,
+# docs/contracts.md, schema version 1). The fleet reads this file to place
+# spool, back up its state and check its health; spool reads nothing here.
+schemaVersion = 1
+
+[project]
+name = "spool"
+description = "File-backed JSONL task spools, hosted for workers that reach them over SSH"
+
+[package]
+flake = "github:space-panda-dev/spool"
+attribute = "spool"
+executables = ["spool"]
+
+# Run as root.account. /usr/local/bin/spool is the link every grant's forced
+# command names, so this proves the account can still run what grants call.
+[health]
+command = ["/usr/local/bin/spool", "--version"]
+timeoutSeconds = 10
+
+# Paths are relative to root.account.home. Neither can be regenerated: the
+# spools hold work nobody has collected, and authorized_keys holds the grants.
+[[state]]
+path = "spools"
+description = "One spool per audience: pending, leased and finished tasks"
+
+[[state]]
+path = ".ssh"
+description = "Grants: one forced-command line per worker in authorized_keys"
+
+# No ports (workers arrive over SSH), no hub link, no telemetry of its own:
+# its timers log to the system journal, which every host collects.
+
+[root]
+# Rendered by the fleet from the host's spool settings, installed by the
+# operator: reclaim returns leases whose workers have gone, gc ages out
+# finished work nobody collected.
+systemUnits = [
+  "spool-reclaim.service",
+  "spool-reclaim.timer",
+  "spool-gc.service",
+  "spool-gc.timer",
+]
+
+# A spool's files are mode 0600, so the spools have one owner, and every
+# grant's forced command runs as it.
+[root.account]
+name = "spool"
+home = "/var/lib/spool"
