@@ -140,3 +140,12 @@ minute, rerunning the program each time. Since changed by
 [ADR 0021](decisions/0021-a-send-refused-for-room-waits.md): such a send now
 waits for room under its lease, and a file the grant could never hold is
 refused with 7 and failed for good.
+
+Rerun the same evening with [ADR 0021](decisions/0021-a-send-refused-for-room-waits.md)
+on both machines, three new tasks against the same 300 MB limit: the third
+task's second file was refused, and its worker kept the lease and waited,
+with no failure record, for 61 s until the caller collected the first
+task; then it sent on and acknowledged. The program ran three times for
+three tasks. Over `--via`, the spool's own line about the refusal reaches
+the worker's stderr on every try, beside the worker's one line about
+waiting.

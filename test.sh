@@ -2373,7 +2373,7 @@ revoke_lease=$(jq -r '.lease_id' "$work/revoke-lease.jsonl")
 HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$grant_id" \
   | jq -e --arg grant "$grant_id" '.grant_id == $grant and .status == "revoked"' >/dev/null; check
 test ! -e "$grant_home/.spool/grants/$grant_id.json"; check
-! grep -F "spool-grant:$grant_id" "$grant_home/.ssh/authorized_keys" >/dev/null; check
+if grep -F "spool-grant:$grant_id" "$grant_home/.ssh/authorized_keys" >/dev/null; then false; fi; check
 test "$(head -n 1 "$grant_home/.ssh/authorized_keys")" = '# unrelated key material'; check
 spoolg status --json | jq -e '.pending >= 1' >/dev/null; check
 # The revoked lease is an attempt, recorded as a reclaim is.
