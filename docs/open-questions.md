@@ -24,8 +24,11 @@ than guessing.
   would need a request naming a task not yet put.
 - Should a grant's limit on result attachments be taken for a whole result
   before its first file is sent? Today each file is counted when it is sent,
-  so a result can have its first files staged and its last refused, and the
-  run is failed with retry after the bytes of the first have travelled.
+  so a result can have its first files staged and its last refused. The run
+  then waits for room with the first files held
+  ([ADR 0021](decisions/0021-a-send-refused-for-room-waits.md)), and two
+  leases of one grant can each hold what the other waits for until both
+  give up at their timeout.
 - Should a spool, or a task, choose its own number of attempts? Three is
   fixed ([ADR 0017](decisions/0017-a-task-has-three-attempts.md)) until a
   real need for another says what the setting should be.

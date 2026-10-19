@@ -42,6 +42,8 @@ module Spool.Store
   , fetchAttachment
   , Sender (..)
   , fitsLimit
+  , Room (..)
+  , roomFor
   , sendCommand
   , sendFrom
   , takeCommand
@@ -80,6 +82,7 @@ import Spool.Error
   , conflict
   , corrupt
   , malformed
+  , neverFits
   , orThrow
   , overLimit
   , report
@@ -849,6 +852,20 @@ data Sender = HostWorker | GrantedWorker WorkerName Int64
 fitsLimit :: Int64 -> Integer -> Int64 -> Bool
 fitsLimit limit held size = limit > 0 && held + toInteger size <= toInteger limit
 
+-- | What room a grant's limit has for a file (ADR 0021).
+data Room = HasRoom | NoRoomNow | NoRoomEver
+  deriving (Eq, Show)
+
+-- | The room a grant's limit has for this many more bytes, given those
+-- staged under the sender's own lease and those the grant holds in all.
+-- What the lease staged no collect can free while it stands, so a file
+-- they leave no room for never fits, and a limit of 0 holds none.
+roomFor :: Int64 -> Integer -> Integer -> Int64 -> Room
+roomFor limit own held size
+  | not (fitsLimit limit own size) = NoRoomEver
+  | fitsLimit limit held size = HasRoom
+  | otherwise = NoRoomNow
+
 -- | The longest request line a send reads before its bytes.
 sendLineLimit :: Int
 sendLineLimit = 4096
@@ -878,7 +895,7 @@ sendFrom paths guard sender (SendRequest reference attachment) already source = 
   (temporary, handle) <- withLock paths $ do
     guard
     either throwIO pure =<< liveLeaseOwned paths (senderWorker sender) reference
-    withinLimit paths sender attachment
+    withinLimit paths sender leaseIdent attachment
     present <- fileExists directory
     unless present $ do
       createDirectory directory
@@ -929,14 +946,24 @@ sendingSize name = do
     then Just (read digits)
     else Nothing
 
-withinLimit :: Paths -> Sender -> SA.Attachment -> IO ()
-withinLimit _ HostWorker _ = pure ()
-withinLimit paths (GrantedWorker worker limit) attachment = do
+-- | Refuse a file the grant could never hold beside what its own lease
+-- staged (7), and then one it has no room for now (6).
+withinLimit :: Paths -> Sender -> LeaseId -> SA.Attachment -> IO ()
+withinLimit _ HostWorker _ _ = pure ()
+withinLimit paths (GrantedWorker worker limit) leaseIdent attachment = do
+  let size = SA.attachmentSize attachment
+  own <- stagedBytes paths leaseIdent
   held <- heldBytes paths worker
-  unless (fitsLimit limit held (SA.attachmentSize attachment)) (throwIO (overLimit
-    ("a result attachment of " <> show (SA.attachmentSize attachment)
-      <> " bytes is over this grant's max_result_bytes of " <> show limit
-      <> ", with " <> show held <> " bytes held")))
+  case roomFor limit own held size of
+    HasRoom -> pure ()
+    NoRoomNow -> throwIO (overLimit
+      ("a result attachment of " <> show size
+        <> " bytes is over this grant's max_result_bytes of " <> show limit
+        <> ", with " <> show held <> " bytes held"))
+    NoRoomEver -> throwIO (neverFits
+      ("a result attachment of " <> show size
+        <> " bytes could never fit under this grant's max_result_bytes of " <> show limit
+        <> ", with " <> show own <> " bytes staged under its lease"))
 
 -- | The bytes of result attachments the spool holds from a worker: those
 -- staged and being sent under its leases in flight, and those its acks

@@ -2373,7 +2373,7 @@ revoke_lease=$(jq -r '.lease_id' "$work/revoke-lease.jsonl")
 HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$grant_id" \
   | jq -e --arg grant "$grant_id" '.grant_id == $grant and .status == "revoked"' >/dev/null; check
 test ! -e "$grant_home/.spool/grants/$grant_id.json"; check
-! grep -F "spool-grant:$grant_id" "$grant_home/.ssh/authorized_keys" >/dev/null; check
+if grep -F "spool-grant:$grant_id" "$grant_home/.ssh/authorized_keys" >/dev/null; then false; fi; check
 test "$(head -n 1 "$grant_home/.ssh/authorized_keys")" = '# unrelated key material'; check
 spoolg status --json | jq -e '.pending >= 1' >/dev/null; check
 # The revoked lease is an attempt, recorded as a reclaim is.
@@ -2653,10 +2653,11 @@ SCRIPT
 chmod +x "$bin/leave"
 
 ra_config() {
-  # ra_config CAPABILITY EXEC [MAX_RESULT_ATTACHMENT_BYTES]
+  # ra_config CAPABILITY EXEC [MAX_RESULT_ATTACHMENT_BYTES [RENEW_SECONDS TIMEOUT_SECONDS]]
   jq -nc --arg cap "$1" --arg exec "$2" --arg limit "${3:-}" --arg path "$worker_path" \
-    '{max_concurrent: 1, renew_seconds: 30, env: {PATH: $path},
-      capabilities: {($cap): ({exec: $exec, args: [], timeout_seconds: 20,
+    --argjson renew "${4:-30}" --argjson timeout "${5:-20}" \
+    '{max_concurrent: 1, renew_seconds: $renew, env: {PATH: $path},
+      capabilities: {($cap): ({exec: $exec, args: [], timeout_seconds: $timeout,
         max_payload_bytes: 4096, max_output_bytes: 4096}
         + (if $limit == "" then {} else {max_result_attachment_bytes: ($limit | tonumber)} end))}}'
 }
@@ -2981,7 +2982,9 @@ collect_ids_remote rr-one | jq -e '.status == "collected"' >/dev/null; check
 test "$(find "$work/ra-remote/result-attachments" -type f | wc -l | tr -d ' ')" = 0; check
 
 # The limit counts what is staged and what is done and not collected, and
-# collect frees it. The grant ra-small may hold 10 bytes.
+# collect frees it. The grant ra-small may hold 10 bytes. A file that what
+# its own lease staged leaves no room for could never fit, and is 7; one that
+# others hold the room for is 6, for now (ADR 0021).
 printf '123456' > "$work/ra-six"
 printf '12345' > "$work/ra-five"
 printf '1234' > "$work/ra-four"
@@ -2990,7 +2993,8 @@ ra_remote_put rs-one leave@1 '{}'
 rs_lease=$("$bin/fake-ssh-ra" "$ra_small" lease | jq -r '.lease_id')
 remote_send() { { send_line "$2" "$3" "$4"; cat "$4"; } | "$bin/fake-ssh-ra" "$1" send; }
 remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-six" | jq -e '.status == "staged"' >/dev/null; check
-expect_exit 6 remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-five"
+expect_exit 7 remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-five"
+grep -q "max_result_bytes" "$work/exit.stderr"; check
 test "$(staged_in ra-remote)" = 1; check
 remote_send "$ra_small" rs-one "$rs_lease" "$work/ra-four" | jq -e '.status == "staged"' >/dev/null; check
 rs_both=$(jq -nc --arg s "$(sha256_of "$work/ra-six")" --arg f "$(sha256_of "$work/ra-four")" \
@@ -2999,6 +3003,7 @@ ra_ack_line rs-one "$rs_lease" "$rs_both" | "$bin/fake-ssh-ra" "$ra_small" ack |
 ra_remote_put rs-two leave@1 '{}'
 rs_two_lease=$("$bin/fake-ssh-ra" "$ra_small" lease | jq -r '.lease_id')
 expect_exit 6 remote_send "$ra_small" rs-two "$rs_two_lease" "$work/ra-one"
+grep -q "max_result_bytes" "$work/exit.stderr"; check
 collect_ids_remote rs-one | jq -e '.status == "collected"' >/dev/null; check
 remote_send "$ra_small" rs-two "$rs_two_lease" "$work/ra-one" | jq -e '.status == "staged"' >/dev/null; check
 # Another worker's lease is stale to it.
@@ -3009,39 +3014,162 @@ test ! -e "$work/ra-remote/result-attachments/leases/$rs_two_lease"; check
 test "$(staged_in ra-remote)" = 0; check
 rs_two_lease=$(in_spool ra-remote lease --worker ra-local | jq -r '.lease_id')
 ack_one ra-remote rs-two "$rs_two_lease" >/dev/null
-# A grant with no limit, as every grant was before, may send nothing.
+# A grant with no limit, as every grant was before, may send nothing, ever.
 ra_remote_put rs-three leave@1 '{}'
 rs_three_lease=$("$bin/fake-ssh-ra" "$ra_putter" lease | jq -r '.lease_id')
-expect_exit 6 remote_send "$ra_putter" rs-three "$rs_three_lease" "$work/ra-one"
+expect_exit 7 remote_send "$ra_putter" rs-three "$rs_three_lease" "$work/ra-one"
 test "$(staged_in ra-remote)" = 0; check
 jq -nc --arg lease "$rs_three_lease" '{task_id:"rs-three",lease_id:$lease,result:{}}' \
   | "$bin/fake-ssh-ra" "$ra_putter" ack | jq -e '.status == "acked"' >/dev/null; check
 
-# A worker whose grant has no room fails the task with retry, says why, and
-# goes on: here, to lease the same task again, and be refused again.
+# A worker whose grant could never hold a file fails the task for good, at
+# once, without waiting, and says why (ADR 0021): here a file larger than
+# the grant's limit, and a grant that holds 0, as every 0.0.3 grant does.
 ra_tiny=$(ra_grant ra-tiny AD --max-result-bytes 2)
-ra_remote_put rt-big leave@1 "$(jq -nc --arg make "printf abc > outputs/$abc_digest" '{make:$make}')"
-"$spool_binary" work --via "$bin/fake-ssh-ra $ra_tiny" --config "$work/ra-leave-three.json" --max-tasks 2
-check
-in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "rt-big")) | length == 2
-  and all(.[]; .retried == true and (.reason | contains("max_result_bytes")))' >/dev/null; check
-in_spool ra-remote results | jq -s -e 'map(select(.task_id == "rt-big")) | length == 0' >/dev/null; check
-test "$(staged_in ra-remote)" = 0; check
-rt_big_lease=$(in_spool ra-remote lease --worker ra-local | jq -r '.lease_id')
-fail_one ra-remote rt-big "$rt_big_lease" --no-retry >/dev/null
+ra_never() {
+  # ra_never TASK GRANT CONFIG MAKE
+  ra_remote_put "$1" leave@1 "$(jq -nc --arg make "$4" '{make:$make}')"
+  local started=${EPOCHREALTIME/./}
+  "$spool_binary" work --via "$bin/fake-ssh-ra $2" --config "$3" --max-tasks 2 2> "$work/ra-never.stderr"
+  check
+  test $(( ${EPOCHREALTIME/./} - started )) -lt 5000000; check
+  test "$(grep -c "waits for room" "$work/ra-never.stderr")" = 0; check
+  in_spool ra-remote failures | jq -s -e --arg task "$1" 'map(select(.task_id == $task)) | length == 1
+    and .[0].retried == false and (.[0].reason | contains("max_result_bytes"))' >/dev/null; check
+  in_spool ra-remote results | jq -s -e --arg task "$1" 'map(select(.task_id == $task)) | length == 0' >/dev/null; check
+  in_spool ra-remote status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+  test "$(staged_in ra-remote)" = 0; check
+}
+ra_never rt-big "$ra_tiny" "$work/ra-leave-three.json" "printf abc > outputs/$abc_digest"
+ra_never rt-zero "$ra_putter" "$work/ra-leave-three.json" "printf abc > outputs/$abc_digest"
 # The same for a file far larger than a pipe holds: the spool refuses it from
 # its request line and reads none of it, and the worker, whose writes then
 # fail, still learns why from the spool's status.
 ra_config leave@1 "$bin/leave" 4000000 > "$work/ra-leave-large.json"
 ra_large_make='head -c 3000000 /dev/urandom > big; if command -v sha256sum >/dev/null 2>&1; then d=$(sha256sum big | cut -d" " -f1); else d=$(shasum -a 256 big | cut -d" " -f1); fi; mv big "outputs/$d"'
-ra_remote_put rt-large leave@1 "$(jq -nc --arg make "$ra_large_make" '{make:$make}')"
-"$spool_binary" work --via "$bin/fake-ssh-ra $ra_tiny" --config "$work/ra-leave-large.json" --max-tasks 1
-check
-in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "rt-large")) | length == 1
-  and .[0].retried == true and (.[0].reason | contains("max_result_bytes"))' >/dev/null; check
+ra_never rt-large "$ra_tiny" "$work/ra-leave-large.json" "$ra_large_make"
+
+# A send refused for want of room now waits for it, keeping its lease and
+# its outputs, and sends the same file again (ADR 0021). The grant ra-wait
+# may hold 4 bytes; a done task not yet collected holds 3 of them.
+ra_wait=$(ra_grant ra-wait AE --max-result-bytes 4)
+for bytes in c d fg hi jkl mno pqrst; do printf '%s' "$bytes" > "$work/rw-$bytes"; done
+rw_make() {
+  # rw_make FILE...: a make that counts its runs and leaves these files.
+  local make="echo ran >> '$work/rw-count-$1'" file
+  for file in "$@"; do make="$make; cp '$work/rw-$file' outputs/$(sha256_of "$work/rw-$file")"; done
+  jq -nc --arg make "$make" '{make:$make}'
+}
+rw_failures() { in_spool ra-remote failures | jq -s -c --arg task "$1" 'map(select(.task_id == $task))'; }
+rw_results() { in_spool ra-remote results | jq -s -c --arg task "$1" 'map(select(.task_id == $task))'; }
+rw_leased() { grep -l "\"task_id\":\"$1\"" "$work"/ra-remote/leased/*.json >/dev/null 2>&1; }
+rw_waiting() { grep -q "waits for room" "$1"; }
+patiently() {
+  local i=0
+  until "$@"; do
+    i=$((i + 1))
+    test "$i" -lt 200 || return 1
+    sleep 0.1
+  done
+}
+# Take a task out of the way: lease it on the host and fail it for good.
+rw_drop() {
+  local lease
+  lease=$(in_spool ra-remote lease --worker ra-local | jq -r --arg task "$1" 'select(.task_id == $task) | .lease_id')
+  test -n "$lease"
+  fail_one ra-remote "$1" "$lease" --no-retry >/dev/null
+}
+ra_config leave@1 "$bin/leave" 10 1 20 > "$work/ra-leave-wait.json"
+ra_config leave@1 "$bin/leave" 10 1 3 > "$work/ra-leave-wait-short.json"
+ra_remote_put rw-first leave@1 "$(jq -nc --arg make "printf abc > outputs/$abc_digest" '{make:$make}')"
+"$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait.json" --max-tasks 1
+test "$(rw_results rw-first | jq 'length')" = 1; check
+
+# It waits, renewing its lease, until the earlier result is collected, and
+# then sends and acknowledges without running the program again.
+ra_remote_put rw-second leave@1 "$(rw_make c d)"
+timeout 60 "$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait.json" \
+  --max-tasks 1 2> "$work/rw-second.stderr" &
+rw_second_pid=$!
+patiently rw_waiting "$work/rw-second.stderr"; check
+test "$(staged_in ra-remote)" = 1; check
+sleep 4
+rw_leased rw-second; check
+test "$(rw_failures rw-second)" = "[]"; check
+# Leased more than 3 s ago, it has been renewed since, so reclaim leaves it.
+test -z "$(in_spool ra-remote reclaim --older-than 3)"; check
+rw_leased rw-second; check
+collect_ids_remote rw-first | jq -e '.status == "collected"' >/dev/null; check
+wait "$rw_second_pid"; check
+rw_results rw-second | jq -e 'length == 1 and (.[0].attachments | length) == 2' >/dev/null; check
+test "$(wc -l < "$work/rw-count-c" | tr -d ' ')" = 1; check
+test "$(rw_failures rw-second)" = "[]"; check
+test "$(grep -c "waits for room" "$work/rw-second.stderr")" = 1; check
+test "$(grep -c "room for result attachment" "$work/rw-second.stderr")" = 1; check
 test "$(staged_in ra-remote)" = 0; check
-rt_large_lease=$(in_spool ra-remote lease --worker ra-local | jq -r '.lease_id')
-fail_one ra-remote rt-large "$rt_large_lease" --no-retry >/dev/null
+
+# Nobody collects: past the capability's timeout_seconds, 3 here, it fails
+# the lease with retry and says how long it waited, and what it staged goes
+# with the lease. rw-second's result holds 2 bytes.
+ra_remote_put rw-third leave@1 "$(rw_make fg hi)"
+rw_started=${EPOCHREALTIME/./}
+timeout 60 "$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait-short.json" \
+  --max-tasks 1 2> "$work/rw-third.stderr"
+check
+rw_took=$(( ${EPOCHREALTIME/./} - rw_started ))
+test "$rw_took" -ge 3000000; check
+test "$rw_took" -lt 15000000; check
+rw_failures rw-third | jq -e 'length == 1 and .[0].retried == true
+  and (.[0].reason | contains("waited 3 s for room under max_result_bytes"))' >/dev/null; check
+test "$(wc -l < "$work/rw-count-fg" | tr -d ' ')" = 1; check
+test "$(staged_in ra-remote)" = 0; check
+rw_drop rw-third
+
+# A lease reclaimed while it waits ends the wait: the worker neither sends
+# nor acknowledges, and the reclaim's record is the task's only failure.
+ra_remote_put rw-fourth leave@1 "$(rw_make jkl)"
+timeout 60 "$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait.json" \
+  --max-tasks 1 2> "$work/rw-fourth.stderr" &
+rw_fourth_pid=$!
+patiently rw_waiting "$work/rw-fourth.stderr"; check
+in_spool ra-remote reclaim --older-than 0 | jq -e '.task_id == "rw-fourth"' >/dev/null; check
+rw_started=${EPOCHREALTIME/./}
+set +e
+wait "$rw_fourth_pid"
+rw_fourth_exit=$?
+set -e
+test "$rw_fourth_exit" -eq 4; check
+test $(( ${EPOCHREALTIME/./} - rw_started )) -lt 10000000; check
+test "$(rw_results rw-fourth)" = "[]"; check
+rw_failures rw-fourth | jq -e 'length == 1 and (.[0].reason | startswith("reclaimed"))' >/dev/null; check
+test "$(staged_in ra-remote)" = 0; check
+rw_drop rw-fourth
+
+# SIGTERM ends the wait: the worker exits 143, its working directory is
+# gone, and the lease stands, for reclaim to return.
+ra_remote_put rw-fifth leave@1 "$(rw_make mno)"
+mkdir "$work/rw-tmp"
+TMPDIR="$work/rw-tmp" "$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" \
+  --config "$work/ra-leave-wait.json" --max-tasks 1 2> "$work/rw-fifth.stderr" &
+rw_fifth_pid=$!
+patiently rw_waiting "$work/rw-fifth.stderr"; check
+test -n "$(ls -A "$work/rw-tmp")"; check
+rw_started=${EPOCHREALTIME/./}
+kill -TERM "$rw_fifth_pid"
+set +e
+wait "$rw_fifth_pid"
+rw_fifth_exit=$?
+set -e
+test "$rw_fifth_exit" -eq 143; check
+test $(( ${EPOCHREALTIME/./} - rw_started )) -lt 2000000; check
+test -z "$(ls -A "$work/rw-tmp")"; check
+rw_leased rw-fifth; check
+test "$(rw_failures rw-fifth)" = "[]"; check
+in_spool ra-remote reclaim --older-than 0 | jq -e '.task_id == "rw-fifth"' >/dev/null; check
+rw_drop rw-fifth
+
+# A file larger than the grant's whole limit is not waited for.
+ra_never rw-sixth "$ra_wait" "$work/ra-leave-wait.json" "$(rw_make pqrst | jq -r '.make')"
 
 # A spool that does not know send refuses it: the worker ends with that
 # status and does not acknowledge the task, whose lease stands.
@@ -3075,7 +3203,7 @@ SCRIPT
 chmod +x "$bin/fake-ssh-03"
 diff <("$bin/fake-ssh-03" "$old_putter" results </dev/null) "$work/old03-results"; check
 old_lease=$(basename "$(find "$work/old03/spool/leased" -name '*.json')" .json)
-expect_exit 6 sh -c "{ printf '%s\n' '$(send_line old-leased "$old_lease" "$work/ra-abc")'; printf abc; } | '$bin/fake-ssh-03' '$old_worker' send"
+expect_exit 7 sh -c "{ printf '%s\n' '$(send_line old-leased "$old_lease" "$work/ra-abc")'; printf abc; } | '$bin/fake-ssh-03' '$old_worker' send"
 jq -nc --arg lease "$old_lease" '{task_id:"old-leased",lease_id:$lease,result:{new:true}}' \
   | "$bin/fake-ssh-03" "$old_worker" ack | jq -e '.status == "acked"' >/dev/null; check
 expect_exit 2 sh -c "printf '%s\n' '$(take_line old-done "$abc_digest")' | '$bin/fake-ssh-03' '$old_putter' take"

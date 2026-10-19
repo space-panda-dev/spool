@@ -63,6 +63,7 @@ table =
   , (Stale, 4)
   , (GrantRefused, 5)
   , (OverLimit, 6)
+  , (NeverFits, 7)
   , (Corrupt, 70)
   , (Retryable, 75)
   ]

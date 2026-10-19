@@ -7,7 +7,7 @@ module Test.Store (tests) where
 
 import Data.Int (Int64)
 import qualified Data.Text as T
-import Spool.Store (attemptsBefore, fitsLimit, retryCap)
+import Spool.Store (Room (..), attemptsBefore, fitsLimit, retryCap, roomFor)
 import Spool.Types
   ( Retry (..)
   , leaseSerialAndTask
@@ -41,7 +41,21 @@ limitTests = testGroup "a grant's limit on result attachments"
       (fitsLimit 10 10 0, fitsLimit 10 11 0) @?= (True, False)
   , testCase "the largest sizes do not wrap" $
       fitsLimit maxBound (toInteger (maxBound :: Int64)) maxBound @?= False
+  , testGroup "the room for a file (ADR 0021)"
+      [ testCase "none, ever, under a limit of 0, as every 0.0.3 grant holds" $
+          roomFor 0 0 0 0 @?= NoRoomEver
+      , testCase "none, ever, for a file larger than the limit" $
+          roomFor 10 0 0 11 @?= NoRoomEver
+      , testCase "none, ever, beside what its own lease staged" $
+          (roomFor 10 4 4 6, roomFor 10 5 5 6) @?= (HasRoom, NoRoomEver)
+      , testCase "none now, while others hold it" $
+          roomFor 10 2 8 6 @?= NoRoomNow
+      , testCase "the largest sizes do not wrap" $
+          roomFor maxBound big big maxBound @?= NoRoomEver
+      ]
   ]
+  where
+    big = toInteger (maxBound :: Int64)
 
 retryCapTests :: TestTree
 retryCapTests = testGroup "retry cap"
