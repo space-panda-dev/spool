@@ -2849,22 +2849,25 @@ test "$(staged_in ra)" = 0; check
 # leaves its file, which its lease takes with it when it ends.
 ra_put ra ra-slow leave@1 '{}'
 ra_slow_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
-mkfifo "$work/ra-slow-pipe"
-"$spool_binary" --dir "$work/ra" send < "$work/ra-slow-pipe" > "$work/ra-slow.out" &
+# An anonymous pipe, not a named one: macOS never wakes a reader waiting on
+# a FIFO when its last writer closes it, and the send must see its end.
+"$spool_binary" --dir "$work/ra" send > "$work/ra-slow.out" < <(
+  jq -nc --arg lease "$ra_slow_lease" --arg sha "$abc_digest" '{task_id:"ra-slow",lease_id:$lease,sha256:$sha,size:3}'
+  printf 'a'
+  until test -e "$work/ra-slow-go"; do sleep 0.1; done
+  printf 'bc'
+) &
 ra_slow_pid=$!
-exec 8>"$work/ra-slow-pipe"
-jq -nc --arg lease "$ra_slow_lease" --arg sha "$abc_digest" '{task_id:"ra-slow",lease_id:$lease,sha256:$sha,size:3}' >&8
-printf 'a' >&8
 ra_sending() { ls -A "$work/ra/result-attachments/leases/$ra_slow_lease" 2>/dev/null | grep -q '^\.send-3-'; }
 eventually ra_sending; check
 timeout 5 "$spool_binary" --dir "$work/ra" status --json | jq -e '.leased == 1' >/dev/null; check
 jq -nc --arg lease "$ra_slow_lease" '{task_id:"ra-slow",lease_id:$lease}' \
   | timeout 5 "$spool_binary" --dir "$work/ra" renew | jq -e '.status == "renewed"' >/dev/null; check
-printf 'bc' >&8
-exec 8>&-
+touch "$work/ra-slow-go"
 wait "$ra_slow_pid"; check
 jq -e '.status == "staged"' "$work/ra-slow.out" >/dev/null; check
 cmp "$work/ra/result-attachments/leases/$ra_slow_lease/$abc_digest" "$work/ra-abc"; check
+mkfifo "$work/ra-slow-pipe"
 "$spool_binary" --dir "$work/ra" send < "$work/ra-slow-pipe" > /dev/null 2>&1 &
 ra_killed_pid=$!
 exec 8>"$work/ra-slow-pipe"
