@@ -33,6 +33,10 @@ tests = testGroup "failures"
   , testCase "no two kinds share an exit status" $ do
       let statuses = map snd table <> [exitStatus NothingPending]
       statuses @?= nub statuses
+  , testCase "a lease whose task was withdrawn exits as a stale one does (ADR 0022)" $ do
+      exitStatus (Withdrawn "task t was withdrawn") @?= 4
+      render (Withdrawn "task t was withdrawn") @?= Just "spool: task t was withdrawn"
+      withContext "work: " (Withdrawn "x") @?= Withdrawn "work: x"
   , testCase "a command line that names no command is malformed input" $
       exitStatus (Usage "usage: spool ...") @?= 2
   , testCase "a lease that finds nothing pending exits 1 and says nothing" $ do

@@ -35,6 +35,8 @@ import Spool.Wire
   , SendRequest (..)
   , TakeRequest (..)
   , Task (..)
+  , TaskLine (..)
+  , WithdrawalRecord (..)
   , canonical
   , encode
   , encodeCollectResult
@@ -42,6 +44,9 @@ import Spool.Wire
   , encodeFailResult
   , encodeSendResult
   , encodeStaleResult
+  , encodeWithdrawResult
+  , encodeWithdrawnResult
+  , newTask
   , parseAck
   , parseCollectRequest
   , parseFail
@@ -51,7 +56,10 @@ import Spool.Wire
   , parseResultRecord
   , parseSendRequest
   , parseTakeRequest
+  , parseStoredTask
   , parseTask
+  , parseWithdrawalRecord
+  , sameTask
   )
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, testCase, (@?=))
@@ -126,6 +134,7 @@ sha = made mkSha256 . T.replicate 64 . T.singleton
 
 task :: Gen Task
 task = Task <$> taskIdentifier <*> capability <*> value <*> attachments
+  <*> elements [0, 7, -3, minBound, maxBound] <*> pure Nothing
   where
     attachments = elements
       [ []
@@ -143,7 +152,7 @@ taskTests :: [TestTree]
 taskTests =
   [ testCase "the protocol's example is a task" $
       parseTask "{\"task_id\":\"task-one\",\"capability\":\"classify@1\",\"payload\":{\"anything\":\"opaque\"},\"attachments\":[]}"
-        @?= Right (Task (made mkTaskId "task-one") (made mkCapability "classify@1")
+        @?= Right (newTask (made mkTaskId "task-one") (made mkCapability "classify@1")
               (A.object ["anything" A..= ("opaque" :: T.Text)]) [])
   , testCase "a task written before attachments existed still reads" $
       fmap taskAttachments
@@ -156,7 +165,51 @@ taskTests =
   , refused "a missing payload" "{\"task_id\":\"t\",\"capability\":\"c@1\"}"
   , refused "a missing capability" "{\"task_id\":\"t\",\"payload\":1}"
   , refused "an unknown field"
-      "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"priority\":9}"
+      "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"rank\":9}"
+  , testCase "a task may give a priority (ADR 0024)" $
+      fmap taskPriority
+        (parseTask "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"priority\":-9}")
+        @?= Right (-9)
+  , testCase "a task that gives none has priority 0" $
+      fmap taskPriority (parseTask "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1}")
+        @?= Right 0
+  , refused "a fractional priority"
+      "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"priority\":1.5}"
+  , refused "a priority past the largest"
+      "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"priority\":9223372036854775808}"
+  , refused "a priority given as a string"
+      "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"priority\":\"high\"}"
+  , refused "a place in the queue, which is the spool's to give,"
+      "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"put_serial\":1}"
+  , testCase "a stored task keeps its place in the queue" $
+      fmap taskPutSerial
+        (parseStoredTask "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"put_serial\":42}")
+        @?= Right (Just 42)
+  , testCase "a task stored before 0.0.5 has no place in the queue" $
+      fmap taskPutSerial
+        (parseStoredTask "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"attachments\":[]}")
+        @?= Right Nothing
+  , testCase "a negative place is corrupt" $
+      assertBool "refused" (isLeft (parseStoredTask
+        "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"put_serial\":-1}"))
+  , testProperty "a stored task reads back as the task it was written from" $
+      forAll task $ \original -> forAll (elements [Nothing, Just 0, Just 12345678901234567890]) $
+        \serial -> let stored = original { taskPutSerial = serial }
+                   in parseStoredTask (encode stored) === Right stored
+  , testCase "a task with neither a priority nor a place is written as 0.0.4 wrote it" $
+      encode (newTask (made mkTaskId "t") (made mkCapability "c@1") A.Null [])
+        @?= "{\"attachments\":[],\"capability\":\"c@1\",\"payload\":null,\"task_id\":\"t\"}"
+  , testProperty "neither priority nor place makes a task another task" $
+      forAll task $ \original ->
+        sameTask original original { taskPriority = taskPriority original + 1, taskPutSerial = Just 3 }
+          === True
+  , testProperty "a lease carries neither a priority nor a place, so a 0.0.4 worker reads it" $
+      forAll task $ \original ->
+        let lease = Lease original { taskPutSerial = Just 9 } leaseOne
+              (made mkWorkerName "worker-one") (storedTimestamp "2026-09-29T12:00:00Z")
+        in fmap KM.keys (A.decode (encode lease) >>= asObject)
+             === Just (map K.fromText
+               ["attachments", "capability", "lease_id", "leased_at", "payload", "task_id", "worker"])
   , refused "an empty task_id" "{\"task_id\":\"\",\"capability\":\"c@1\",\"payload\":1}"
   , refused "a numeric task_id" "{\"task_id\":7,\"capability\":\"c@1\",\"payload\":1}"
   , refused "an array" "[]"
@@ -188,6 +241,8 @@ taskTests =
     refused label bytes = testCase (label <> " is refused") $
       assertBool "refused" (isLeft (parseTask bytes))
     hex = BLC.pack . replicate 64
+    asObject (A.Object object) = Just object
+    asObject _ = Nothing
 
 requestTests :: [TestTree]
 requestTests =
@@ -272,7 +327,46 @@ requestTests =
   , testCase "a fetch request names one digest" $
       parseFetchRequest
         ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\"}")
-        @?= Right (FetchRequest reference (sha 'a'))
+        @?= Right (FetchRequest reference (sha 'a') 0)
+  , testCase "a fetch request may ask from an offset (ADR 0026)" $
+      parseFetchRequest
+        ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\",\"offset\":5}")
+        @?= Right (FetchRequest reference (sha 'a') 5)
+  , testCase "a fetch request with a negative offset is refused" $
+      assertBool "refused" $ isLeft $ parseFetchRequest
+        ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\",\"offset\":-1}")
+  , testCase "a fetch from the start is written as 0.0.4 wrote it" $
+      encode (FetchRequest reference (sha 'a') 0)
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\",\"task_id\":\"t\"}"
+  , testCase "a fetch from an offset says where" $
+      parseFetchRequest (encode (FetchRequest reference (sha 'a') 7))
+        @?= Right (FetchRequest reference (sha 'a') 7)
+  , testCase "withdraw answers name the task (ADR 0022)" $
+      map (encodeWithdrawResult taskOne) [minBound .. maxBound]
+        @?= [ "{\"status\":\"withdrawn\",\"task_id\":\"t\"}"
+            , "{\"status\":\"finished\",\"task_id\":\"t\"}"
+            , "{\"status\":\"unknown\",\"task_id\":\"t\"}" ]
+  , testCase "a lease whose task was withdrawn is answered so" $
+      encodeWithdrawnResult reference
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"withdrawn\",\"task_id\":\"t\"}"
+  , testCase "a pending task is listed with its priority (ADR 0023)" $
+      encode (PendingLine taskOne 3)
+        @?= "{\"priority\":3,\"state\":\"pending\",\"task_id\":\"t\"}"
+  , testCase "a leased task is listed with its lease, worker, and times" $
+      encode (LeasedLine taskOne 0 leaseOne (Just (made mkWorkerName "w"))
+          (storedTimestamp "2026-10-21T00:00:00Z") (storedTimestamp "2026-10-21T00:01:00Z"))
+        @?= "{\"lease_id\":\"lease_1_1_t\",\"leased_at\":\"2026-10-21T00:00:00Z\",\"priority\":0,\"renewed_at\":\"2026-10-21T00:01:00Z\",\"state\":\"leased\",\"task_id\":\"t\",\"worker\":\"w\"}"
+  , testCase "a lease never handed to a worker is listed with none" $
+      fmap (KM.lookup "worker") (A.decode (encode (LeasedLine taskOne 0 leaseOne Nothing
+          (storedTimestamp "2026-10-21T00:00:00Z") (storedTimestamp "2026-10-21T00:00:00Z")))
+        >>= \found -> case found of A.Object object -> Just object; _ -> Nothing)
+        @?= Just (Just A.Null)
+  , testCase "a withdrawal record reads back" $ do
+      let record = WithdrawalRecord taskOne leaseOne (storedTimestamp "2026-10-21T00:00:00Z")
+      parseWithdrawalRecord (encode record) @?= Right record
+  , testCase "a withdrawal record with another field is corrupt" $
+      assertBool "refused" $ isLeft $ parseWithdrawalRecord
+        "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"withdrawn_at\":\"2026-10-21T00:00:00Z\",\"by\":\"x\"}"
   , testCase "a fetch request with a path for a digest is refused" $
       assertBool "refused" $ isLeft $ parseFetchRequest
         "{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"../../etc/passwd\"}"

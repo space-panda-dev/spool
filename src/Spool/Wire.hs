@@ -9,8 +9,11 @@
 module Spool.Wire
   ( -- * A task and its lease
     Task (..)
+  , newTask
+  , sameTask
   , Lease (..)
   , parseTask
+  , parseStoredTask
   , parseLease
     -- * What a worker sends
   , LeaseRef (..)
@@ -31,19 +34,25 @@ module Spool.Wire
     -- * What the spool keeps
   , ResultRecord (..)
   , FailureRecord (..)
+  , WithdrawalRecord (..)
   , parseResultRecord
   , parseFailureRecord
+  , parseWithdrawalRecord
     -- * What the spool answers
   , PutStatus (..)
   , AckStatus (..)
   , CollectStatus (..)
+  , WithdrawStatus (..)
   , Counts (..)
+  , TaskLine (..)
   , encodePutResult
   , encodeAckResult
   , encodeRenewResult
   , encodeFailResult
   , encodeSendResult
   , encodeStaleResult
+  , encodeWithdrawnResult
+  , encodeWithdrawResult
   , encodeReclaimResult
   , encodeCollectResult
   , encodeExpiredResult
@@ -62,6 +71,7 @@ import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Aeson.Types as AT
 import qualified Data.ByteString.Lazy as BL
+import Data.Int (Int64)
 import qualified Data.Text as T
 import qualified Spool.Attachments as SA
 import Spool.Canonical (canonical, encode)
@@ -87,15 +97,39 @@ data Task = Task
   , taskCapability :: Capability
   , taskPayload :: A.Value
   , taskAttachments :: [SA.Attachment]
+  , taskPriority :: Int64
+    -- ^ Leased before every task of a lower priority (ADR 0024). 0 when the
+    -- caller gave none, and then not written.
+  , taskPutSerial :: Maybe Integer
+    -- ^ The spool's count of puts when this task was put: tasks of one
+    -- priority are leased in this order (ADR 0024). The spool writes it in
+    -- its own files and nowhere else; a task put before 0.0.5 has none, and
+    -- comes before every task that has one.
   } deriving (Eq, Show)
 
+-- | A task as a caller puts it, before the spool has given it a place.
+newTask :: TaskId -> Capability -> A.Value -> [SA.Attachment] -> Task
+newTask ident capability payload attachments =
+  Task ident capability payload attachments 0 Nothing
+
+-- | Whether two tasks are the same task: the same envelope. Neither the
+-- priority it was put with nor its place in the queue is part of it, so a
+-- task put again with another priority is the task already there (ADR 0024).
+sameTask :: Task -> Task -> Bool
+sameTask held wanted =
+  taskId held == taskId wanted
+    && taskCapability held == taskCapability wanted
+    && taskPayload held == taskPayload wanted
+    && taskAttachments held == taskAttachments wanted
+
 instance ToJSON Task where
-  toJSON task = A.object
+  toJSON task = A.object $
     [ "task_id" .= taskId task
     , "capability" .= taskCapability task
     , "payload" .= taskPayload task
     , "attachments" .= taskAttachments task
-    ]
+    ] <> [ "priority" .= taskPriority task | taskPriority task /= 0 ]
+      <> maybe [] (\serial -> ["put_serial" .= serial]) (taskPutSerial task)
 
 data Lease = Lease
   { leaseTask :: Task
@@ -163,11 +197,16 @@ instance ToJSON FailRequest where
 data FetchRequest = FetchRequest
   { fetchRef :: LeaseRef
   , fetchDigest :: SA.Sha256
+  , fetchOffset :: Int64
+    -- ^ How many of its bytes the worker already holds: the spool writes
+    -- those after them (ADR 0026). 0 is the whole file, and is not written,
+    -- so a fetch from the start is what 0.0.4 sent.
   } deriving (Eq, Show)
 
 instance ToJSON FetchRequest where
   toJSON request =
-    A.object (referenceFields (fetchRef request) <> ["sha256" .= fetchDigest request])
+    A.object (referenceFields (fetchRef request) <> ["sha256" .= fetchDigest request]
+      <> [ "offset" .= fetchOffset request | fetchOffset request /= 0 ])
 
 -- | One result attachment a worker sends under its lease: the bytes follow
 -- this request on the same stream.
@@ -237,6 +276,21 @@ instance ToJSON FailureRecord where
     , "retried" .= retryFlag (failureRetried record)
     ]
 
+-- | The record that a lease's task was withdrawn while it was held, kept so
+-- that its worker is answered @withdrawn@ and not @stale@ (ADR 0022).
+data WithdrawalRecord = WithdrawalRecord
+  { withdrawalTask :: TaskId
+  , withdrawalLease :: LeaseId
+  , withdrawalAt :: Timestamp
+  } deriving (Eq, Show)
+
+instance ToJSON WithdrawalRecord where
+  toJSON record = A.object
+    [ "task_id" .= withdrawalTask record
+    , "lease_id" .= withdrawalLease record
+    , "withdrawn_at" .= withdrawalAt record
+    ]
+
 data PutStatus = PutInserted | PutExisting deriving (Eq, Show)
 
 data AckStatus = Acked | AlreadyDone deriving (Eq, Show)
@@ -247,6 +301,31 @@ data CollectStatus
   | NotFinished  -- ^ it is pending or leased, and nothing was deleted
   | Unknown      -- ^ the spool holds nothing under it
   deriving (Bounded, Enum, Eq, Show)
+
+-- | What @withdraw@ found under a task's identifier (ADR 0022).
+data WithdrawStatus
+  = WithdrawnNow  -- ^ it was pending or leased, and is gone with its records
+  | Finished      -- ^ it is done or failed for good, and nothing was deleted
+  | NotHeld       -- ^ the spool holds nothing under it
+  deriving (Bounded, Enum, Eq, Show)
+
+-- | One task that is pending or leased, as @status --json --tasks@ lists it
+-- (ADR 0023).
+data TaskLine
+  = PendingLine TaskId Int64
+  | LeasedLine TaskId Int64 LeaseId (Maybe WorkerName) Timestamp Timestamp
+    -- ^ Its lease, the worker it was handed to, when it was leased, and
+    -- when it was last renewed, which is when it was leased if never.
+  deriving (Eq, Show)
+
+instance ToJSON TaskLine where
+  toJSON line = case line of
+    PendingLine ident priority -> A.object
+      ["task_id" .= ident, "state" .= ("pending" :: T.Text), "priority" .= priority]
+    LeasedLine ident priority lease worker leasedAt renewedAt -> A.object
+      [ "task_id" .= ident, "state" .= ("leased" :: T.Text), "priority" .= priority
+      , "lease_id" .= lease, "worker" .= worker, "leased_at" .= leasedAt
+      , "renewed_at" .= renewedAt ]
 
 -- | What @status@ counts: task files in three places, and failure records.
 data Counts = Counts
@@ -275,18 +354,47 @@ strictObject name fields body bytes = do
     A.Object object -> rejectUnknown fields object >> body object
     _ -> Left (name <> " must be a JSON object")
 
+-- | A task as a caller puts it: it may give a priority, and never a place
+-- in the queue, which is the spool's to give.
 parseTask :: BL.ByteString -> Either String Task
 parseTask = strictObject "task"
-  ["task_id", "capability", "payload", "attachments"] $ \object -> do
-    ident <- mkTaskId =<< requiredText "task_id" object
-    capability <- mkCapability =<< requiredText "capability" object
-    payload <- required "task is missing payload" "payload" object
-    attachments <- case KM.lookup "attachments" object of
-      Nothing -> Right []
-      Just value -> case A.fromJSON value of
-        A.Error message -> Left message
-        A.Success declarations -> SA.validateAttachments declarations
-    pure (Task ident capability payload attachments)
+  ["task_id", "capability", "payload", "attachments", "priority"] taskFields
+
+-- | A task as the spool keeps it in its own files, with its place in the
+-- queue when it was put by 0.0.5 or later.
+parseStoredTask :: BL.ByteString -> Either String Task
+parseStoredTask = strictObject "task"
+  ["task_id", "capability", "payload", "attachments", "priority", "put_serial"] $
+  \object -> do
+    task <- taskFields object
+    serial <- case KM.lookup "put_serial" object of
+      Nothing -> Right Nothing
+      Just value@(A.Number _) -> case A.fromJSON value of
+        A.Success number | number >= (0 :: Integer) -> Right (Just number)
+        _ -> Left "put_serial must be a non-negative integer"
+      Just _ -> Left "put_serial must be a non-negative integer"
+    pure task { taskPutSerial = serial }
+
+taskFields :: Object -> Either String Task
+taskFields object = do
+  ident <- mkTaskId =<< requiredText "task_id" object
+  capability <- mkCapability =<< requiredText "capability" object
+  payload <- required "task is missing payload" "payload" object
+  attachments <- case KM.lookup "attachments" object of
+    Nothing -> Right []
+    Just value -> case A.fromJSON value of
+      A.Error message -> Left message
+      A.Success declarations -> SA.validateAttachments declarations
+  priority <- case KM.lookup "priority" object of
+    Nothing -> Right 0
+    Just value@(A.Number _) -> case A.fromJSON value of
+      A.Success number -> Right number
+      A.Error _ -> Left priorityRange
+    Just _ -> Left priorityRange
+  pure (newTask ident capability payload attachments) { taskPriority = priority }
+  where
+    priorityRange = "priority must be an integer from " <> show (minBound :: Int64)
+      <> " through " <> show (maxBound :: Int64)
 
 -- | The lease envelope, as a worker reads it back from a spool.
 parseLease :: BL.ByteString -> Either String Lease
@@ -304,7 +412,7 @@ parseLease = strictObject "lease"
       Just value -> case A.fromJSON value of
         A.Error message -> Left message
         A.Success declarations -> SA.validateAttachments declarations
-    pure (Lease (Task ident capability payload attachments) leaseIdent worker
+    pure (Lease (newTask ident capability payload attachments) leaseIdent worker
       (storedTimestamp leasedAt))
 
 -- | What a transition on a lease answered, as a worker reads it back.
@@ -355,13 +463,19 @@ parseFail = strictObject "fail" ["task_id", "lease_id", "reason"] $ \object -> d
 
 parseFetchRequest :: BL.ByteString -> Either String FetchRequest
 parseFetchRequest = strictObject "fetch request"
-  ["task_id", "lease_id", "sha256"] $ \object -> do
+  ["task_id", "lease_id", "sha256", "offset"] $ \object -> do
     identText <- requiredText "task_id" object
     leaseText <- requiredText "lease_id" object
     digestText <- requiredText "sha256" object
+    offset <- case KM.lookup "offset" object of
+      Nothing -> Right 0
+      Just value@(A.Number _) -> case A.fromJSON value of
+        A.Success number | number >= (0 :: Int64) -> Right number
+        _ -> Left "offset must be a non-negative integer"
+      Just _ -> Left "offset must be a non-negative integer"
     reference <- leaseRef identText leaseText
     digest <- SA.mkSha256 digestText
-    pure (FetchRequest reference digest)
+    pure (FetchRequest reference digest offset)
 
 parseSendRequest :: BL.ByteString -> Either String SendRequest
 parseSendRequest = strictObject "send request"
@@ -443,6 +557,15 @@ parseFailureRecord = strictObject "failure record"
       , failureRetried = retried
       }
 
+parseWithdrawalRecord :: BL.ByteString -> Either String WithdrawalRecord
+parseWithdrawalRecord = strictObject "withdrawal record"
+  ["task_id", "lease_id", "withdrawn_at"] $ \object -> do
+    identText <- requiredText "task_id" object
+    leaseText <- requiredText "lease_id" object
+    at <- requiredText "withdrawn_at" object
+    reference <- leaseRef identText leaseText
+    pure (WithdrawalRecord (refTask reference) (refLease reference) (storedTimestamp at))
+
 -- | What a result record and a failure record have in common.
 recordIdentity :: Object -> Either String (TaskId, LeaseId, Capability, WorkerName)
 recordIdentity object = do
@@ -501,6 +624,10 @@ encodeSendResult reference = answer reference "staged"
 encodeStaleResult :: LeaseRef -> BL.ByteString
 encodeStaleResult reference = answer reference "stale"
 
+-- | The answer to a line whose lease's task was withdrawn (ADR 0022).
+encodeWithdrawnResult :: LeaseRef -> BL.ByteString
+encodeWithdrawnResult reference = answer reference "withdrawn"
+
 -- | What reclaim did with a task: returned it to pending, or, when the task
 -- had used its retries, left it failed.
 encodeReclaimResult :: TaskId -> Retry -> BL.ByteString
@@ -513,6 +640,12 @@ encodeCollectResult ident status = reply ident $ case status of
   Collected -> "collected"
   NotFinished -> "not_finished"
   Unknown -> "unknown"
+
+encodeWithdrawResult :: TaskId -> WithdrawStatus -> BL.ByteString
+encodeWithdrawResult ident status = reply ident $ case status of
+  WithdrawnNow -> "withdrawn"
+  Finished -> "finished"
+  NotHeld -> "unknown"
 
 encodeExpiredResult :: TaskId -> BL.ByteString
 encodeExpiredResult ident = reply ident "expired"

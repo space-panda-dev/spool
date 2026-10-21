@@ -8,6 +8,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Lazy.Char8 as BLC
 import Data.Either (isLeft)
 import Data.Int (Int64)
+import Data.List (isInfixOf)
 import qualified Data.Map.Strict as Map
 import Spool.Types (Capability, mkCapability)
 import Spool.Worker.Config
@@ -25,8 +26,21 @@ tests = testGroup "worker configuration"
   [ testCase "limits left out take their defaults" $ do
       config <- parsed (document "" capabilityBody)
       wcMaxConcurrent config @?= 1
+      wcPrefetch config @?= 0
+      wcMinFreeBytes config @?= Nothing
       wcRenewSeconds config @?= 30
       wcEnv config @?= []
+  , testCase "a worker may lease ahead, above a floor of free space (ADR 0025)" $ do
+      config <- parsed (document "\"prefetch\":1,\"min_free_bytes\":6000000000," capabilityBody)
+      (wcPrefetch config, wcMinFreeBytes config) @?= (1, Just 6000000000)
+      parseWorkConfig (encodeWorkConfig config) @?= Right config
+  , testCase "a configuration without them shows as it did" $ do
+      config <- parsed (document "" capabilityBody)
+      assertBool "no prefetch shown" (not ("prefetch" `isInfixOf` BLC.unpack (encodeWorkConfig config)))
+  , testCase "a negative prefetch is refused" $
+      assertBool "refused" (isLeft (parseWorkConfig (document "\"prefetch\":-1," capabilityBody)))
+  , testCase "a floor of 0 is refused" $
+      assertBool "refused" (isLeft (parseWorkConfig (document "\"min_free_bytes\":0," capabilityBody)))
   , testCase "a capability reads as written" $ do
       config <- parsed (document "" capabilityBody)
       Map.toList (wcCapabilities config)

@@ -50,6 +50,7 @@ data StoreCommand
   | Ack
   | Reclaim Integer
   | Collect
+  | Withdraw
   | Gc Integer
   | Status StatusFormat
   | Renew
@@ -96,6 +97,8 @@ parseSubcommand ["revoke", "--grant", identifier] =
   store (RevokeCommand (T.pack identifier))
 parseSubcommand ["status"] = store (Status StatusText)
 parseSubcommand ["status", "--json"] = store (Status StatusJson)
+parseSubcommand ["status", "--json", "--tasks"] = store (Status StatusTasks)
+parseSubcommand ["status", "--tasks", "--json"] = store (Status StatusTasks)
 parseSubcommand ["lease", "--worker", worker] = do
   name <- workerArgument worker
   store (LeaseCommand name 1)
@@ -105,6 +108,7 @@ parseSubcommand ["lease", "--count", count, "--worker", worker] =
   leaseCommand worker count
 parseSubcommand ["reclaim", "--older-than", age] = Store . Reclaim <$> olderThan age
 parseSubcommand ["collect"] = store Collect
+parseSubcommand ["withdraw"] = store Withdraw
 parseSubcommand ["gc", "--older-than", age] = Store . Gc <$> olderThan age
 parseSubcommand ("work" : "--config" : configPath : "--show" : []) =
   Right (WorkShow configPath)
@@ -240,4 +244,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|send|take|reclaim --older-than SECONDS|collect|gc --older-than SECONDS|status [--json]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH] [--max-result-bytes N]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\nFOLLOW: --follow [--idle-seconds N]"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|send|take|reclaim --older-than SECONDS|collect|withdraw|gc --older-than SECONDS|status [--json [--tasks]]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH] [--max-result-bytes N]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\nFOLLOW: --follow [--idle-seconds N]"

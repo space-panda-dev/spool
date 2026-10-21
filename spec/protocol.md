@@ -1,12 +1,55 @@
 # Spool protocol
 
-Version: 0.0.4
+Version: 0.0.5
 Status: draft
 
 The protocol a spool and its workers follow. It is dedicated to the public
 domain under CC0 1.0: anyone may implement it. The version above must match
 [`VERSION`](VERSION). Matters that are not settled remain listed in
 [`docs/open-questions.md`](../docs/open-questions.md).
+
+## Since 0.0.4
+
+Version 0.0.5 adds five decisions:
+[ADR 0022](../docs/decisions/0022-a-task-may-be-withdrawn.md) (`withdraw`),
+[ADR 0023](../docs/decisions/0023-status-lists-each-task.md)
+(`status --json --tasks`),
+[ADR 0024](../docs/decisions/0024-leases-follow-put-order-and-priority.md)
+(put order and `priority`),
+[ADR 0025](../docs/decisions/0025-a-worker-may-fetch-ahead.md) (`prefetch`
+and `min_free_bytes`), and
+[ADR 0026](../docs/decisions/0026-a-worker-survives-its-link.md) (a lease
+reclaimed while its worker was away is taken back; `fetch` from an
+`offset`). Each new field is written only where it holds something:
+
+- A task may carry `priority`, written only when it is not 0, and the
+  spool writes `put_serial` in the task files it keeps. A 0.0.4 binary
+  refuses a task file that has either as corrupt (exit 70), so it must not
+  be run on a spool a 0.0.5 binary has put to. The lease envelope carries
+  neither, so a 0.0.4 worker works a 0.0.5 spool. A 0.0.4 spool refuses a
+  task put with `priority` as malformed input (exit 2).
+- `withdraw` and `status --json --tasks` are new commands and remote words;
+  a 0.0.4 spool refuses them as malformed input (exit 2). `withdraw`
+  answers `withdrawn`, `finished`, and `unknown`.
+- `renew`, `ack`, and `fail` may answer `withdrawn`, with exit 4, where
+  they answered `stale`. A 0.0.4 worker reads any answer but `stale` as
+  accepted, so it runs a withdrawn task to its end and acknowledges it into
+  nothing; nothing is recorded. One whose run leaves result attachments
+  ends with exit 4 at its first `send`, as for a stale lease.
+- A `renew`, `ack`, `send`, or `fetch` on a lease reclaimed for want of
+  renewal, whose task nobody has leased since, takes the lease back and
+  acts, where 0.0.4 answered `stale` (exit 4). A reclaim that returns its
+  task to pending keeps what the lease staged until then.
+- A fetch request may carry `offset`, written only when it is not 0. A
+  0.0.4 spool refuses one that has it as malformed input (exit 2); a 0.0.5
+  worker sends it only to resume a fetch the transport broke.
+- A worker configuration may carry `prefetch` and `min_free_bytes`; a 0.0.4
+  worker refuses them (exit 2).
+- `gc` also deletes withdrawal records old enough, and answers nothing for
+  them.
+
+A spool written by 0.0.4 is read by 0.0.5 unchanged: its pending tasks,
+which have no `put_serial`, are leased first, in task ID order.
 
 ## Since 0.0.3
 
@@ -82,9 +125,9 @@ negotiation.
 
 ## Tasks
 
-A task is one JSON object with exactly the three required fields below and the
-optional `attachments` field defined in the next section. New writers include
-that field explicitly.
+A task is one JSON object with exactly the three required fields below, the
+optional `attachments` field defined in the next section, and an optional
+`priority`. New writers include `attachments` explicitly.
 
 ```json
 {"task_id":"task-one","capability":"classify@1","payload":{"anything":"opaque"},"attachments":[]}
@@ -95,6 +138,15 @@ that field explicitly.
   `version` matches `[A-Za-z0-9.]+`, 1 to 128 characters in all. Only the
   grammar is checked.
 - `payload`: any JSON value, including null. Never interpreted.
+- `priority`: an integer from -9223372036854775808 through
+  9223372036854775807, 0 when it is not given. Under
+  [ADR 0024](../docs/decisions/0024-leases-follow-put-order-and-priority.md)
+  a higher priority is leased first. It is not part of what makes two tasks
+  equal.
+
+The spool writes `put_serial`, the place its `put` gave the task, in the
+task files it keeps; a task that a caller gives one is malformed input. A
+lease carries neither field.
 
 ### Names
 
@@ -135,9 +187,13 @@ already present remains an idempotent no-op and does not require source files.
 A task is **pending**, **leased**, **done**, or **failed**.
 
 - `put` makes a task pending. An equal task put again is a no-op; the same ID
-  with different content is a conflict.
+  with different content is a conflict. Equal means the same `task_id`,
+  `capability`, `payload`, and `attachments`: a task put again with another
+  `priority` is the task already there, and keeps its priority and place.
 - `lease` moves a pending task to leased under a new lease ID, naming the
-  worker.
+  worker. It takes the pending task with the highest priority, and among
+  those the one put first; a task put before 0.0.5 goes before every task
+  put since, in task ID order. A task returned to pending keeps its place.
 - `ack` with that lease ID moves it to done, carrying the task's result: any
   JSON value, `{"task_id", "lease_id", "result"}`, and the result
   attachments sent under the lease that it names (below). The result is kept
@@ -152,7 +208,11 @@ A task is **pending**, **leased**, **done**, or **failed**.
 - `reclaim --older-than SECONDS` ends every lease whose later of lease time
   and last renewal is older than that, as a failure: it records one and
   returns the task to pending, or on its last attempt leaves it failed. The
-  old lease ID is dead.
+  old lease ID is dead once the task is leased again or finishes; until
+  then its worker takes it back (below).
+- `withdraw` deletes a pending or leased task, with its attachments and its
+  failure records, because whoever put it no longer wants it. A leased
+  task's lease ends at once, and a request on it is answered `withdrawn`.
 - `collect` deletes a finished task, and `gc --older-than SECONDS` every
   finished task that finished that long ago: a done task, or one whose latest
   failure was final, whether by `--no-retry`, by exit 65, or by its last
@@ -172,6 +232,28 @@ lease with no worker on file was never handed to a worker; reclaim returns
 its task to pending with no record, and it is no attempt.
 
 A lease ID that is not the task's current lease acts on nothing.
+
+Under [ADR 0026](../docs/decisions/0026-a-worker-survives-its-link.md), a
+`renew`, `ack`, `send`, or `fetch` naming a lease that a reclaim for want of
+renewal ended takes the lease back when its task is pending and no failure
+record of the task is later than the lease's: through the remote command,
+only for the grant's worker. The task moves back under the lease, with its
+worker and a renewal now, and the reclaim's failure record is deleted,
+last; until it is, recovery finishes the reclaim again. The request then
+acts as on any lease in flight. A reclaim that left the task failed, a
+revoke's reclaim, and a `fail` are never taken back, and `fail` never takes
+a lease back. A reclaim that returns its task to pending keeps the result
+attachments the lease staged until the lease is taken back, or the task is
+leased again, withdrawn, or finished.
+
+Under [ADR 0022](../docs/decisions/0022-a-task-may-be-withdrawn.md), a
+leased task withdrawn leaves a withdrawal record,
+`{"task_id", "lease_id", "withdrawn_at"}`, which is the withdrawal's commit;
+recovery finishes ending a lease that has one. A lease reclaimed and waiting
+to be taken back when its task is withdrawn gets one too. A `renew`, `ack`,
+or `fail` naming such a lease is answered `withdrawn`, and a `send` or
+`fetch` on it exits 4. `gc --older-than SECONDS` deletes withdrawal records
+that old.
 
 Under
 [ADR 0013](../docs/decisions/0013-the-record-commits-and-recovery-finishes.md),
@@ -215,8 +297,10 @@ spool --dir DIR send < send-request-and-bytes
 spool --dir DIR take < take-request.json > attachment
 spool --dir DIR reclaim --older-than SECONDS
 spool --dir DIR collect < tasks.jsonl
+spool --dir DIR withdraw < tasks.jsonl
 spool --dir DIR gc --older-than SECONDS
 spool --dir DIR status [--json]
+spool --dir DIR status --json --tasks
 spool --dir DIR work --worker WORKER --config FILE [--max-tasks N] [--follow [--idle-seconds N]]
 spool work --via COMMAND --config FILE [--max-tasks N] [--follow [--idle-seconds N]]
 spool work --config FILE --show
@@ -241,8 +325,8 @@ any. A malformed line is exit 2 with nothing acted on, whether it is the first
 line or the last.
 
 `put`, `reclaim`, and `gc` answer on stdout with one line for each task they
-acted on, in the order they acted, and `collect` with one line for each line
-it was given, in the order given:
+acted on, in the order they acted, and `collect` and `withdraw` with one
+line for each line they were given, in the order given:
 
 ```json
 {"task_id":"task-one","status":"inserted"}
@@ -268,19 +352,24 @@ every answer names the lease it answers:
 | `fail --no-retry` | `failed` | the task is failed |
 | `send` | `staged` | the file is staged under the lease, for its ack to name |
 | `ack`, `renew`, `fail` | `stale` | nothing was done: see below |
+| `ack`, `renew`, `fail` | `withdrawn` | nothing was done: the lease's task was withdrawn |
 | `reclaim` | `reclaimed` | the task is pending again and its lease is dead |
 | `reclaim` | `failed` | the task is failed: that was its last attempt |
 | `collect` | `collected` | the task was finished, and it and its records are gone |
 | `collect` | `not_finished` | the task is pending or leased; nothing was deleted |
 | `collect` | `unknown` | the spool holds nothing under that ID |
 | `gc` | `expired` | the task had finished long enough ago, and it and its records are gone |
+| `withdraw` | `withdrawn` | the task was pending or leased, and it, its attachments, and its records are gone |
+| `withdraw` | `finished` | the task is done or failed for good; nothing was deleted |
+| `withdraw` | `unknown` | the spool holds no pending, leased, or finished task under that ID |
 
 `stale` answers a lease that is stale, unknown, another task's, or, through
 the remote command, another worker's; an `ack` whose result differs from
 the one already stored; and an `ack` repeated after its task was collected
-or expired. The answer does not say which. The command acts on the lines
-that are not stale, and then exits 4 if any was. `collect` exits 0 whatever
-it answers.
+or expired. The answer does not say which. `withdrawn` answers a lease
+whose task was withdrawn while it was held. The command acts on the other
+lines, and then exits 4 if any was answered either way. `collect` and
+`withdraw` exit 0 whatever they answer.
 
 `init` answers nothing.
 
@@ -312,7 +401,7 @@ answered from its record, as any repeat is.
 {"task_id":"task-one","lease_id":"lease_...","result":{"vocals":"0123...cdef"},"attachments":[{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":123}]}
 ```
 
-`collect` takes one line for each task:
+`collect` and `withdraw` take one line for each task:
 
 ```json
 {"task_id":"task-one"}
@@ -372,6 +461,20 @@ not an exclusive partition of task IDs. A retrying failure can contribute one
 pending task and one or more failed records; its `retried` field distinguishes
 that history from terminal failure.
 
+### Each task
+
+Under [ADR 0023](../docs/decisions/0023-status-lists-each-task.md),
+`status --json --tasks` writes one line for each task pending or leased:
+the pending first, in the order they will be leased, then the leased, in
+the order they were leased. `renewed_at` is the last renewal, or
+`leased_at` if there has been none; `worker` is null for a lease never
+handed to a worker. No payload is listed.
+
+```json
+{"task_id":"task-one","state":"pending","priority":0}
+{"task_id":"task-two","state":"leased","priority":0,"lease_id":"lease_...","worker":"worker-one","leased_at":"2026-09-29T12:00:00Z","renewed_at":"2026-09-29T12:05:00Z"}
+```
+
 ### `fetch`
 
 `fetch` accepts exactly one JSON object:
@@ -380,6 +483,11 @@ that history from terminal failure.
 {"task_id":"task-one","lease_id":"lease_...","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
 ```
 
+It may also carry `offset`, from 0 through the attachment's size: the bytes
+of it the worker already holds (ADR 0026). The spool verifies the whole file
+as below, and writes the bytes after the offset. An offset past the end is
+malformed input (exit 2).
+
 The task and lease must be current and the digest must be declared by that
 task. The spool verifies the stored bytes against both the declared SHA-256
 and size before writing the raw bytes to stdout. It checks the lease and
@@ -387,8 +495,9 @@ opens the file under the spool's lock, and verifies and writes the bytes
 after letting it go, so a reader slow to read holds up no other command; a
 lease that ends meanwhile does not stop a fetch already begun. Diagnostics
 use stderr. The
-receiver verifies digest and size again before exposing the file. Ranges,
-resumption, paths, and multiple requests in one invocation are unsupported.
+receiver verifies digest and size again before exposing the file. Ranges
+other than an offset, paths, and multiple requests in one invocation are
+unsupported.
 Malformed requests and undeclared digests are exit 2. An unknown, stale, or
 wrong-task lease is exit 4. A stored attachment whose declared digest or size
 does not match is corrupt durable state and exit 70. A declaration whose
@@ -536,8 +645,10 @@ put
 results
 failures
 collect
+withdraw
 status
 status --json
+status --json --tasks
 ```
 
 `N` is decimal from 1 through 9223372036854775807 with no sign or leading
@@ -564,7 +675,8 @@ read nothing on stdin. Under
 [ADR 0018](../docs/decisions/0018-finished-work-is-collected-or-ages-out.md),
 `collect` takes and answers the same lines as it does locally, for a grant
 whose `put` is true; for one whose `put` is false it is exit 5 and the lines
-are not read. Requested command words never contain task IDs, lease
+are not read. `withdraw` and `status --json --tasks` are the same
+(ADR 0022, ADR 0023). Requested command words never contain task IDs, lease
 IDs, digests, paths, or a claimed worker.
 
 ### Remote worker
@@ -644,7 +756,7 @@ detect this.
 | 1 | `lease`: no pending task |
 | 2 | malformed input |
 | 3 | task conflict |
-| 4 | stale or unknown lease |
+| 4 | stale, unknown, or withdrawn lease |
 | 5 | grant missing, revoked, or expired |
 | 6 | `send`: no room now under the grant's `max_result_bytes` |
 | 7 | `send`: the grant's `max_result_bytes` could never hold this result |
@@ -668,9 +780,9 @@ Exit 65 (`EX_DATAERR`) is how a program says its task can never succeed.
 `work` fails it with `--no-retry` and the reason `exit 65: ` followed by the
 end of the program's stderr, as for any other failing exit.
 
-Every number in the configuration is a whole number of at least 1. The
-concurrency limit and the byte limits may be as large as the host's integers
-allow; `renew_seconds` and `timeout_seconds` may be at most 9223372036854. A
+Every number in the configuration is a whole number of at least 1, except
+`prefetch`, which may be 0. The concurrency limit, `prefetch`, and the byte
+limits may be as large as the host's integers allow; `renew_seconds` and `timeout_seconds` may be at most 9223372036854. A
 number outside its range is malformed input and exit 2; it is never rounded,
 wrapped, or clamped.
 
@@ -703,6 +815,42 @@ it leases nothing more, every run is killed as above, each run's working
 directory is deleted, and `work` exits 143. It
 reports nothing for the tasks it was running. Their leases stand, for
 `reclaim` to return.
+
+### Leasing ahead
+
+Under [ADR 0025](../docs/decisions/0025-a-worker-may-fetch-ahead.md), a
+configuration may set `prefetch`, 0 when it is not given, and
+`min_free_bytes`. A worker holds up to the concurrency limit plus
+`prefetch` leases at once. Each task fetches its attachments as soon as it
+is leased, while its lease is renewed, and then waits for one of the
+concurrency limit's slots to run its program in, which it lets go when the
+program ends, before its outputs are sent. A task never takes a slot ahead
+of a task leased before it that still waits for one. While a task leased
+earlier is held, the worker leases nothing more until the file system that
+holds its working directories has `min_free_bytes` free, and a task waits
+to fetch until its attachments would leave that much free; the first task
+held never waits. The waits start at 1 second and double up to
+`renew_seconds`. Free space is what `df -P -k` on the worker's `PATH`
+reports as available. `work --show` shows `prefetch` and `min_free_bytes`
+only when they are set.
+
+### A withdrawn task
+
+A renewal answered `withdrawn` (ADR 0022) stops the run at once, wherever
+it is: its program's process group is ended as for a timeout, its working
+directory is deleted, and nothing is acknowledged or failed. The worker
+says so on stderr and goes on; it is no failure. A request answered
+`stale` is followed by one renewal, to tell a withdrawal from a lost lease.
+
+### The link
+
+Under [ADR 0026](../docs/decisions/0026-a-worker-survives-its-link.md), a
+renewal that fails with 75 is said once on stderr and tried again at the
+next interval. A fetch, a send, and an ack that fail with 75 are said once
+and asked again after a wait of 1 second, doubling up to `renew_seconds`,
+for as long as the lease is renewed; a fetch asks from the end of what it
+received, which it keeps in a partial file beside the attachment and
+verifies whole before it gives it its name. A `fail` is not asked again.
 
 ### Result attachments
 

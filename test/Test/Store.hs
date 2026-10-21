@@ -6,15 +6,28 @@
 module Test.Store (tests) where
 
 import Data.Int (Int64)
+import Data.List (sortOn)
 import qualified Data.Text as T
-import Spool.Store (Room (..), attemptsBefore, fitsLimit, retryCap, roomFor)
+import qualified Data.Aeson as A
+import Spool.Store
+  ( Room (..)
+  , attemptsBefore
+  , fitsLimit
+  , isReclaimReason
+  , leaseOrder
+  , retryCap
+  , roomFor
+  )
 import Spool.Types
   ( Retry (..)
   , leaseSerialAndTask
   , mkLeaseId
+  , mkCapability
   , mkTaskId
   , newLeaseId
+  , taskIdText
   )
+import Spool.Wire (Task (..), newTask)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck
@@ -27,7 +40,33 @@ import Test.Tasty.QuickCheck
   )
 
 tests :: TestTree
-tests = testGroup "store" [retryCapTests, limitTests]
+tests = testGroup "store" [retryCapTests, limitTests, orderTests]
+
+orderTests :: TestTree
+orderTests = testGroup "lease order (ADR 0024)"
+  [ testCase "the first put is leased first, whatever its ID" $
+      order [("zz", 0, Just 1), ("aa", 0, Just 2), ("mm", 0, Just 3)] @?= ["zz", "aa", "mm"]
+  , testCase "a higher priority goes first, then the first put" $
+      order [("a", 0, Just 1), ("b", 5, Just 4), ("c", 5, Just 2), ("d", -1, Just 0)]
+        @?= ["c", "b", "a", "d"]
+  , testCase "a task put before order was kept goes before those put after" $
+      order [("new", 0, Just 1), ("old-b", 0, Nothing), ("old-a", 0, Nothing)]
+        @?= ["old-a", "old-b", "new"]
+  , testCase "priority outranks age, even for a task put before order was kept" $
+      order [("old", 0, Nothing), ("urgent", 1, Just 99)] @?= ["urgent", "old"]
+  , testCase "only a reclaim for want of renewal can be taken back (ADR 0026)" $
+      map isReclaimReason
+        [ "reclaimed: not renewed within 300 s"
+        , "reclaimed: grant revoked"
+        , "exit 3: failed"
+        ] @?= [True, False, False]
+  ]
+  where
+    order entries = map (taskIdText . taskId) (sortOn leaseOrder
+      [ (newTask (named name) capability A.Null []) { taskPriority = priority, taskPutSerial = serial }
+      | (name, priority, serial) <- entries ])
+    named name = either error id (mkTaskId name)
+    capability = either error id (mkCapability "c@1")
 
 limitTests :: TestTree
 limitTests = testGroup "a grant's limit on result attachments"

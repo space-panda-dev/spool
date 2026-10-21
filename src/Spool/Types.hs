@@ -183,8 +183,9 @@ retryFlag :: Retry -> Bool
 retryFlag Retry = True
 retryFlag NoRetry = False
 
--- | How @status@ prints its counters.
-data StatusFormat = StatusText | StatusJson
+-- | How @status@ prints: its counters as text or JSON, or one JSON line for
+-- each task pending or leased (ADR 0023).
+data StatusFormat = StatusText | StatusJson | StatusTasks
   deriving (Eq, Show)
 
 -- | When something happened, as a record carries it: UTC to the second,

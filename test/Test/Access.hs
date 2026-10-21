@@ -58,6 +58,8 @@ acceptedCommands =
   , ("collect", RemoteCollect)
   , ("status", RemoteStatus StatusText)
   , ("status --json", RemoteStatus StatusJson)
+  , ("status --json --tasks", RemoteStatus StatusTasks)
+  , ("withdraw", RemoteWithdraw)
   ]
 
 rejectedCommands :: [(String, BS.ByteString)]
@@ -91,6 +93,8 @@ rejectedCommands =
   , ("local reclaim", "reclaim --older-than 0")
   , ("local gc", "gc --older-than 0")
   , ("collect with an option", "collect --all")
+  , ("withdraw with a task", "withdraw t")
+  , ("tasks in the other order", "status --tasks --json")
   , ("local grant", "grant --worker other")
   , ("local revoke", "revoke --grant grant_deadbeef")
   , ("missing count", "lease --count")

@@ -13,6 +13,7 @@ module Spool.Files
   , taskCleanupDir
   , resultLeasesDir
   , resultTasksDir
+  , withdrawnDir
   , layoutPath
   , lockPath
   , openSpool
@@ -26,6 +27,7 @@ module Spool.Files
   , taskCleanupPath
   , resultLeaseDir
   , resultTaskDir
+  , withdrawnPath
   , workerSidecarPath
   , renewedSidecarPath
   , jsonFiles
@@ -79,6 +81,9 @@ data Paths = Paths
     -- ^ The result attachments sent under each lease in flight (ADR 0020).
   , resultTasksDir :: FilePath
     -- ^ The result attachments of each done task (ADR 0020).
+  , withdrawnDir :: FilePath
+    -- ^ A record for each lease whose task was withdrawn while it was held
+    -- (ADR 0022).
   , layoutPath :: FilePath
     -- ^ Which layout the spool's files are in (ADR 0018).
   , lockPath :: FilePath
@@ -133,6 +138,7 @@ spoolAt directory lock = Paths
   , taskCleanupDir = directory </> ".task-cleanup"
   , resultLeasesDir = directory </> "result-attachments" </> "leases"
   , resultTasksDir = directory </> "result-attachments" </> "tasks"
+  , withdrawnDir = directory </> "withdrawn"
   , layoutPath = directory </> ".spool-layout"
   , lockPath = directory </> ".spool.lock"
   , processLock = lock
@@ -159,10 +165,11 @@ underTask :: FilePath -> String -> TaskId -> FilePath
 underTask directory extension ident =
   directory </> T.unpack (taskIdText ident) <> extension
 
-leasedPath, failedPath, resultPath :: Paths -> LeaseId -> FilePath
+leasedPath, failedPath, resultPath, withdrawnPath :: Paths -> LeaseId -> FilePath
 leasedPath paths = underLease (leasedDir paths) ".json"
 failedPath paths = underLease (failedDir paths) ".json"
 resultPath paths = underLease (resultsDir paths) ".json"
+withdrawnPath paths = underLease (withdrawnDir paths) ".json"
 
 workerSidecarPath, renewedSidecarPath :: Paths -> LeaseId -> FilePath
 workerSidecarPath paths = underLease (leasedDir paths) ".worker"
@@ -177,7 +184,7 @@ initialise paths = mapM_ (createDirectoryIfMissing True)
   [rootDir paths, pendingDir paths, leasedDir paths, doneDir paths,
    failedDir paths, resultsDir paths, attachmentsDir paths,
    attachmentCleanupDir paths, taskCleanupDir paths, resultLeasesDir paths,
-   resultTasksDir paths]
+   resultTasksDir paths, withdrawnDir paths]
 
 jsonFiles :: FilePath -> IO [FilePath]
 jsonFiles directory = do
