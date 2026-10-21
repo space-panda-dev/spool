@@ -1,0 +1,59 @@
+$ scripts/demo.sh
+[exit 0]
+--- stdout
+$ spool --version
+spool 0.0.4 <commit>
+
+$ spool init
+
+$ spool put
+{"status":"inserted","task_id":"greet-ada"}
+{"status":"inserted","task_id":"word-count"}
+
+$ spool status
+pending=2 leased=0 done=0 failed=0
+
+$ spool lease --worker demo
+{"attachments":[],"capability":"greet@1","lease_id":"<lease>","leased_at":"<time>","payload":{"name":"Ada"},"task_id":"greet-ada","worker":"demo"}
+
+$ spool ack
+{"lease_id":"<lease>","status":"acked","task_id":"greet-ada"}
+
+$ spool lease --worker demo
+{"attachments":[],"capability":"count@1","lease_id":"<lease>","leased_at":"<time>","payload":{"words":"one two three"},"task_id":"word-count","worker":"demo"}
+
+$ spool fail
+{"lease_id":"<lease>","status":"failed_retry","task_id":"word-count"}
+
+$ spool status
+pending=1 leased=0 done=1 failed=1
+
+$ spool lease --worker demo
+{"attachments":[],"capability":"count@1","lease_id":"<lease>","leased_at":"<time>","payload":{"words":"one two three"},"task_id":"word-count","worker":"demo"}
+
+$ spool fail --no-retry
+{"lease_id":"<lease>","status":"failed","task_id":"word-count"}
+
+$ spool ack
+spool: lease is unknown or stale
+spool: one or more leases were stale or unknown
+{"lease_id":"<lease>","status":"stale","task_id":"word-count"}
+[exit 4]
+
+$ spool lease --worker demo
+[exit 1]
+
+$ spool results
+{"capability":"greet@1","finished_at":"<time>","lease_id":"<lease>","result":{"greeting":"Hello, Ada"},"task_id":"greet-ada","worker":"demo"}
+
+$ spool failures
+{"capability":"count@1","failed_at":"<time>","lease_id":"<lease>","reason":"the counter is busy","retried":true,"task_id":"word-count","worker":"demo"}
+{"capability":"count@1","failed_at":"<time>","lease_id":"<lease>","reason":"words are not countable","retried":false,"task_id":"word-count","worker":"demo"}
+
+$ spool collect
+{"status":"collected","task_id":"greet-ada"}
+{"status":"collected","task_id":"word-count"}
+
+$ spool status --json
+{"done":0,"failed":0,"leased":0,"pending":0}
+--- stderr

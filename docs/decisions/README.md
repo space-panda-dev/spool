@@ -30,3 +30,4 @@ document and the implementation say nothing of it until it is accepted.
 | [0019](0019-a-worker-may-follow-its-spool.md) | A worker may follow its spool |
 | [0020](0020-a-result-may-carry-attachments.md) | A result may carry attachments |
 | [0021](0021-a-send-refused-for-room-waits.md) | A send refused for room waits |
+| [0022](0022-a-binary-names-its-commit.md) | A binary names the commit it was built from |

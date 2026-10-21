@@ -77,7 +77,8 @@ docs/real-machine-gate.md authorized cross-machine validation and evidence
 src/                   the reference implementation, a library
 app/                   the spool executable
 test/                  unit and property tests
-test.sh                the integration suite, run against a built binary
+test.sh                the integration suite, in sections (`bash test.sh --list`)
+MAP.md                 where each area lives: code, tests, protocol, decisions
 ```
 
 ## Contributing

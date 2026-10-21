@@ -63,9 +63,17 @@ filesystemFailure :: IOException -> SpoolError
 filesystemFailure exception =
   retryable ("filesystem failure: " <> displayException exception)
 
+-- | The commit this binary was built from (ADR 0022): a full commit id,
+-- one followed by @-dirty@ for a tree with uncommitted changes, or
+-- @unknown@. The flake writes it here before it builds; a cabal build has
+-- no way to learn it without rebuilding every module at every commit, so
+-- it says @unknown@ rather than a commit it may not be.
+buildCommit :: String
+buildCommit = "unknown"
+
 run :: [String] -> IO ()
 run args = case args of
-  ["--version"] -> putStrLn ("spool " <> showVersion version)
+  ["--version"] -> putStrLn ("spool " <> showVersion version <> " " <> buildCommit)
   ["remote", "--grant", identifier] -> runRemote (T.pack identifier)
   ("work" : rest) | "--show" `elem` rest && "--dir" `notElem` args ->
     either (throwIO . Usage) runWorkShow (parseWorkShow rest)

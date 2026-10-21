@@ -1,0 +1,84 @@
+# What `wf` needs to know about Spool (`wf check --help`, `wf suites`).
+# Tiers are budgets in seconds: 1 | 5 | 30 | 300 | "night". `wf check --tier 5`
+# before a commit, `wf check --tier 30 --changed` before a merge, `--tier 300`
+# before a release; the flake (what CI runs) is the night tier.
+#
+# Every cabal suite builds the same configuration (-f werror --enable-tests),
+# so they share one dist-newstyle, which the slot keeps between runs.
+keep = ["dist-newstyle"]
+
+# Links, the decision index, invariants, spec version, licences: under a second.
+[suites.structure]
+run = 'python3 scripts/check.py "$@"'
+timeout_seconds = 60
+tier = 1
+where = "local"
+
+# MAP.md's generated blocks and the pointers in the entry documents
+# (`lens stale --fix MAP.md` rewrites the blocks).
+[suites.docs]
+run = '"${WF:-wf}" vet --docs MAP.md AGENTS.md README.md "$@"'
+timeout_seconds = 60
+tier = 1
+where = "local"
+
+# The library and the binary. Seconds when dist-newstyle is warm; a cold
+# build is minutes, so it runs on the laptop like the others.
+[suites.build]
+run = 'cabal build -v0 -f werror --enable-tests exe:spool "$@"'
+timeout_seconds = 1800
+tier = 5
+where = "any"
+paths = ["src/**", "app/**", "spool.cabal"]
+
+# test/: pure functions and failures at one exact moment.
+[suites.unit]
+run = 'cabal test -v0 -f werror --enable-tests --test-show-details=direct "$@"'
+timeout_seconds = 1800
+parser = "cabal"
+tier = 30
+paths = ["src/**", "app/**", "test/**", "spool.cabal"]
+
+# test.sh against the binary this tree builds (test.sh builds it with the
+# flags above). ARGS name sections, each under 20 s: `wf check integration --
+# work`; `bash test.sh --list` names them. All of them take about a minute.
+[suites.integration]
+run = 'bash test.sh "$@"'
+timeout_seconds = 1800
+tier = 300
+paths = ["src/**", "app/**", "test.sh", "test/fixtures/**", "spool.cabal"]
+
+# The protocol's happy path against its golden transcript (`wf prove demo`
+# writes the same transcript, framed, to .wf/proof/).
+[suites.demo]
+run = 'want=$(mktemp) && sed -e "1,3d" -e "/^--- stderr\$/,\$d" test/golden/demo.txt > "$want" && bash scripts/demo.sh | diff -u "$want" -'
+timeout_seconds = 1800
+tier = 5
+where = "any"
+paths = ["src/**", "app/**", "scripts/demo.sh", "test/golden/**", "spool.cabal"]
+
+# What CI runs: the static binary with warnings as errors, the unit tests, the
+# integration suite, and nix/spool.nix against spool.cabal.
+[suites.flake]
+run = 'nix flake check -L "$@"'
+timeout_seconds = 3600
+tier = "night"
+where = "laptop"
+paths = ["**"]
+
+# A CLI transcript of the protocol's happy path: `wf prove demo --golden`.
+[prove.demo]
+transcript = "scripts/demo.sh"
+golden = "test/golden/demo.txt"
+timeout = 300
+
+[context]
+map = "MAP.md"
+generated = ["MAP.md"]
+
+# Mirrors scripts/check.py's check_banned_words: no file or path may name the
+# predecessor project (case-insensitive). The pattern is spelled so that this
+# file passes that check itself.
+[[vet.banned]]
+pattern = "atel[i]er"
+reason = "Spool must not name the predecessor project (scripts/check.py, check_banned_words): call it the predecessor"
