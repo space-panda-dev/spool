@@ -22,9 +22,14 @@ they chose. ([ADR 0002](decisions/0002-a-spool-is-an-audience.md))
 grant, never from what it claims.
 ([ADR 0003](decisions/0003-ssh-first.md))
 
-**INV-6. A stale lease acts on nothing.** Once a lease is reclaimed or
-resolved, its ID cannot acknowledge, renew, or fail anything.
-([ADR 0001](decisions/0001-pull-protocol.md))
+**INV-6. A stale lease acts on nothing.** Once a lease is resolved,
+withdrawn, or reclaimed and its task leased again or failed for good, its ID
+cannot acknowledge, renew, or fail anything. A lease reclaimed for want of
+renewal, whose task nobody has leased since, is not stale: its worker takes
+it back.
+([ADR 0001](decisions/0001-pull-protocol.md),
+[ADR 0022](decisions/0022-a-task-may-be-withdrawn.md),
+[ADR 0026](decisions/0026-a-worker-survives-its-link.md))
 
 **INV-7. Retries are idempotent.** Putting an equal task again, or repeating an
 acknowledgement, changes nothing; the same task ID with different content is a

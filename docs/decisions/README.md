@@ -30,3 +30,8 @@ document and the implementation say nothing of it until it is accepted.
 | [0019](0019-a-worker-may-follow-its-spool.md) | A worker may follow its spool |
 | [0020](0020-a-result-may-carry-attachments.md) | A result may carry attachments |
 | [0021](0021-a-send-refused-for-room-waits.md) | A send refused for room waits |
+| [0022](0022-a-task-may-be-withdrawn.md) | A task may be withdrawn |
+| [0023](0023-status-lists-each-task.md) | Status lists each task pending or leased |
+| [0024](0024-leases-follow-put-order-and-priority.md) | Leases follow put order, and a task may be put above others |
+| [0025](0025-a-worker-may-fetch-ahead.md) | A worker may fetch ahead, above a floor of free disk |
+| [0026](0026-a-worker-survives-its-link.md) | A worker survives its link |
