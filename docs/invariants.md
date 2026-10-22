@@ -28,8 +28,8 @@ cannot acknowledge, renew, or fail anything. A lease reclaimed for want of
 renewal, whose task nobody has leased since, is not stale: its worker takes
 it back.
 ([ADR 0001](decisions/0001-pull-protocol.md),
-[ADR 0022](decisions/0022-a-task-may-be-withdrawn.md),
-[ADR 0026](decisions/0026-a-worker-survives-its-link.md))
+[ADR 0023](decisions/0023-a-task-may-be-withdrawn.md),
+[ADR 0027](decisions/0027-a-worker-survives-its-link.md))
 
 **INV-7. Retries are idempotent.** Putting an equal task again, or repeating an
 acknowledgement, changes nothing; the same task ID with different content is a

@@ -1,4 +1,4 @@
-# 0025. A worker may fetch ahead, above a floor of free disk
+# 0026. A worker may fetch ahead, above a floor of free disk
 
 Status: accepted
 
@@ -49,7 +49,7 @@ shows as it did.
    worker about to lease ahead stops.
 3. A task waiting for the floor holds its lease. Nobody else can run it
    meanwhile; a caller that wants it back withdraws it
-   ([ADR 0022](0022-a-task-may-be-withdrawn.md)).
+   ([ADR 0023](0023-a-task-may-be-withdrawn.md)).
 
 ## Rejected
 

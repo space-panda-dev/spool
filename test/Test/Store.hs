@@ -43,7 +43,7 @@ tests :: TestTree
 tests = testGroup "store" [retryCapTests, limitTests, orderTests]
 
 orderTests :: TestTree
-orderTests = testGroup "lease order (ADR 0024)"
+orderTests = testGroup "lease order (ADR 0025)"
   [ testCase "the first put is leased first, whatever its ID" $
       order [("zz", 0, Just 1), ("aa", 0, Just 2), ("mm", 0, Just 3)] @?= ["zz", "aa", "mm"]
   , testCase "a higher priority goes first, then the first put" $
@@ -54,7 +54,7 @@ orderTests = testGroup "lease order (ADR 0024)"
         @?= ["old-a", "old-b", "new"]
   , testCase "priority outranks age, even for a task put before order was kept" $
       order [("old", 0, Nothing), ("urgent", 1, Just 99)] @?= ["urgent", "old"]
-  , testCase "only a reclaim for want of renewal can be taken back (ADR 0026)" $
+  , testCase "only a reclaim for want of renewal can be taken back (ADR 0027)" $
       map isReclaimReason
         [ "reclaimed: not renewed within 300 s"
         , "reclaimed: grant revoked"

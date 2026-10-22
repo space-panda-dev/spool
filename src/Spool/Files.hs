@@ -83,7 +83,7 @@ data Paths = Paths
     -- ^ The result attachments of each done task (ADR 0020).
   , withdrawnDir :: FilePath
     -- ^ A record for each lease whose task was withdrawn while it was held
-    -- (ADR 0022).
+    -- (ADR 0023).
   , layoutPath :: FilePath
     -- ^ Which layout the spool's files are in (ADR 0018).
   , lockPath :: FilePath

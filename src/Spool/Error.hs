@@ -49,7 +49,7 @@ data SpoolError
   | Usage String
   -- | @lease@ found no pending task.  Exit 1, and nothing to say.
   | NothingPending
-  -- | A lease whose task was withdrawn (ADR 0022). Exit 4, as for any lease
+  -- | A lease whose task was withdrawn (ADR 0023). Exit 4, as for any lease
   -- that acts on nothing, but answered @withdrawn@, so that its worker
   -- stops the run and says nothing has failed.
   | Withdrawn String

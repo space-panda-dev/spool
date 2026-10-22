@@ -11,14 +11,14 @@ domain under CC0 1.0: anyone may implement it. The version above must match
 ## Since 0.0.4
 
 Version 0.0.5 adds five decisions:
-[ADR 0022](../docs/decisions/0022-a-task-may-be-withdrawn.md) (`withdraw`),
-[ADR 0023](../docs/decisions/0023-status-lists-each-task.md)
+[ADR 0023](../docs/decisions/0023-a-task-may-be-withdrawn.md) (`withdraw`),
+[ADR 0024](../docs/decisions/0024-status-lists-each-task.md)
 (`status --json --tasks`),
-[ADR 0024](../docs/decisions/0024-leases-follow-put-order-and-priority.md)
+[ADR 0025](../docs/decisions/0025-leases-follow-put-order-and-priority.md)
 (put order and `priority`),
-[ADR 0025](../docs/decisions/0025-a-worker-may-fetch-ahead.md) (`prefetch`
+[ADR 0026](../docs/decisions/0026-a-worker-may-fetch-ahead.md) (`prefetch`
 and `min_free_bytes`), and
-[ADR 0026](../docs/decisions/0026-a-worker-survives-its-link.md) (a lease
+[ADR 0027](../docs/decisions/0027-a-worker-survives-its-link.md) (a lease
 reclaimed while its worker was away is taken back; `fetch` from an
 `offset`). Each new field is written only where it holds something:
 
@@ -140,7 +140,7 @@ optional `attachments` field defined in the next section, and an optional
 - `payload`: any JSON value, including null. Never interpreted.
 - `priority`: an integer from -9223372036854775808 through
   9223372036854775807, 0 when it is not given. Under
-  [ADR 0024](../docs/decisions/0024-leases-follow-put-order-and-priority.md)
+  [ADR 0025](../docs/decisions/0025-leases-follow-put-order-and-priority.md)
   a higher priority is leased first. It is not part of what makes two tasks
   equal.
 
@@ -233,7 +233,7 @@ its task to pending with no record, and it is no attempt.
 
 A lease ID that is not the task's current lease acts on nothing.
 
-Under [ADR 0026](../docs/decisions/0026-a-worker-survives-its-link.md), a
+Under [ADR 0027](../docs/decisions/0027-a-worker-survives-its-link.md), a
 `renew`, `ack`, `send`, or `fetch` naming a lease that a reclaim for want of
 renewal ended takes the lease back when its task is pending and no failure
 record of the task is later than the lease's: through the remote command,
@@ -246,7 +246,7 @@ a lease back. A reclaim that returns its task to pending keeps the result
 attachments the lease staged until the lease is taken back, or the task is
 leased again, withdrawn, or finished.
 
-Under [ADR 0022](../docs/decisions/0022-a-task-may-be-withdrawn.md), a
+Under [ADR 0023](../docs/decisions/0023-a-task-may-be-withdrawn.md), a
 leased task withdrawn leaves a withdrawal record,
 `{"task_id", "lease_id", "withdrawn_at"}`, which is the withdrawal's commit;
 recovery finishes ending a lease that has one. A lease reclaimed and waiting
@@ -463,7 +463,7 @@ that history from terminal failure.
 
 ### Each task
 
-Under [ADR 0023](../docs/decisions/0023-status-lists-each-task.md),
+Under [ADR 0024](../docs/decisions/0024-status-lists-each-task.md),
 `status --json --tasks` writes one line for each task pending or leased:
 the pending first, in the order they will be leased, then the leased, in
 the order they were leased. `renewed_at` is the last renewal, or
@@ -484,7 +484,7 @@ handed to a worker. No payload is listed.
 ```
 
 It may also carry `offset`, from 0 through the attachment's size: the bytes
-of it the worker already holds (ADR 0026). The spool verifies the whole file
+of it the worker already holds (ADR 0027). The spool verifies the whole file
 as below, and writes the bytes after the offset. An offset past the end is
 malformed input (exit 2).
 
@@ -676,7 +676,7 @@ read nothing on stdin. Under
 `collect` takes and answers the same lines as it does locally, for a grant
 whose `put` is true; for one whose `put` is false it is exit 5 and the lines
 are not read. `withdraw` and `status --json --tasks` are the same
-(ADR 0022, ADR 0023). Requested command words never contain task IDs, lease
+(ADR 0023, ADR 0024). Requested command words never contain task IDs, lease
 IDs, digests, paths, or a claimed worker.
 
 ### Remote worker
@@ -818,7 +818,7 @@ reports nothing for the tasks it was running. Their leases stand, for
 
 ### Leasing ahead
 
-Under [ADR 0025](../docs/decisions/0025-a-worker-may-fetch-ahead.md), a
+Under [ADR 0026](../docs/decisions/0026-a-worker-may-fetch-ahead.md), a
 configuration may set `prefetch`, 0 when it is not given, and
 `min_free_bytes`. A worker holds up to the concurrency limit plus
 `prefetch` leases at once. Each task fetches its attachments as soon as it
@@ -836,7 +836,7 @@ only when they are set.
 
 ### A withdrawn task
 
-A renewal answered `withdrawn` (ADR 0022) stops the run at once, wherever
+A renewal answered `withdrawn` (ADR 0023) stops the run at once, wherever
 it is: its program's process group is ended as for a timeout, its working
 directory is deleted, and nothing is acknowledged or failed. The worker
 says so on stderr and goes on; it is no failure. A request answered
@@ -844,7 +844,7 @@ says so on stderr and goes on; it is no failure. A request answered
 
 ### The link
 
-Under [ADR 0026](../docs/decisions/0026-a-worker-survives-its-link.md), a
+Under [ADR 0027](../docs/decisions/0027-a-worker-survives-its-link.md), a
 renewal that fails with 75 is said once on stderr and tried again at the
 next interval. A fetch, a send, and an ack that fail with 75 are said once
 and asked again after a wait of 1 second, doubling up to `renew_seconds`,

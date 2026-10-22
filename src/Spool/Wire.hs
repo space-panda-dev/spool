@@ -98,11 +98,11 @@ data Task = Task
   , taskPayload :: A.Value
   , taskAttachments :: [SA.Attachment]
   , taskPriority :: Int64
-    -- ^ Leased before every task of a lower priority (ADR 0024). 0 when the
+    -- ^ Leased before every task of a lower priority (ADR 0025). 0 when the
     -- caller gave none, and then not written.
   , taskPutSerial :: Maybe Integer
     -- ^ The spool's count of puts when this task was put: tasks of one
-    -- priority are leased in this order (ADR 0024). The spool writes it in
+    -- priority are leased in this order (ADR 0025). The spool writes it in
     -- its own files and nowhere else; a task put before 0.0.5 has none, and
     -- comes before every task that has one.
   } deriving (Eq, Show)
@@ -114,7 +114,7 @@ newTask ident capability payload attachments =
 
 -- | Whether two tasks are the same task: the same envelope. Neither the
 -- priority it was put with nor its place in the queue is part of it, so a
--- task put again with another priority is the task already there (ADR 0024).
+-- task put again with another priority is the task already there (ADR 0025).
 sameTask :: Task -> Task -> Bool
 sameTask held wanted =
   taskId held == taskId wanted
@@ -199,7 +199,7 @@ data FetchRequest = FetchRequest
   , fetchDigest :: SA.Sha256
   , fetchOffset :: Int64
     -- ^ How many of its bytes the worker already holds: the spool writes
-    -- those after them (ADR 0026). 0 is the whole file, and is not written,
+    -- those after them (ADR 0027). 0 is the whole file, and is not written,
     -- so a fetch from the start is what 0.0.4 sent.
   } deriving (Eq, Show)
 
@@ -277,7 +277,7 @@ instance ToJSON FailureRecord where
     ]
 
 -- | The record that a lease's task was withdrawn while it was held, kept so
--- that its worker is answered @withdrawn@ and not @stale@ (ADR 0022).
+-- that its worker is answered @withdrawn@ and not @stale@ (ADR 0023).
 data WithdrawalRecord = WithdrawalRecord
   { withdrawalTask :: TaskId
   , withdrawalLease :: LeaseId
@@ -302,7 +302,7 @@ data CollectStatus
   | Unknown      -- ^ the spool holds nothing under it
   deriving (Bounded, Enum, Eq, Show)
 
--- | What @withdraw@ found under a task's identifier (ADR 0022).
+-- | What @withdraw@ found under a task's identifier (ADR 0023).
 data WithdrawStatus
   = WithdrawnNow  -- ^ it was pending or leased, and is gone with its records
   | Finished      -- ^ it is done or failed for good, and nothing was deleted
@@ -310,7 +310,7 @@ data WithdrawStatus
   deriving (Bounded, Enum, Eq, Show)
 
 -- | One task that is pending or leased, as @status --json --tasks@ lists it
--- (ADR 0023).
+-- (ADR 0024).
 data TaskLine
   = PendingLine TaskId Int64
   | LeasedLine TaskId Int64 LeaseId (Maybe WorkerName) Timestamp Timestamp
@@ -624,7 +624,7 @@ encodeSendResult reference = answer reference "staged"
 encodeStaleResult :: LeaseRef -> BL.ByteString
 encodeStaleResult reference = answer reference "stale"
 
--- | The answer to a line whose lease's task was withdrawn (ADR 0022).
+-- | The answer to a line whose lease's task was withdrawn (ADR 0023).
 encodeWithdrawnResult :: LeaseRef -> BL.ByteString
 encodeWithdrawnResult reference = answer reference "withdrawn"
 

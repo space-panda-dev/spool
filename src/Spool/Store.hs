@@ -253,7 +253,7 @@ finishCommitted paths = do
           completeFail paths task leaseIdent (failureRetried record) (failureReason record)
 
 -- | Finish ending every lease whose task was withdrawn while it was held:
--- the withdrawal's record is its commit (ADR 0022).
+-- the withdrawal's record is its commit (ADR 0023).
 finishWithdrawn :: Paths -> IO ()
 finishWithdrawn paths = do
   files <- jsonFiles (leasedDir paths)
@@ -512,7 +512,7 @@ leaseUpTo paths worker count = do
               leaseMany rest (taskId task : active) (remaining - 1) (lease : output)
 
 -- | Every pending task, with its file, in the order they are leased in
--- (ADR 0024).
+-- (ADR 0025).
 pendingInOrder :: Paths -> IO [(FilePath, Task)]
 pendingInOrder paths = do
   files <- jsonFiles (pendingDir paths)
@@ -522,7 +522,7 @@ pendingInOrder paths = do
 -- | Where a pending task stands in the queue: the highest priority first,
 -- and within a priority the first put first. A task put before put order
 -- was kept has no serial, and goes before every task that has one; ties
--- fall to the task ID, as every lease did before (ADR 0024).
+-- fall to the task ID, as every lease did before (ADR 0025).
 leaseOrder :: Task -> (Down Int64, Integer, TaskId)
 leaseOrder task =
   (Down (taskPriority task), fromMaybe 0 (taskPutSerial task), taskId task)
@@ -671,7 +671,7 @@ renewStep paths reference =
   fmap (const (encodeRenewResult reference)) <$> renewOne paths reference
 
 -- | Renew a lease: one in flight, or one reclaimed whose task has waited
--- since, which takes it back (ADR 0026).
+-- since, which takes it back (ADR 0027).
 renewOne :: Paths -> LeaseRef -> IO (Either SpoolError ())
 renewOne paths reference@(LeaseRef _ leaseIdent) = do
   standing <- leaseStands paths Nothing reference
@@ -768,7 +768,7 @@ failureHistory paths ident leaseIdent = do
 -- its attachments go. Whatever result attachments the lease sent go with
 -- it, since no result will name them, unless it was reclaimed and its task
 -- goes back to pending: its worker may yet take it back, and send on
--- (ADR 0026).
+-- (ADR 0027).
 completeFail :: Paths -> Task -> LeaseId -> Retry -> T.Text -> IO ()
 completeFail paths task leaseIdent retry reason = do
   when (retry == Retry) (returnToPending paths task)
@@ -1210,7 +1210,7 @@ liveLeaseOwned paths worker reference@(LeaseRef ident leaseIdent) = do
               else Left (stale "lease belongs to a different worker")
 
 -- | What a lease not in flight is answered: withdrawn, if its task was
--- withdrawn while it was held (ADR 0022), and otherwise stale.
+-- withdrawn while it was held (ADR 0023), and otherwise stale.
 notInFlight :: Paths -> LeaseRef -> IO (Either SpoolError a)
 notInFlight paths reference =
   Left . fromMaybe (stale "lease is unknown or stale") <$> withdrawnLease paths reference
@@ -1231,7 +1231,7 @@ withdrawnLease paths (LeaseRef ident leaseIdent) = do
 
 -- | Whether a lease stands for a request that carries on with it: as
 -- 'liveLeaseOwned', but a lease reclaimed for want of renewal, whose task
--- no lease has been taken on since, is first taken back (ADR 0026).
+-- no lease has been taken on since, is first taken back (ADR 0027).
 leaseStands :: Paths -> Maybe WorkerName -> LeaseRef -> IO (Either SpoolError ())
 leaseStands paths worker reference = do
   live <- fileExists (leasedPath paths (refLease reference))
@@ -1244,7 +1244,7 @@ isReclaimReason = T.isPrefixOf "reclaimed: not renewed within "
 
 -- | The record of a lease reclaimed for want of renewal whose task has
 -- waited in pending since: no lease of the task has ended after it, so none
--- has been taken (ADR 0026).
+-- has been taken (ADR 0027).
 waitingReclaim :: Paths -> LeaseId -> IO (Maybe FailureRecord)
 waitingReclaim paths leaseIdent = case leaseSerialAndTask leaseIdent of
   Nothing -> pure Nothing
@@ -1263,7 +1263,7 @@ waitingReclaim paths leaseIdent = case leaseSerialAndTask leaseIdent of
           else Nothing
 
 -- | Take back a lease reclaimed for want of renewal, for its own worker,
--- when its task has waited in pending since (ADR 0026). The task moves back
+-- when its task has waited in pending since (ADR 0027). The task moves back
 -- under the lease, the lease's worker and a renewal are written, and the
 -- reclaim's record goes last: it is the commit, and until it goes, recovery
 -- finishes the reclaim again. Answers whether it was taken back.
@@ -1446,7 +1446,7 @@ withdrawTasks paths = do
     BLC.putStrLn (encodeWithdrawResult ident status)
 
 -- | Take a task back from the spool because whoever put it no longer wants
--- it (ADR 0022). A pending task goes, with its attachments and its records.
+-- it (ADR 0023). A pending task goes, with its attachments and its records.
 -- A leased one goes too: its lease ends now, under a withdrawal record that
 -- answers its worker @withdrawn@, so that the worker stops the run. A task
 -- that is done or failed for good is left for collect.

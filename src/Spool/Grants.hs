@@ -322,7 +322,7 @@ dispatchRemote paths grant operation = case operation of
   Access.RemoteCollect
     | Access.grantPut grant -> collectTasks paths
     | otherwise -> throwIO (grantRefused "grant does not permit collect")
-  -- Taking a task back goes with having put it (ADR 0022).
+  -- Taking a task back goes with having put it (ADR 0023).
   Access.RemoteWithdraw
     | Access.grantPut grant -> withdrawTasks paths
     | otherwise -> throwIO (grantRefused "grant does not permit withdraw")
@@ -354,7 +354,7 @@ dispatchRemote paths grant operation = case operation of
       | otherwise = throwIO (grantRefused "grant does not permit reading the spool")
     ownedLive = liveLeaseOwned paths (Just worker)
     -- A renewal takes back the worker's own lease reclaimed while it was
-    -- away, if its task has waited since (ADR 0026).
+    -- away, if its task has waited since (ADR 0027).
     standing = leaseStands paths (Just worker)
     ownedAck ack = ackOwned paths worker (ackRef ack)
     -- Act on an item only if its lease is the grant's worker's.
@@ -370,7 +370,7 @@ ackOwned :: Paths -> WorkerName -> LeaseRef -> IO (Either SpoolError ())
 ackOwned paths worker reference@(LeaseRef ident leaseIdent) = do
   inFlight <- fileExists (leasedPath paths leaseIdent)
   -- An ack takes back the worker's own lease reclaimed while it was away,
-  -- if its task has waited since (ADR 0026).
+  -- if its task has waited since (ADR 0027).
   live <- if inFlight then pure True else revive paths (Just worker) reference
   if live
     then liveLeaseOwned paths (Just worker) reference

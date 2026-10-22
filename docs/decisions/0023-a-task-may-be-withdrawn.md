@@ -1,4 +1,4 @@
-# 0022. A task may be withdrawn
+# 0023. A task may be withdrawn
 
 Status: accepted
 
@@ -39,7 +39,7 @@ lease acts on nothing and is answered `withdrawn` where it would have been
 `stale`; the command still exits 4, since the lease is dead
 ([INV-6](../invariants.md)). A `send` or `fetch` on it exits 4 as before.
 A lease reclaimed while its worker was away, whose task is withdrawn while
-it waits to be taken back ([ADR 0026](0026-a-worker-survives-its-link.md)),
+it waits to be taken back ([ADR 0027](0027-a-worker-survives-its-link.md)),
 gets a withdrawal record too. `gc --older-than` deletes withdrawal records
 that old, as it deletes finished tasks.
 

@@ -67,7 +67,7 @@ data Connection = Connection
   , failLeaseWith :: LeaseRef -> T.Text -> Retry -> IO (Either SpoolError ())
   , withAttachment :: LeaseRef -> SA.Attachment -> Int64 -> (Handle -> IO ()) -> IO ()
     -- ^ Run an action on a handle that reads the attachment's bytes after
-    -- the first so many, which the worker already holds (ADR 0026).
+    -- the first so many, which the worker already holds (ADR 0027).
   , sendResultAttachment :: LeaseRef -> SA.Attachment -> FilePath -> IO (Either SpoolError ())
     -- ^ Send the file at this path as a result attachment under the lease.
     -- A stale lease, or a grant with no room for it now or ever, is

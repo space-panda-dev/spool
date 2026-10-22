@@ -1,4 +1,4 @@
-# 0026. A worker survives its link
+# 0027. A worker survives its link
 
 Status: accepted
 

@@ -3,10 +3,10 @@
 Guidance for anyone changing Spool, coding agents and people alike. `CLAUDE.md`
 imports it; tool-specific additions go there, never a second copy.
 
-Read [README.md](README.md), [docs/invariants.md](docs/invariants.md), and the
-[decision records](docs/decisions/README.md) before changing the protocol or
-what Spool promises. Read [spec/protocol.md](spec/protocol.md) before changing
-any command, file, or exit code.
+Start at [MAP.md](MAP.md): it names, for each area, the code, the tests, the
+section of [spec/protocol.md](spec/protocol.md) and the decision records that
+govern it. Read that section and those records before changing the area, and
+[docs/invariants.md](docs/invariants.md) before changing what Spool promises.
 
 ## How to work
 
@@ -24,6 +24,12 @@ any command, file, or exit code.
   [docs/open-questions.md](docs/open-questions.md).
 
 ## Checks
+
+`wf suites` lists the suites in `.workshop.toml` and `wf check` runs them:
+`--tier 5` (structure, build, demo) before a commit, `--tier 30 --changed`
+while working, `--tier 300` before a merge. Cabal suites run on the laptop;
+`bash test.sh SECTION...` runs part of the integration suite against a binary
+built from this tree, and refuses one found on `PATH`.
 
 `make check` validates the repository's structure: links resolve, every
 document is linked from somewhere, every decision record is indexed, cited

@@ -46,10 +46,10 @@ data WorkConfig = WorkConfig
   { wcMaxConcurrent :: Int
   , wcPrefetch :: Int
     -- ^ How many tasks the worker leases and fetches ahead of those its
-    -- programs run (ADR 0025). 0, the default, leases none ahead.
+    -- programs run (ADR 0026). 0, the default, leases none ahead.
   , wcMinFreeBytes :: Maybe Int64
     -- ^ The free space a fetch must leave where working directories are
-    -- made, while another task of the worker holds one (ADR 0025). No
+    -- made, while another task of the worker holds one (ADR 0026). No
     -- floor when it is not given.
   , wcRenewSeconds :: Int
   , wcEnv :: [(String, String)]

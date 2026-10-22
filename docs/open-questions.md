@@ -18,11 +18,11 @@ than guessing.
   way around the question, not an answer to it.
 - Is there a hard cancel for a running task? A withdrawn task's worker
   stops its run at its next renewal
-  ([ADR 0022](decisions/0022-a-task-may-be-withdrawn.md)); nothing reaches
+  ([ADR 0023](decisions/0023-a-task-may-be-withdrawn.md)); nothing reaches
   a worker sooner, since workers pull.
 - Should a task's priority change once it is put? Putting it again with
   another priority changes nothing
-  ([ADR 0024](decisions/0024-leases-follow-put-order-and-priority.md)).
+  ([ADR 0025](decisions/0025-leases-follow-put-order-and-priority.md)).
 - How do an attachment's bytes reach the spool from another machine? A task
   put through the remote command may declare none ([ADR 0015](decisions/0015-a-grant-may-let-its-holder-put.md)).
   A result's attachments do reach it, by `send` under a lease
@@ -47,7 +47,7 @@ than guessing.
   refused is found only when the program finishes, so the program runs to
   the end of work that can no longer be acknowledged. A renewal answered
   `withdrawn` does stop it
-  ([ADR 0022](decisions/0022-a-task-may-be-withdrawn.md)).
+  ([ADR 0023](decisions/0023-a-task-may-be-withdrawn.md)).
 
 ## Access
 

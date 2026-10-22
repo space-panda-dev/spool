@@ -22,11 +22,23 @@
       # build during evaluation, and then nobody can evaluate this flake for
       # a system they cannot build for, such as a Linux host's configuration
       # from a Mac. The check below keeps the file current.
-      package = pkgs: pkgs.haskell.lib.enableCabalFlag
-        (pkgs.haskell.lib.overrideSrc
-          (pkgs.haskellPackages.callPackage ./nix/spool.nix { })
-          { src = ./.; })
-        "werror";
+      #
+      # `spool --version` names the commit it was built from (ADR 0022):
+      # the flake's own revision, or its dirty revision for a tree with
+      # uncommitted changes, written into src/Spool.hs before the build.
+      commit = self.rev or self.dirtyRev or "unknown";
+      package = pkgs: pkgs.haskell.lib.overrideCabal
+        (pkgs.haskell.lib.enableCabalFlag
+          (pkgs.haskell.lib.overrideSrc
+            (pkgs.haskellPackages.callPackage ./nix/spool.nix { })
+            { src = ./.; })
+          "werror")
+        (drv: {
+          postPatch = (drv.postPatch or "") + ''
+            substituteInPlace src/Spool.hs \
+              --replace-fail 'buildCommit = "unknown"' 'buildCommit = "${commit}"'
+          '';
+        });
     in {
       packages = forEachSystem (system:
         let
@@ -69,7 +81,7 @@
             nativeBuildInputs = [ pkgs.coreutils ];
           } ''
             test -x ${spool}/bin/spool
-            test "$(${spool}/bin/spool --version)" = "spool 0.0.5"
+            test "$(${spool}/bin/spool --version)" = "spool 0.0.5 ${commit}"
             touch "$out"
           '';
 
@@ -85,6 +97,7 @@
             ];
           } ''
             SPOOL=${spool}/bin/spool SPOOL_FIXTURES=${./test/fixtures} \
+              SPOOL_COMMIT=${commit} \
               ${pkgs.bash}/bin/bash ${./test.sh}
             touch "$out"
           '';

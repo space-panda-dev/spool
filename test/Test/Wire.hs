@@ -166,7 +166,7 @@ taskTests =
   , refused "a missing capability" "{\"task_id\":\"t\",\"payload\":1}"
   , refused "an unknown field"
       "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"rank\":9}"
-  , testCase "a task may give a priority (ADR 0024)" $
+  , testCase "a task may give a priority (ADR 0025)" $
       fmap taskPriority
         (parseTask "{\"task_id\":\"t\",\"capability\":\"c@1\",\"payload\":1,\"priority\":-9}")
         @?= Right (-9)
@@ -328,7 +328,7 @@ requestTests =
       parseFetchRequest
         ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\"}")
         @?= Right (FetchRequest reference (sha 'a') 0)
-  , testCase "a fetch request may ask from an offset (ADR 0026)" $
+  , testCase "a fetch request may ask from an offset (ADR 0027)" $
       parseFetchRequest
         ("{\"task_id\":\"t\",\"lease_id\":\"lease_1_1_t\",\"sha256\":\"" <> digest <> "\",\"offset\":5}")
         @?= Right (FetchRequest reference (sha 'a') 5)
@@ -341,7 +341,7 @@ requestTests =
   , testCase "a fetch from an offset says where" $
       parseFetchRequest (encode (FetchRequest reference (sha 'a') 7))
         @?= Right (FetchRequest reference (sha 'a') 7)
-  , testCase "withdraw answers name the task (ADR 0022)" $
+  , testCase "withdraw answers name the task (ADR 0023)" $
       map (encodeWithdrawResult taskOne) [minBound .. maxBound]
         @?= [ "{\"status\":\"withdrawn\",\"task_id\":\"t\"}"
             , "{\"status\":\"finished\",\"task_id\":\"t\"}"
@@ -349,7 +349,7 @@ requestTests =
   , testCase "a lease whose task was withdrawn is answered so" $
       encodeWithdrawnResult reference
         @?= "{\"lease_id\":\"lease_1_1_t\",\"status\":\"withdrawn\",\"task_id\":\"t\"}"
-  , testCase "a pending task is listed with its priority (ADR 0023)" $
+  , testCase "a pending task is listed with its priority (ADR 0024)" $
       encode (PendingLine taskOne 3)
         @?= "{\"priority\":3,\"state\":\"pending\",\"task_id\":\"t\"}"
   , testCase "a leased task is listed with its lease, worker, and times" $

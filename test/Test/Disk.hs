@@ -1,4 +1,4 @@
--- | The floor a fetch must leave on the worker's disk (ADR 0025): reading
+-- | The floor a fetch must leave on the worker's disk (ADR 0026): reading
 -- what @df -P -k@ says, and when a fetch may begin.
 module Test.Disk (tests) where
 

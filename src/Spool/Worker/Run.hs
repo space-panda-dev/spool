@@ -145,7 +145,7 @@ retryAfterExit :: Int -> Retry
 retryAfterExit 65 = NoRetry
 retryAfterExit _ = Retry
 
--- | What the tasks a worker holds share (ADR 0025): the slots its programs
+-- | What the tasks a worker holds share (ADR 0026): the slots its programs
 -- run in, free and waited for, the tasks it holds, the free space a fetch
 -- must leave while a task leased before it is held, and how to measure it.
 data Pool = Pool
@@ -195,7 +195,7 @@ runWork spool configPath maxTasks follow = do
 
 -- | The worker, given how to wait so many seconds.
 --
--- It holds up to `max_concurrent` plus `prefetch` leases at once (ADR 0025).
+-- It holds up to `max_concurrent` plus `prefetch` leases at once (ADR 0026).
 -- A task fetches its attachments as soon as it is leased, and then waits
 -- for one of `max_concurrent` slots to run its program in, so a task leased
 -- ahead is fetched while the one before it runs. With `prefetch` 0 every
@@ -254,7 +254,7 @@ workWith sleep spool config maxTasks follow = do
     stopAll running = readIORef running >>= mapM_ cancel
 
 -- | Before leasing a task while another is held, wait for the free space
--- `min_free_bytes` asks for (ADR 0025): the waits start at 1 second and
+-- `min_free_bytes` asks for (ADR 0026): the waits start at 1 second and
 -- double up to the renewal interval. With no floor, or nothing held, it
 -- does not wait.
 roomToLeaseAhead :: (Int -> IO ()) -> Pool -> Int -> IO ()
@@ -309,7 +309,7 @@ runOneLease spool config pool ticket lease = do
 -- | Fetch, run, send, and acknowledge one task while its lease is renewed.
 -- A renewal answered @withdrawn@ stops the run at once: its program is
 -- ended and its working directory removed, and nothing has failed
--- (ADR 0022).
+-- (ADR 0023).
 runExecutable
   :: Connection -> WorkConfig -> Pool -> Int -> Task -> LeaseId -> CapabilityConfig
   -> BL.ByteString -> IO ()
@@ -375,7 +375,7 @@ attachmentBytes :: Task -> Integer
 attachmentBytes task = sum (map (toInteger . SA.attachmentSize) (taskAttachments task))
 
 -- | Before a task fetches, wait while the fetch would take the disk under
--- `min_free_bytes` and a task leased before it is still held (ADR 0025),
+-- `min_free_bytes` and a task leased before it is still held (ADR 0026),
 -- renewing the lease. The first task held never waits, so the tasks held
 -- cannot wait for each other. False when the lease ended meanwhile.
 awaitRoomToFetch
@@ -405,7 +405,7 @@ whileLeased renewing seconds = do
 
 -- | Make a request again after the transport failed to carry it, or the
 -- spool could not answer it (exit 75), for as long as the lease is renewed
--- (ADR 0026). The waits start at 1 second and double up to the renewal
+-- (ADR 0027). The waits start at 1 second and double up to the renewal
 -- interval. Nothing when the lease ended in a wait.
 persisting :: (String -> IO ()) -> (Int -> IO Bool) -> Int -> String -> IO a -> IO (Maybe a)
 persisting say pause capSeconds what request = go False (min 1 capSeconds)
@@ -428,7 +428,7 @@ persisting say pause capSeconds what request = go False (min 1 capSeconds)
 -- the rules is the program's doing, and fails the task for good. A grant
 -- with no room for a file now is waited for (ADR 0021), and one that could
 -- never hold it fails the task for good. A send the transport could not
--- carry is made again (ADR 0026).
+-- carry is made again (ADR 0027).
 returned
   :: Connection -> LeaseRef -> WorkConfig -> CapabilityConfig -> (Int -> IO Bool)
   -> (String -> IO ()) -> FilePath -> RunOutcome -> IO Returned
@@ -468,7 +468,7 @@ digestOf = T.unpack . SA.sha256Text . SA.attachmentSha256
 -- | Receive every declared attachment into the working directory, verified.
 -- Bytes arrive in a partial file beside where the attachment goes; a fetch
 -- the transport could not finish is asked again from where the partial
--- file ends, for as long as the lease is renewed (ADR 0026), and the whole
+-- file ends, for as long as the lease is renewed (ADR 0027), and the whole
 -- file is verified before it is given its name. False when the lease ended
 -- while a fetch waited to be asked again.
 receiveTaskAttachments
@@ -531,7 +531,7 @@ removeWorkerDirectory directory = do
 -- | Renew the lease at each interval until a renewal is refused, and answer
 -- with the refusal. A renewal the transport could not carry, or the spool
 -- could not answer (exit 75), is said once and tried again at the next
--- interval (ADR 0026): a lease reclaimed meanwhile is taken back by the
+-- interval (ADR 0027): a lease reclaimed meanwhile is taken back by the
 -- next renewal that arrives, if nobody has leased its task since. It ends
 -- no other way but by being stopped.
 renewalLoop :: (String -> IO ()) -> Connection -> LeaseRef -> Int -> IO SpoolError

@@ -1,4 +1,4 @@
-# 0023. Status lists each task pending or leased
+# 0024. Status lists each task pending or leased
 
 Status: accepted
 
@@ -16,7 +16,7 @@ The operator asked for this on 2026-10-21.
 
 **`status --json --tasks` writes one line for each task pending or
 leased.** Pending tasks come first, in the order they will be leased
-([ADR 0024](0024-leases-follow-put-order-and-priority.md)), then leased
+([ADR 0025](0025-leases-follow-put-order-and-priority.md)), then leased
 ones, in the order they were leased:
 
 ```json

@@ -30,7 +30,7 @@ tests = testGroup "worker configuration"
       wcMinFreeBytes config @?= Nothing
       wcRenewSeconds config @?= 30
       wcEnv config @?= []
-  , testCase "a worker may lease ahead, above a floor of free space (ADR 0025)" $ do
+  , testCase "a worker may lease ahead, above a floor of free space (ADR 0026)" $ do
       config <- parsed (document "\"prefetch\":1,\"min_free_bytes\":6000000000," capabilityBody)
       (wcPrefetch config, wcMinFreeBytes config) @?= (1, Just 6000000000)
       parseWorkConfig (encodeWorkConfig config) @?= Right config

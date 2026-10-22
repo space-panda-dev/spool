@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# The integration suite: the spool binary against the protocol, in sections.
+#
+#   bash test.sh                  every section
+#   bash test.sh grants work      these sections and the ones they need;
+#                                 SPOOL_ONLY="grants work" says the same
+#   bash test.sh --list           each section, what it covers, what it needs
+#
+# SPOOL names the binary under test by its absolute path; without it the
+# suite builds one from this tree with cabal. SPOOL_COMMIT, when set, is the
+# commit that binary must say it was built from (the flake sets both).
 set -euo pipefail
 
 # Say where the suite stopped. The trap also fires where a failure is expected
@@ -7,33 +17,138 @@ set -E
 trap 'if [[ $- == *e* ]]; then echo "test.sh: line $LINENO failed: $BASH_COMMAND" >&2; fi' ERR
 
 here=$(cd "$(dirname "$0")" && pwd)
+
+# Sections run in this order. Each starts from the programs and helpers
+# below and nothing else, except for the sections it needs, which run first.
+sections=(queue retention work attachments grants remote follow lifecycle outputs scheduling)
+about() {
+  case $1 in
+    queue) echo "put, lease, renew, fail, ack: idempotency, fencing, attempts, recovery" ;;
+    retention) echo "collect and gc, the 0.0.2 layout, listing order, corrupt sidecars" ;;
+    work) echo "the local worker: programs, timeouts, signals, limits, concurrency" ;;
+    attachments) echo "task attachments: declared, staged, verified, fetched, removed" ;;
+    grants) echo "grants and the forced command: records, exact remote grammar, revoke" ;;
+    remote) echo "another machine: put through a grant, work --via, remote failures" ;;
+    follow) echo "a worker that follows its spool: idle waits, signals, flaky transport" ;;
+    lifecycle) echo "attempts, retention and following together (ADRs 0017-0019)" ;;
+    outputs) echo "result attachments: send, take, limits, waiting for room, 0.0.3 records" ;;
+    scheduling) echo "withdraw, status per task, put order and priority, prefetch, a worker's link (ADRs 0023-0027)" ;;
+  esac
+}
+needs() {
+  case $1 in
+    grants) echo attachments ;;
+    remote) echo grants ;;
+    follow) echo remote ;;
+    scheduling) echo outputs ;;
+  esac
+}
+
+usage() {
+  echo "usage: bash test.sh [--list] [SECTION...]   (or SPOOL_ONLY=\"SECTION...\")" >&2
+  echo "sections: ${sections[*]}" >&2
+  exit 2
+}
+asked=()
+case ${1:-} in
+  --list)
+    for name in "${sections[@]}"; do
+      printf '%-12s %s%s\n' "$name" "$(about "$name")" "$(n=$(needs "$name"); [[ -n $n ]] && echo " (needs $n)")"
+    done
+    exit 0 ;;
+  -h|--help) usage ;;
+esac
+if (($# > 0)); then asked=("$@"); elif [[ -n ${SPOOL_ONLY:-} ]]; then read -r -a asked <<<"$SPOOL_ONLY"; fi
+for name in "${asked[@]}"; do
+  [[ " ${sections[*]} " == *" $name "* ]] || { echo "test.sh: no section '$name'" >&2; usage; }
+done
+# What runs: every section asked for and what it needs, in the order above.
+chosen=" "
+choose() {
+  [[ $chosen == *" $1 "* ]] && return 0
+  local need
+  need=$(needs "$1")
+  [[ -z $need ]] || choose "$need"
+  chosen+="$1 "
+}
+if ((${#asked[@]} == 0)); then
+  chosen=" ${sections[*]} "
+else
+  for name in "${asked[@]}"; do choose "$name"; done
+fi
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 checks=0
 check() { checks=$((checks + 1)); }
 
-spool_binary=${SPOOL:-$work/spool-bin}
+# The binary under test is one built from this tree, never whichever `spool`
+# PATH holds: the suite once passed while running an installed spool rather
+# than the one it was meant to test.
+die() { echo "test.sh: $*" >&2; exit 2; }
 if [[ -z ${SPOOL:-} ]]; then
-  ghc_flags=(-O1 -threaded -Wall -Werror
-    -package aeson -package bytestring -package crypton -package directory
-    -package filepath -package memory -package process -package text -package time
-    -package unix)
-  if [[ -n ${SPOOL_GHC_PACKAGE_ENV:-} ]]; then
-    ghc_flags+=(-package-env "$SPOOL_GHC_PACKAGE_ENV")
-  fi
-  mkdir "$work/hs"
-  ghc "${ghc_flags[@]}" -i"$here/src" -outputdir "$work/hs" -o "$spool_binary" \
-    "$here/app/Main.hs" >/dev/null
+  command -v cabal >/dev/null || die "no SPOOL and no cabal: set SPOOL to a spool built from this tree"
+  (cd "$here" && cabal build -v0 -f werror --enable-tests exe:spool) \
+    || die "cabal could not build spool in $here"
+  SPOOL=$(cd "$here" && cabal list-bin -v0 -f werror --enable-tests spool)
 fi
-test -x "$spool_binary" || { echo "set SPOOL to a compiled spool binary" >&2; exit 2; }
-test "$($spool_binary --version)" = "spool 0.0.5"; check
+[[ $SPOOL == /* ]] || die "SPOOL must be an absolute path; '$SPOOL' would be looked up on PATH"
+test -x "$SPOOL" || die "SPOOL=$SPOOL is not an executable file"
+on_path=$(command -v spool 2>/dev/null || true)
+if [[ -n $on_path && $(realpath "$on_path") == $(realpath "$SPOOL") ]]; then
+  die "SPOOL=$SPOOL is the spool on PATH ($on_path), not one built from this tree; unset SPOOL to build one"
+fi
+spool_binary=$SPOOL
+read -r version_name version_number version_commit version_rest < <("$spool_binary" --version) || true
+test "$version_name $version_number" = "spool 0.0.5" \
+  || die "SPOOL=$SPOOL says '$("$spool_binary" --version)', not spool 0.0.5"
+[[ -n ${version_commit:-} && -z ${version_rest:-} ]] \
+  || die "SPOOL=$SPOOL does not name its commit in --version"
+if [[ -n ${SPOOL_COMMIT:-} ]]; then
+  test "$version_commit" = "$SPOOL_COMMIT" \
+    || die "SPOOL=$SPOOL was built from $version_commit, not $SPOOL_COMMIT"
+elif [[ $version_commit != unknown ]] && tree_commit=$(git -C "$here" rev-parse HEAD 2>/dev/null); then
+  test "${version_commit%-dirty}" = "$tree_commit" \
+    || die "SPOOL=$SPOOL was built from $version_commit, but this tree is $tree_commit"
+fi
+check
+# Anything below that reaches for `spool` on PATH, from a script or `sh -c`
+# where the function below is not defined, stops here instead.
+mkdir "$work/no-spool-on-path"
+cat > "$work/no-spool-on-path/spool" <<'SCRIPT'
+#!/bin/sh
+echo "test.sh: a bare 'spool' was run from PATH; run \"\$spool_binary\" instead" >&2
+exit 99
+SCRIPT
+chmod +x "$work/no-spool-on-path/spool"
+PATH="$work/no-spool-on-path:$PATH"
 
 # Files the suite reads, beside it or where the flake check puts them.
 fixtures=${SPOOL_FIXTURES:-$here/test/fixtures}
 test -f "$fixtures/spool-0.0.2-layout.tar"
 
 spool() { "$spool_binary" --dir "$work/spool" "$@"; }
+
+# wait_for SECONDS COMMAND...: run COMMAND every tenth of a second until it
+# succeeds, or fail once SECONDS have passed. Every wait for a condition in
+# this suite is this one; a fixed sleep is left only where the time itself is
+# what a test is about.
+wait_for() {
+  local deadline=$(( ${EPOCHREALTIME/./} + $1 * 1000000 ))
+  shift
+  until "$@"; do
+    (( ${EPOCHREALTIME/./} < deadline )) || return 1
+    sleep 0.1
+  done
+}
+eventually() { wait_for 5 "$@"; }
+# Conditions to wait for.
+exists() { test -e "$1"; }
+nonempty() { test -s "$1"; }
+has_entries() { test -n "$(ls -A "$1" 2>/dev/null)"; }
+files_at_least() { test "$(find "$1" -type f 2>/dev/null | wc -l | tr -d ' ')" -ge "$2"; }
+gone() { ! kill -0 "$1" 2>/dev/null; }
 
 # Capture an exit status without letting errexit hide the result.
 expect_exit() {
@@ -46,7 +161,226 @@ expect_exit() {
   test "$actual" -eq "$expected"
   check
 }
+# ADR 0018: finished work is collected, or ages out. These helpers drive the
+# real writers on the spool in one directory of the work area, with one task
+# pending at a time, so that each lease takes the task meant.
+in_spool() { local dir=$1; shift; "$spool_binary" --dir "$work/$dir" "$@"; }
+put_one() { printf '{"task_id":"%s","capability":"keep@1","payload":{}}\n' "$2" | in_spool "$1" put; }
+lease_one() { in_spool "$1" lease --worker keeper | jq -r '.lease_id'; }
+ack_one() {
+  jq -nc --arg task "$2" --arg lease "$3" '{task_id:$task,lease_id:$lease,result:{kept:$task}}' \
+    | in_spool "$1" ack
+}
+fail_one() {
+  jq -nc --arg task "$2" --arg lease "$3" '{task_id:$task,lease_id:$lease,reason:"kept"}' \
+    | in_spool "$1" fail "${@:4}"
+}
+collect_ids() { local dir=$1; shift; printf '{"task_id":"%s"}\n' "$@" | in_spool "$dir" collect; }
+# A done task with one retried failure behind it; prints the finishing lease.
+finish_with_history() {
+  local lease
+  put_one "$1" "$2" >/dev/null
+  lease=$(lease_one "$1")
+  fail_one "$1" "$2" "$lease" >/dev/null
+  lease=$(lease_one "$1")
+  ack_one "$1" "$2" "$lease" >/dev/null
+  printf '%s\n' "$lease"
+}
+# Make a record as old as this many seconds before now.
+age_record() {
+  jq -c --arg field "$2" --argjson age "$3" '.[$field] = ((now - $age) | floor | todate)' "$1" \
+    > "$work/aged.json"
+  mv -f "$work/aged.json" "$1"
+}
+records_of() { find "$work/$1/results" "$work/$1/failed" -name "*_$2.json"; }
 
+# The programs the worker sections run, and the configuration that maps a
+# capability to one.
+bin="$work/bin"
+mkdir -p "$bin"
+
+cat > "$bin/echo-classify" <<'SCRIPT'
+#!/bin/sh
+payload=$(cat)
+printf '{"echoed":%s}\n' "$payload"
+SCRIPT
+chmod +x "$bin/echo-classify"
+
+cat > "$bin/crash-three" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+echo "deliberate crash for the spool worker test" >&2
+exit 3
+SCRIPT
+chmod +x "$bin/crash-three"
+
+cat > "$bin/hopeless" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+echo "this payload can never be classified" >&2
+exit 65
+SCRIPT
+chmod +x "$bin/hopeless"
+
+grandchild_pidfile="$work/grandchild-pid"
+cat > "$bin/sleeper" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+# A grandchild in the same process group, so the timeout kill can be proven
+# to reach more than the immediate child.
+sh -c 'echo \$\$ > "$grandchild_pidfile"; sleep 30' &
+sleep 5
+printf '{"slept":true}\n'
+SCRIPT
+chmod +x "$bin/sleeper"
+
+stubborn_pidfile="$work/stubborn-pid"
+stubborn_finished="$work/stubborn-finished"
+cat > "$bin/stubborn" <<SCRIPT
+#!/bin/sh
+# Ignores SIGTERM, as do the sleeps it starts, so only SIGKILL ends it early.
+trap '' TERM
+cat >/dev/null
+echo \$\$ > "$stubborn_pidfile"
+i=0
+while [ "\$i" -lt 150 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+: > "$stubborn_finished"
+printf '{"stubborn":true}\n'
+SCRIPT
+chmod +x "$bin/stubborn"
+
+cat > "$bin/ignores-stdin" <<'SCRIPT'
+#!/bin/sh
+# Never reads its payload, so a payload too big for the pipe stays unwritten.
+sleep 3
+printf '{"ignored":true}\n'
+SCRIPT
+chmod +x "$bin/ignores-stdin"
+
+leftover_pidfile="$work/leftover-pid"
+leftover_finished="$work/leftover-finished"
+cat > "$bin/leaves-one-behind" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+# Starts a process that ignores SIGTERM and holds this script's output open,
+# then answers and exits as if nothing were left running.
+sh -c 'trap "" TERM; echo \$\$ > "$leftover_pidfile"
+  i=0; while [ "\$i" -lt 150 ]; do sleep 0.1; i=\$((i + 1)); done
+  : > "$leftover_finished"' &
+i=0
+while [ ! -s "$leftover_pidfile" ] && [ "\$i" -lt 50 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"answered":true}\n'
+SCRIPT
+chmod +x "$bin/leaves-one-behind"
+
+interrupted_pidfile="$work/interrupted-pid"
+interrupted_asked="$work/interrupted-asked"
+cat > "$bin/runs-until-stopped" <<SCRIPT
+#!/bin/sh
+# Notes that it was asked to stop, and stops.
+trap ': > "$interrupted_asked"; exit 0' TERM
+cat >/dev/null
+echo \$\$ > "$interrupted_pidfile"
+i=0
+while [ "\$i" -lt 300 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"finished":true}\n'
+SCRIPT
+chmod +x "$bin/runs-until-stopped"
+
+cat > "$bin/big-output" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+yes 0123456789 | head -c 200000
+SCRIPT
+chmod +x "$bin/big-output"
+
+cat > "$bin/env-check" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+if [ -n "${HOME:-}" ]; then
+  printf '{"has_home":true}\n'
+else
+  printf '{"has_home":false}\n'
+fi
+SCRIPT
+chmod +x "$bin/env-check"
+
+cat > "$bin/not-json" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+printf 'not json at all\n'
+SCRIPT
+chmod +x "$bin/not-json"
+
+lockdir="$work/exclusive-lock"
+cat > "$bin/no-overlap" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+if ! mkdir "$lockdir" 2>/dev/null; then
+  exit 9
+fi
+sleep 0.3
+rmdir "$lockdir"
+printf '{"ok":true}\n'
+SCRIPT
+chmod +x "$bin/no-overlap"
+
+startdir="$work/started"
+mkdir -p "$startdir"
+releasefile="$work/release"
+cat > "$bin/wait-for-release" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+: > "$startdir/started-\$\$"
+i=0
+while [ ! -f "$releasefile" ] && [ "\$i" -lt 100 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"released":true}\n'
+SCRIPT
+chmod +x "$bin/wait-for-release"
+
+late_start="$work/late-started"
+late_release="$work/late-release"
+cat > "$bin/wait-for-late-release" <<SCRIPT
+#!/bin/sh
+cat >/dev/null
+: > "$late_start"
+i=0
+while [ ! -f "$late_release" ] && [ "\$i" -lt 100 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"late":true}\n'
+SCRIPT
+chmod +x "$bin/wait-for-late-release"
+
+# The executables are given the tools this suite itself runs with, and
+# nothing else. A fixed /usr/bin:/bin has no cat inside a Nix sandbox on
+# Linux, where the tools live in the store.
+worker_path=$PATH
+
+worker_config() {
+  # worker_config CAPABILITY EXEC TIMEOUT MAXBYTES [MAX_CONCURRENT] [MAX_OUTPUT_BYTES]
+  jq -nc --arg cap "$1" --arg exec "$2" --argjson timeout "$3" --argjson maxbytes "$4" \
+    --argjson concurrent "${5:-1}" --argjson maxoutput "${6:-65536}" \
+    --arg path "$worker_path" \
+    '{max_concurrent: $concurrent, renew_seconds: 30, env: {PATH: $path},
+      capabilities: {($cap): {exec: $exec, args: [], timeout_seconds: $timeout,
+        max_payload_bytes: $maxbytes, max_output_bytes: $maxoutput}}}'
+}
+
+section_queue() {
 spool init
 
 task_one='{"task_id":"task-one","capability":"classify@1","payload":{"input":"one","parameters":{"mode":"preview"}}}'
@@ -316,7 +650,7 @@ jq -c '{task_id, lease_id, result: {opaque: true}}' "$work/opaque-lease.jsonl" \
   | spool ack | jq -e '.status == "acked"' >/dev/null; check
 
 # A stale renew and fail are both fenced with exit 4. A reclaimed lease is
-# stale to a renewal once its task has been leased again (ADR 0026).
+# stale to a renewal once its task has been leased again (ADR 0027).
 stale_renew_task='{"task_id":"task-stale-renew","capability":"classify@1","payload":{}}'
 printf '%s\n' "$stale_renew_task" | spool put >/dev/null
 spool lease --worker renewer2 > "$work/stale-renew-lease.jsonl"
@@ -662,38 +996,9 @@ set -e
 test "$other_result_exit" -eq 4; check
 jq -e '.status == "stale"' "$work/interrupted-ack-other.out" >/dev/null; check
 
-# ADR 0018: finished work is collected, or ages out. These helpers drive the
-# real writers on the spool in one directory of the work area, with one task
-# pending at a time, so that each lease takes the task meant.
-in_spool() { local dir=$1; shift; "$spool_binary" --dir "$work/$dir" "$@"; }
-put_one() { printf '{"task_id":"%s","capability":"keep@1","payload":{}}\n' "$2" | in_spool "$1" put; }
-lease_one() { in_spool "$1" lease --worker keeper | jq -r '.lease_id'; }
-ack_one() {
-  jq -nc --arg task "$2" --arg lease "$3" '{task_id:$task,lease_id:$lease,result:{kept:$task}}' \
-    | in_spool "$1" ack
 }
-fail_one() {
-  jq -nc --arg task "$2" --arg lease "$3" '{task_id:$task,lease_id:$lease,reason:"kept"}' \
-    | in_spool "$1" fail "${@:4}"
-}
-collect_ids() { local dir=$1; shift; printf '{"task_id":"%s"}\n' "$@" | in_spool "$dir" collect; }
-# A done task with one retried failure behind it; prints the finishing lease.
-finish_with_history() {
-  local lease
-  put_one "$1" "$2" >/dev/null
-  lease=$(lease_one "$1")
-  fail_one "$1" "$2" "$lease" >/dev/null
-  lease=$(lease_one "$1")
-  ack_one "$1" "$2" "$lease" >/dev/null
-  printf '%s\n' "$lease"
-}
-# Make a record as old as this many seconds before now.
-age_record() {
-  jq -c --arg field "$2" --argjson age "$3" '.[$field] = ((now - $age) | floor | todate)' "$1" \
-    > "$work/aged.json"
-  mv -f "$work/aged.json" "$1"
-}
-records_of() { find "$work/$1/results" "$work/$1/failed" -name "*_$2.json"; }
+
+section_retention() {
 
 # collect deletes a finished task, done or finally failed, with its result
 # and every failure record, and answers every line; a pending or leased task
@@ -769,7 +1074,7 @@ z_lease=$(lease_one aging)
 fail_one aging z-retrying "$z_lease" >/dev/null
 # A task that failed finally long ago and has been put again is pending.
 # z-retrying, put first, waits in pending; f-again is put above it, so the
-# lease takes f-again (ADR 0024).
+# lease takes f-again (ADR 0025).
 printf '{"task_id":"f-again","capability":"keep@1","payload":{},"priority":1}\n' \
   | in_spool aging put >/dev/null
 f_again_lease=$(lease_one aging)
@@ -946,193 +1251,12 @@ bad_renewal_lease=$(jq -r '.lease_id' "$work/bad-renewal-lease.jsonl")
 printf 'not-an-integer\n' > "$work/corrupt-sidecars/leased/$bad_renewal_lease.renewed"
 expect_exit 70 spools reclaim --older-than 0
 
+}
+
+section_work() {
 #############################################################################
 # The worker: spool work maps a leased capability to a configured executable.
 #############################################################################
-
-bin="$work/bin"
-mkdir -p "$bin"
-
-cat > "$bin/echo-classify" <<'SCRIPT'
-#!/bin/sh
-payload=$(cat)
-printf '{"echoed":%s}\n' "$payload"
-SCRIPT
-chmod +x "$bin/echo-classify"
-
-cat > "$bin/crash-three" <<'SCRIPT'
-#!/bin/sh
-cat >/dev/null
-echo "deliberate crash for the spool worker test" >&2
-exit 3
-SCRIPT
-chmod +x "$bin/crash-three"
-
-cat > "$bin/hopeless" <<'SCRIPT'
-#!/bin/sh
-cat >/dev/null
-echo "this payload can never be classified" >&2
-exit 65
-SCRIPT
-chmod +x "$bin/hopeless"
-
-grandchild_pidfile="$work/grandchild-pid"
-cat > "$bin/sleeper" <<SCRIPT
-#!/bin/sh
-cat >/dev/null
-# A grandchild in the same process group, so the timeout kill can be proven
-# to reach more than the immediate child.
-sh -c 'echo \$\$ > "$grandchild_pidfile"; sleep 30' &
-sleep 5
-printf '{"slept":true}\n'
-SCRIPT
-chmod +x "$bin/sleeper"
-
-stubborn_pidfile="$work/stubborn-pid"
-stubborn_finished="$work/stubborn-finished"
-cat > "$bin/stubborn" <<SCRIPT
-#!/bin/sh
-# Ignores SIGTERM, as do the sleeps it starts, so only SIGKILL ends it early.
-trap '' TERM
-cat >/dev/null
-echo \$\$ > "$stubborn_pidfile"
-i=0
-while [ "\$i" -lt 150 ]; do
-  sleep 0.1
-  i=\$((i + 1))
-done
-: > "$stubborn_finished"
-printf '{"stubborn":true}\n'
-SCRIPT
-chmod +x "$bin/stubborn"
-
-cat > "$bin/ignores-stdin" <<'SCRIPT'
-#!/bin/sh
-# Never reads its payload, so a payload too big for the pipe stays unwritten.
-sleep 3
-printf '{"ignored":true}\n'
-SCRIPT
-chmod +x "$bin/ignores-stdin"
-
-leftover_pidfile="$work/leftover-pid"
-leftover_finished="$work/leftover-finished"
-cat > "$bin/leaves-one-behind" <<SCRIPT
-#!/bin/sh
-cat >/dev/null
-# Starts a process that ignores SIGTERM and holds this script's output open,
-# then answers and exits as if nothing were left running.
-sh -c 'trap "" TERM; echo \$\$ > "$leftover_pidfile"
-  i=0; while [ "\$i" -lt 150 ]; do sleep 0.1; i=\$((i + 1)); done
-  : > "$leftover_finished"' &
-i=0
-while [ ! -s "$leftover_pidfile" ] && [ "\$i" -lt 50 ]; do
-  sleep 0.1
-  i=\$((i + 1))
-done
-printf '{"answered":true}\n'
-SCRIPT
-chmod +x "$bin/leaves-one-behind"
-
-interrupted_pidfile="$work/interrupted-pid"
-interrupted_asked="$work/interrupted-asked"
-cat > "$bin/runs-until-stopped" <<SCRIPT
-#!/bin/sh
-# Notes that it was asked to stop, and stops.
-trap ': > "$interrupted_asked"; exit 0' TERM
-cat >/dev/null
-echo \$\$ > "$interrupted_pidfile"
-i=0
-while [ "\$i" -lt 300 ]; do
-  sleep 0.1
-  i=\$((i + 1))
-done
-printf '{"finished":true}\n'
-SCRIPT
-chmod +x "$bin/runs-until-stopped"
-
-cat > "$bin/big-output" <<'SCRIPT'
-#!/bin/sh
-cat >/dev/null
-yes 0123456789 | head -c 200000
-SCRIPT
-chmod +x "$bin/big-output"
-
-cat > "$bin/env-check" <<'SCRIPT'
-#!/bin/sh
-cat >/dev/null
-if [ -n "${HOME:-}" ]; then
-  printf '{"has_home":true}\n'
-else
-  printf '{"has_home":false}\n'
-fi
-SCRIPT
-chmod +x "$bin/env-check"
-
-cat > "$bin/not-json" <<'SCRIPT'
-#!/bin/sh
-cat >/dev/null
-printf 'not json at all\n'
-SCRIPT
-chmod +x "$bin/not-json"
-
-lockdir="$work/exclusive-lock"
-cat > "$bin/no-overlap" <<SCRIPT
-#!/bin/sh
-cat >/dev/null
-if ! mkdir "$lockdir" 2>/dev/null; then
-  exit 9
-fi
-sleep 0.3
-rmdir "$lockdir"
-printf '{"ok":true}\n'
-SCRIPT
-chmod +x "$bin/no-overlap"
-
-startdir="$work/started"
-mkdir -p "$startdir"
-releasefile="$work/release"
-cat > "$bin/wait-for-release" <<SCRIPT
-#!/bin/sh
-cat >/dev/null
-: > "$startdir/started-\$\$"
-i=0
-while [ ! -f "$releasefile" ] && [ "\$i" -lt 100 ]; do
-  sleep 0.1
-  i=\$((i + 1))
-done
-printf '{"released":true}\n'
-SCRIPT
-chmod +x "$bin/wait-for-release"
-
-late_start="$work/late-started"
-late_release="$work/late-release"
-cat > "$bin/wait-for-late-release" <<SCRIPT
-#!/bin/sh
-cat >/dev/null
-: > "$late_start"
-i=0
-while [ ! -f "$late_release" ] && [ "\$i" -lt 100 ]; do
-  sleep 0.1
-  i=\$((i + 1))
-done
-printf '{"late":true}\n'
-SCRIPT
-chmod +x "$bin/wait-for-late-release"
-
-# The executables are given the tools this suite itself runs with, and
-# nothing else. A fixed /usr/bin:/bin has no cat inside a Nix sandbox on
-# Linux, where the tools live in the store.
-worker_path=$PATH
-
-worker_config() {
-  # worker_config CAPABILITY EXEC TIMEOUT MAXBYTES [MAX_CONCURRENT] [MAX_OUTPUT_BYTES]
-  jq -nc --arg cap "$1" --arg exec "$2" --argjson timeout "$3" --argjson maxbytes "$4" \
-    --argjson concurrent "${5:-1}" --argjson maxoutput "${6:-65536}" \
-    --arg path "$worker_path" \
-    '{max_concurrent: $concurrent, renew_seconds: 30, env: {PATH: $path},
-      capabilities: {($cap): {exec: $exec, args: [], timeout_seconds: $timeout,
-        max_payload_bytes: $maxbytes, max_output_bytes: $maxoutput}}}'
-}
 
 spoolw() { "$spool_binary" --dir "$work/workspool" "$@"; }
 spoolw init
@@ -1281,24 +1405,9 @@ drain_pending "work-timeout"
 
 # The timeout kill reaches the whole process group, not just the immediate
 # child: the grandchild the sleeper script forked does not outlive it.
-i=0
-while [ ! -s "$grandchild_pidfile" ] && [ "$i" -lt 50 ]; do
-  sleep 0.1
-  i=$((i + 1))
-done
-test -s "$grandchild_pidfile"; check
+wait_for 5 nonempty "$grandchild_pidfile"; check
 grandchild_pid=$(cat "$grandchild_pidfile")
-grandchild_dead=1
-i=0
-while [ "$i" -lt 50 ]; do
-  if ! kill -0 "$grandchild_pid" 2>/dev/null; then
-    grandchild_dead=0
-    break
-  fi
-  sleep 0.1
-  i=$((i + 1))
-done
-test "$grandchild_dead" -eq 0; check
+wait_for 5 gone "$grandchild_pid"; check
 
 # The timeout holds against a program that ignores SIGTERM: it is killed
 # outright after the grace period, long before its own 15 seconds are up.
@@ -1368,12 +1477,7 @@ worker_config "long@1" "$bin/runs-until-stopped" 60 1024 > "$work/interrupted-co
 TMPDIR="$work/interrupted-tmp" "$spool_binary" --dir "$work/interrupted-work" \
   work --worker stopped --config "$work/interrupted-config.json" --max-tasks 1 &
 interrupted_worker=$!
-i=0
-while [ ! -s "$interrupted_pidfile" ] && [ "$i" -lt 100 ]; do
-  sleep 0.1
-  i=$((i + 1))
-done
-test -s "$interrupted_pidfile"; check
+wait_for 10 nonempty "$interrupted_pidfile"; check
 test -n "$(ls -A "$work/interrupted-tmp")"; check
 kill -TERM "$interrupted_worker"
 set +e
@@ -1443,11 +1547,7 @@ concurrent_b='{"task_id":"work-concurrent-b","capability":"waitrelease@1","paylo
 printf '%s\n%s\n' "$concurrent_a" "$concurrent_b" | spoolw put >/dev/null
 worker_config "waitrelease@1" "$bin/wait-for-release" 10 1024 2 > "$work/waitrelease-config.json"
 (
-  i=0
-  while [ "$(find "$startdir" -type f 2>/dev/null | wc -l | tr -d ' ')" -lt 2 ] && [ "$i" -lt 100 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
+  wait_for 10 files_at_least "$startdir" 2 || true
   : > "$releasefile"
 ) &
 releaser_pid=$!
@@ -1501,15 +1601,12 @@ jq -nc --arg path "$worker_path" --arg probe "$cc_probe" \
 for i in $(seq 1 "$cc_n"); do
   printf '{"task_id":"cc-%s","capability":"probe@1","payload":{}}\n' "$i"
 done | spoolcc put >/dev/null
-cc_count() { find "$cc_started" -type f | wc -l | tr -d ' '; }
 (
-  i=0
-  while [ "$(cc_count)" -lt 1 ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  wait_for 10 files_at_least "$cc_started" 1 || true
   before=$SECONDS
   spoolcc status --json > "$work/cc-status.json"
   echo $((SECONDS - before)) > "$work/cc-status-seconds"
-  i=0
-  while [ "$(cc_count)" -lt "$cc_n" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  wait_for 10 files_at_least "$cc_started" "$cc_n" || true
   : > "$cc_release"
 ) &
 cc_releaser=$!
@@ -1531,7 +1628,7 @@ test "$(cat "$work/cc-status-seconds")" -le 1; check
 
 # A lease reclaimed while work is running, whose task is then leased again,
 # fences the worker's eventual ack. The worker surfaces exit 4 and stores no
-# result, and the replacement's lease stands (ADR 0026).
+# result, and the replacement's lease stands (ADR 0027).
 spoollate() { "$spool_binary" --dir "$work/late-spool" "$@"; }
 spoollate init
 printf '%s\n' '{"task_id":"work-late","capability":"late@1","payload":{}}' \
@@ -1545,12 +1642,7 @@ late_run() {
     2> "$work/late-worker.stderr" &
   late_worker_pid=$!
   set -e
-  i=0
-  while [ ! -f "$late_start" ] && [ "$i" -lt 100 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  test -f "$late_start"; check
+  wait_for 10 exists "$late_start"; check
   spoollate reclaim --older-than 0 >/dev/null
 }
 late_run
@@ -1571,7 +1663,7 @@ printf '%s\n' "$late_replacement_ack" | spoollate ack >/dev/null
 
 # A lease reclaimed while work is running, whose task nobody has leased
 # since, is taken back by the worker's ack: the result is its own, and the
-# reclaim's record goes with the reclaim it undoes (ADR 0026).
+# reclaim's record goes with the reclaim it undoes (ADR 0027).
 printf '%s\n' '{"task_id":"work-back","capability":"late@1","payload":{}}' \
   | spoollate put >/dev/null
 late_run
@@ -1598,6 +1690,9 @@ spoolw status --json | jq -e '.pending == 0' >/dev/null; check
 "$spool_binary" --dir "$work/workspool" work --worker w1 --config "$work/success-config.json"
 expect_exit 1 spoolw lease --worker nobody
 
+}
+
+section_attachments() {
 #############################################################################
 # Attachments: declarations survive the envelope boundary, bytes are verified
 # on staging/fetch/worker receipt, and spool-owned copies share task lifetime.
@@ -1738,11 +1833,7 @@ jq -nc --arg digest "$stage_digest" \
 "$spool_binary" --dir "$work/interrupted-stage" put --attachments "$stage_source" \
   < "$work/interrupted-stage-task.jsonl" >/dev/null 2>&1 &
 stage_put_pid=$!
-i=0
-while [ -z "$(ls -A "$work/interrupted-stage/attachments")" ] && [ "$i" -lt 100 ]; do
-  sleep 0.1
-  i=$((i + 1))
-done
+wait_for 10 has_entries "$work/interrupted-stage/attachments" || true
 kill -9 "$stage_put_pid"
 set +e
 wait "$stage_put_pid" 2>/dev/null
@@ -1760,6 +1851,9 @@ printf '%s\n' "$lookalike_task" | spooli put --attachments "$attachment_source" 
 spooli status >/dev/null
 test -f "$work/interrupted-stage/attachments/task-lookalike.spool-attachment-stage/$attachment_digest"; check
 
+}
+
+section_grants() {
 #############################################################################
 # Grants and the SSH boundary: the account record supplies both spool and
 # worker, every remote word reaches only its named handler, and revoke fences.
@@ -2157,6 +2251,9 @@ test "$bad_sidecar_exit" -eq 70; check
 cp "$work/good-worker-sidecar" "$work/grant-spool/leased/$bad_sidecar_lease.worker"
 printf '%s\n' "$bad_sidecar_ack" | spoolg ack | jq -e '.status == "acked"' >/dev/null; check
 
+}
+
+section_remote() {
 #############################################################################
 # Another machine: a grant that may put puts through the forced command, and
 # work --via runs the whole worker there, speaking the same grammar.
@@ -2354,7 +2451,7 @@ done
 
 # A lease reclaimed while the remote worker runs, whose task is then leased
 # again, fences its acknowledgement: the worker exits 4 and the spool keeps
-# no result, as locally (ADR 0026).
+# no result, as locally (ADR 0027).
 printf '%s\n' '{"task_id":"remote-late","capability":"late@1","payload":{},"priority":2000}' \
   | "$bin/fake-ssh" "$putter_grant" put >/dev/null
 jq -c --arg late "$bin/wait-for-late-release" \
@@ -2366,12 +2463,7 @@ remote_late_run() {
   "$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-late.json" --max-tasks 1 &
   remote_late_worker=$!
   set -e
-  i=0
-  while [ ! -f "$late_start" ] && [ "$i" -lt 100 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  test -f "$late_start"; check
+  wait_for 10 exists "$late_start"; check
   spoolg reclaim --older-than 0 | jq -e --arg task "$1" '.task_id == $task' >/dev/null; check
 }
 remote_late_run remote-late
@@ -2430,21 +2522,15 @@ test "$late_revoke_exit" -eq 4; check
 HOME="$grant_home" "$spool_binary" --dir "$work/grant-spool" revoke --grant "$grant_id" \
   | jq -e '.status == "revoked"' >/dev/null; check
 
+}
+
+section_follow() {
 #############################################################################
 # A worker that follows its spool (ADR 0019) waits for work instead of
 # stopping, asks again after a transport failure, and stops at SIGTERM or a
 # refusal.
 #############################################################################
 
-# Wait up to five seconds for a command to succeed.
-eventually() {
-  local i=0
-  until "$@"; do
-    i=$((i + 1))
-    test "$i" -lt 50 || return 1
-    sleep 0.1
-  done
-}
 result_for() { spoolfo results | jq -e --arg task "$1" 'select(.task_id == $task)' >/dev/null; }
 
 spoolfo() { "$spool_binary" --dir "$work/follow" "$@"; }
@@ -2531,6 +2617,9 @@ check
 # --idle-seconds belongs to --follow.
 expect_exit 2 spoolfo work --worker w --config "$work/follow-config.json" --idle-seconds 5
 
+}
+
+section_lifecycle() {
 #############################################################################
 # The three decisions together: a task's attempts (ADR 0017), retention
 # (ADR 0018), and a worker that follows its spool (ADR 0019).
@@ -2631,6 +2720,9 @@ cap_follower_exit=$?
 set -e
 test "$cap_follower_exit" -eq 143; check
 
+}
+
+section_outputs() {
 #############################################################################
 # Result attachments (ADR 0020): a program leaves files in outputs/, named by
 # their digests; the worker sends each under its lease, the ack files them
@@ -2869,7 +2961,7 @@ test ! -s "$work/exit.stdout"; check
 
 # A lease that ends without a result takes what it staged with it: fail,
 # fail --no-retry, and reclaim, once the task is leased again. A reclaim
-# keeps it while the task waits, for the lease to be taken back (ADR 0026).
+# keeps it while the task waits, for the lease to be taken back (ADR 0027).
 test -f "$work/ra/result-attachments/leases/$ra_pending_lease/$abc_digest"; check
 fail_one ra ra-pending "$ra_pending_lease" | jq -e '.status == "failed_retry"' >/dev/null; check
 test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
@@ -2925,8 +3017,8 @@ set -e
 exec 8>&-
 in_spool ra status >/dev/null
 ra_sending_hello; check
-# A reclaim keeps it while the task waits to be taken back (ADR 0026); a
-# withdrawal of the task takes it (ADR 0022).
+# A reclaim keeps it while the task waits to be taken back (ADR 0027); a
+# withdrawal of the task takes it (ADR 0023).
 in_spool ra reclaim --older-than 0 >/dev/null
 ra_sending_hello; check
 printf '%s\n' '{"task_id":"ra-slow"}' | in_spool ra withdraw | jq -e '.status == "withdrawn"' >/dev/null; check
@@ -3110,14 +3202,7 @@ rw_failures() { in_spool ra-remote failures | jq -s -c --arg task "$1" 'map(sele
 rw_results() { in_spool ra-remote results | jq -s -c --arg task "$1" 'map(select(.task_id == $task))'; }
 rw_leased() { grep -l "\"task_id\":\"$1\"" "$work"/ra-remote/leased/*.json >/dev/null 2>&1; }
 rw_waiting() { grep -q "waits for room" "$1"; }
-patiently() {
-  local i=0
-  until "$@"; do
-    i=$((i + 1))
-    test "$i" -lt 200 || return 1
-    sleep 0.1
-  done
-}
+patiently() { wait_for 20 "$@"; }
 # Take a task out of the way: lease it on the host and fail it for good.
 rw_drop() {
   local lease
@@ -3174,7 +3259,7 @@ rw_drop rw-third
 # A lease reclaimed while it waits, and its task leased again, ends the
 # wait: the worker neither sends nor acknowledges, and the reclaim's record
 # is the task's only failure. The worker is stopped while that happens, so
-# that no renewal takes the lease back first (ADR 0026).
+# that no renewal takes the lease back first (ADR 0027).
 ra_remote_put rw-fourth leave@1 "$(rw_make jkl)"
 "$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait.json" \
   --max-tasks 1 2> "$work/rw-fourth.stderr" &
@@ -3261,11 +3346,12 @@ jq -nc --arg lease "$old_lease" '{task_id:"old-leased",lease_id:$lease,result:{n
   | "$bin/fake-ssh-03" "$old_worker" ack | jq -e '.status == "acked"' >/dev/null; check
 expect_exit 2 sh -c "printf '%s\n' '$(take_line old-done "$abc_digest")' | '$bin/fake-ssh-03' '$old_putter' take"
 
-#############################################################################
-# Scheduling (0.0.5): withdraw (ADR 0022), status per task (ADR 0023), lease
-# order and priority (ADR 0024), prefetch above a disk floor (ADR 0025), and
-# a worker that survives its link (ADR 0026).
-#############################################################################
+}
+
+section_scheduling() {
+# Scheduling (0.0.5): withdraw (ADR 0023), status per task (ADR 0024), lease
+# order and priority (ADR 0025), prefetch above a disk floor (ADR 0026), and
+# a worker that survives its link (ADR 0027).
 
 in_spool sched init
 sched_files="$work/sched-files"
@@ -3291,8 +3377,8 @@ withdraw_ids() { local dir=$1; shift; printf '{"task_id":"%s"}\n' "$@" | in_spoo
 lease_ref() { jq -nc --arg task "$1" --arg lease "$2" '{task_id:$task,lease_id:$lease}'; }
 
 # Leases are handed out in the order tasks were put, whatever their IDs, and
-# a higher priority goes first (ADR 0024). status --json --tasks lists the
-# pending in that order, then the leased (ADR 0023).
+# a higher priority goes first (ADR 0025). status --json --tasks lists the
+# pending in that order, then the leased (ADR 0024).
 for name in q-c q-a q-b; do sched_put sched "$name" classify@1 >/dev/null; done
 sched_put sched q-hi classify@1 '[]' 5 | jq -e '.status == "inserted"' >/dev/null; check
 sched_tasks sched | jq -s -e 'map([.task_id, .state, .priority]) ==
@@ -3321,7 +3407,7 @@ expect_exit 2 sh -c "printf '%s\n' '{\"task_id\":\"q-x\",\"capability\":\"c@1\",
 
 # withdraw takes back a pending task with its attachments and every record
 # of it; a done or finally failed task is finished, and left for collect; an
-# ID the spool does not hold is unknown (ADR 0022).
+# ID the spool does not hold is unknown (ADR 0023).
 in_spool wd init
 put_one wd w-done >/dev/null
 ack_one wd w-done "$(lease_one wd)" >/dev/null
@@ -3449,7 +3535,7 @@ in_spool wr status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; c
 
 # A worker leases ahead and fetches the next task's attachments while the
 # program before it runs, renewing both; with prefetch 0 it does not
-# (ADR 0025).
+# (ADR 0026).
 in_spool pf init
 pf_run() {
   # pf_run CONFIG: put two tasks, start the worker, and wait for the first
@@ -3494,7 +3580,7 @@ in_spool pf work --config "$work/pf-floor.json" --show | jq -e '.prefetch == 1' 
 
 # A lease reclaimed while its worker was away is taken back by its next
 # renewal, if nobody has leased its task since; the reclaim's record goes
-# with it (ADR 0026).
+# with it (ADR 0027).
 in_spool rv init
 put_one rv rv-back >/dev/null
 rv_lease=$(lease_one rv)
@@ -3524,7 +3610,7 @@ expect_exit 2 sh -c "printf '%s\n' '$(fo_request 11)' | '$spool_binary' --dir '$
 
 # A remote worker whose fetch is cut off asks again from where its copy
 # ends, and one whose renewal cannot reach the spool tries again at the next
-# interval; the task is done either way (ADR 0026).
+# interval; the task is done either way (ADR 0027).
 cat > "$bin/cut-ssh" <<SCRIPT
 #!/bin/sh
 # The first fetch carries 5 bytes and the link drops; the first renewal
@@ -3567,4 +3653,16 @@ grep -q "renewal could not reach the spool" "$work/cut.stderr"; check
 grep -q "renewal reached the spool again" "$work/cut.stderr"; check
 in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "cut-one")) | length == 0' >/dev/null; check
 
-printf 'ok: standalone JSONL spool, opaque payloads, capability boundaries, idempotency, conflict, lease fencing, renew, fail/retry, durable results, attachments, grants, exact remote dispatch, configured executor lifecycle, resource/concurrency limits, following workers, attempts with retention, result attachments, scheduling (%d checks)\n' "$checks"
+}
+
+# The section loop's names are ones no section uses: sections share globals.
+sections_ran=()
+for section_now in "${sections[@]}"; do
+  if [[ $chosen == *" $section_now "* ]]; then
+    section_started=${EPOCHREALTIME/./}
+    "section_$section_now"
+    sections_ran+=("$section_now")
+    printf 'test.sh: %-12s %5.1f s\n' "$section_now" "$(( ${EPOCHREALTIME/./} - section_started ))e-6" >&2
+  fi
+done
+printf 'ok: %s (%d checks)\n' "${sections_ran[*]}" "$checks"

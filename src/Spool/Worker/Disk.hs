@@ -1,5 +1,5 @@
 -- | How much room a worker's disk has, for the floor a fetch must leave
--- (ADR 0025). The boring way: POSIX @df -P@, whose output has one line for
+-- (ADR 0026). The boring way: POSIX @df -P@, whose output has one line for
 -- each file system and its fields in a fixed order, on every system the
 -- worker runs on. Nothing here is asked unless the configuration sets a
 -- floor.
