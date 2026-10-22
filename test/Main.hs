@@ -7,6 +7,7 @@ module Main (main) where
 import qualified Test.Access
 import qualified Test.Attachments
 import qualified Test.Cli
+import qualified Test.Connection
 import qualified Test.Disk
 import qualified Test.Error
 import qualified Test.Files
@@ -26,6 +27,7 @@ main = do
     [ Test.Access.tests
     , attachments
     , Test.Cli.tests
+    , Test.Connection.tests
     , Test.Disk.tests
     , Test.Error.tests
     , Test.Files.tests

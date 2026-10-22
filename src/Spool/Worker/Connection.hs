@@ -133,12 +133,13 @@ remoteConnection program arguments = Connection
   , withAttachment = \reference attachment offset action ->
       withCreateProcess (speaking "fetch") $ \toSpool fromSpool _ handle -> do
         (writing, reading) <- pipes toSpool fromSpool
-        withAsync (feed writing (encode
-            (FetchRequest reference (SA.attachmentSha256 attachment) offset))) $
+        withAsync (try (feed writing (encode
+            (FetchRequest reference (SA.attachmentSha256 attachment) offset)))) $
           \feeding -> do
             action reading
-            wait feeding
-        waitForProcess handle >>= failed
+            fed <- wait feeding
+            waitForProcess handle >>= failed
+            either (throwIO . unwritten) pure fed
     -- The request line and then the file's bytes. A spool that refuses the
     -- request stops reading it, so a write that fails is looked at only
     -- once the spool's status has said why.
@@ -187,16 +188,27 @@ remoteConnection program arguments = Connection
     pipes _ _ = throwIO (retryable "the transport was started without its pipes")
 
     -- One request with these lines; the exit status and what came back.
+    -- A transport that ends without reading its input, as ssh does when it
+    -- cannot connect, breaks the pipe the request is written to: the
+    -- transport's status says why, so a write that failed is looked at
+    -- only once that status has been.
     request :: String -> BL.ByteString -> IO (ExitCode, BL.ByteString)
     request word input =
       withCreateProcess (speaking word) $ \toSpool fromSpool _ handle -> do
         (writing, reading) <- pipes toSpool fromSpool
-        withAsync (BL.hPut writing input >> hClose writing) $ \feeding ->
+        withAsync (try (BL.hPut writing input >> hClose writing)) $ \feeding ->
           withAsync (BS.hGetContents reading) $ \collecting -> do
             output <- wait collecting
-            wait feeding
+            fed <- wait feeding
             status <- waitForProcess handle
-            pure (status, BL.fromStrict output)
+            case fed of
+              Left exception -> failed status >> throwIO (unwritten exception)
+              Right () -> pure (status, BL.fromStrict output)
+
+    -- A request the transport did not take, when its status named no failure.
+    unwritten :: IOException -> SpoolError
+    unwritten exception =
+      retryable ("could not write the request: " <> displayException exception)
 
     -- A transition on one lease: the one answer line says what became of it.
     answered :: String -> BL.ByteString -> IO (Either SpoolError ())
