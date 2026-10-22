@@ -31,3 +31,8 @@ document and the implementation say nothing of it until it is accepted.
 | [0020](0020-a-result-may-carry-attachments.md) | A result may carry attachments |
 | [0021](0021-a-send-refused-for-room-waits.md) | A send refused for room waits |
 | [0022](0022-a-binary-names-its-commit.md) | A binary names the commit it was built from |
+| [0023](0023-a-task-may-be-withdrawn.md) | A task may be withdrawn |
+| [0024](0024-status-lists-each-task.md) | Status lists each task pending or leased |
+| [0025](0025-leases-follow-put-order-and-priority.md) | Leases follow put order, and a task may be put above others |
+| [0026](0026-a-worker-may-fetch-ahead.md) | A worker may fetch ahead, above a floor of free disk |
+| [0027](0027-a-worker-survives-its-link.md) | A worker survives its link |

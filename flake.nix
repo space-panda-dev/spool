@@ -81,7 +81,7 @@
             nativeBuildInputs = [ pkgs.coreutils ];
           } ''
             test -x ${spool}/bin/spool
-            test "$(${spool}/bin/spool --version)" = "spool 0.0.4 ${commit}"
+            test "$(${spool}/bin/spool --version)" = "spool 0.0.5 ${commit}"
             touch "$out"
           '';
 

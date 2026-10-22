@@ -20,7 +20,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 # Sections run in this order. Each starts from the programs and helpers
 # below and nothing else, except for the sections it needs, which run first.
-sections=(queue retention work attachments grants remote follow lifecycle outputs)
+sections=(queue retention work attachments grants remote follow lifecycle outputs scheduling)
 about() {
   case $1 in
     queue) echo "put, lease, renew, fail, ack: idempotency, fencing, attempts, recovery" ;;
@@ -32,6 +32,7 @@ about() {
     follow) echo "a worker that follows its spool: idle waits, signals, flaky transport" ;;
     lifecycle) echo "attempts, retention and following together (ADRs 0017-0019)" ;;
     outputs) echo "result attachments: send, take, limits, waiting for room, 0.0.3 records" ;;
+    scheduling) echo "withdraw, status per task, put order and priority, prefetch, a worker's link (ADRs 0023-0027)" ;;
   esac
 }
 needs() {
@@ -39,6 +40,7 @@ needs() {
     grants) echo attachments ;;
     remote) echo grants ;;
     follow) echo remote ;;
+    scheduling) echo outputs ;;
   esac
 }
 
@@ -99,8 +101,8 @@ if [[ -n $on_path && $(realpath "$on_path") == $(realpath "$SPOOL") ]]; then
 fi
 spool_binary=$SPOOL
 read -r version_name version_number version_commit version_rest < <("$spool_binary" --version) || true
-test "$version_name $version_number" = "spool 0.0.4" \
-  || die "SPOOL=$SPOOL says '$("$spool_binary" --version)', not spool 0.0.4"
+test "$version_name $version_number" = "spool 0.0.5" \
+  || die "SPOOL=$SPOOL says '$("$spool_binary" --version)', not spool 0.0.5"
 [[ -n ${version_commit:-} && -z ${version_rest:-} ]] \
   || die "SPOOL=$SPOOL does not name its commit in --version"
 if [[ -n ${SPOOL_COMMIT:-} ]]; then
@@ -647,13 +649,15 @@ jq -e '.task_id == "task-opaque" and (.lease_id | test("^lease_[A-Za-z0-9._-]+$"
 jq -c '{task_id, lease_id, result: {opaque: true}}' "$work/opaque-lease.jsonl" \
   | spool ack | jq -e '.status == "acked"' >/dev/null; check
 
-# A stale renew and fail are both fenced with exit 4.
+# A stale renew and fail are both fenced with exit 4. A reclaimed lease is
+# stale to a renewal once its task has been leased again (ADR 0027).
 stale_renew_task='{"task_id":"task-stale-renew","capability":"classify@1","payload":{}}'
 printf '%s\n' "$stale_renew_task" | spool put >/dev/null
 spool lease --worker renewer2 > "$work/stale-renew-lease.jsonl"
 stale_lease=$(jq -r '.lease_id' "$work/stale-renew-lease.jsonl")
 stale_task_id=$(jq -r '.task_id' "$work/stale-renew-lease.jsonl")
 spool reclaim --older-than 0 >/dev/null
+spool lease --worker renewer3 > "$work/stale-renew-release.jsonl"
 stale_renew_line=$(jq -nc --arg task "$stale_task_id" --arg lease "$stale_lease" \
   '{task_id:$task,lease_id:$lease}')
 set +e
@@ -661,7 +665,6 @@ printf '%s\n' "$stale_renew_line" | spool renew >/dev/null 2>&1
 stale_renew_exit=$?
 set -e
 test "$stale_renew_exit" -eq 4; check
-spool lease --worker renewer3 > "$work/stale-renew-release.jsonl"
 stale_release=$(jq -r '.lease_id' "$work/stale-renew-release.jsonl")
 stale_reack=$(jq -nc --arg task "$stale_task_id" --arg lease "$stale_release" \
   '{task_id:$task,lease_id:$lease,result:{released:true}}')
@@ -1070,7 +1073,10 @@ put_one aging z-retrying >/dev/null
 z_lease=$(lease_one aging)
 fail_one aging z-retrying "$z_lease" >/dev/null
 # A task that failed finally long ago and has been put again is pending.
-put_one aging f-again >/dev/null
+# z-retrying, put first, waits in pending; f-again is put above it, so the
+# lease takes f-again (ADR 0025).
+printf '{"task_id":"f-again","capability":"keep@1","payload":{},"priority":1}\n' \
+  | in_spool aging put >/dev/null
 f_again_lease=$(lease_one aging)
 fail_one aging f-again "$f_again_lease" --no-retry >/dev/null
 put_one aging f-again | jq -e '.status == "inserted"' >/dev/null; check
@@ -1620,21 +1626,27 @@ test "$cc_seconds" -lt 6; check
 jq -e '.leased >= 1' "$work/cc-status.json" >/dev/null; check
 test "$(cat "$work/cc-status-seconds")" -le 1; check
 
-# A lease reclaimed while work is running fences the worker's eventual ack.
-# The worker surfaces exit 4, stores no result, and leaves the re-pended task
-# for a replacement worker.
+# A lease reclaimed while work is running, whose task is then leased again,
+# fences the worker's eventual ack. The worker surfaces exit 4 and stores no
+# result, and the replacement's lease stands (ADR 0027).
 spoollate() { "$spool_binary" --dir "$work/late-spool" "$@"; }
 spoollate init
 printf '%s\n' '{"task_id":"work-late","capability":"late@1","payload":{}}' \
   | spoollate put >/dev/null
 worker_config "late@1" "$bin/wait-for-late-release" 10 1024 \
   > "$work/late-config.json"
-set +e
-spoollate work --worker old-worker --config "$work/late-config.json" --max-tasks 1 &
-late_worker_pid=$!
-set -e
-wait_for 10 exists "$late_start"; check
-spoollate reclaim --older-than 0 >/dev/null
+late_run() {
+  rm -f "$late_start" "$late_release"
+  set +e
+  spoollate work --worker old-worker --config "$work/late-config.json" --max-tasks 1 \
+    2> "$work/late-worker.stderr" &
+  late_worker_pid=$!
+  set -e
+  wait_for 10 exists "$late_start"; check
+  spoollate reclaim --older-than 0 >/dev/null
+}
+late_run
+spoollate lease --worker replacement > "$work/late-replacement.jsonl"
 : > "$late_release"
 set +e
 wait "$late_worker_pid"
@@ -1642,13 +1654,27 @@ late_worker_exit=$?
 set -e
 test "$late_worker_exit" -eq 4; check
 spoollate status --json \
-  | jq -e '.pending == 1 and .leased == 0 and .done == 0' >/dev/null; check
+  | jq -e '.pending == 0 and .leased == 1 and .done == 0' >/dev/null; check
 spoollate results | jq -s -e 'length == 0' >/dev/null; check
-spoollate lease --worker replacement > "$work/late-replacement.jsonl"
 late_replacement_lease=$(jq -r '.lease_id' "$work/late-replacement.jsonl")
 late_replacement_ack=$(jq -nc --arg lease "$late_replacement_lease" \
   '{task_id:"work-late",lease_id:$lease,result:{replacement:true}}')
 printf '%s\n' "$late_replacement_ack" | spoollate ack >/dev/null
+
+# A lease reclaimed while work is running, whose task nobody has leased
+# since, is taken back by the worker's ack: the result is its own, and the
+# reclaim's record goes with the reclaim it undoes (ADR 0027).
+printf '%s\n' '{"task_id":"work-back","capability":"late@1","payload":{}}' \
+  | spoollate put >/dev/null
+late_run
+spoollate status --json | jq -e '.pending == 1 and .leased == 0' >/dev/null; check
+spoollate failures | jq -s -e 'map(select(.task_id == "work-back")) | length == 1' >/dev/null; check
+: > "$late_release"
+wait "$late_worker_pid"; check
+spoollate results | jq -s -e 'map(select(.task_id == "work-back"))
+  | length == 1 and .[0].worker == "old-worker" and .[0].result == {late: true}' >/dev/null; check
+spoollate failures | jq -s -e 'map(select(.task_id == "work-back")) | length == 0' >/dev/null; check
+spoollate status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
 
 # --max-tasks stops after the requested count even with more pending work.
 extra_a='{"task_id":"work-extra-a","capability":"classify@1","payload":{}}'
@@ -2325,7 +2351,7 @@ for word in results failures status 'status --json'; do
 done
 # collect is a remote word for a grant that may put (ADR 0018); one that may
 # not is denied before a line is read, and the task is still there.
-printf '%s\n' '{"task_id":"000-remote-collect","capability":"classify@1","payload":{}}' \
+printf '%s\n' '{"task_id":"000-remote-collect","capability":"classify@1","payload":{},"priority":1000}' \
   | spoolg put >/dev/null
 spoolg lease --worker local-collector > "$work/remote-collect-lease.jsonl"
 jq -e '.task_id == "000-remote-collect"' "$work/remote-collect-lease.jsonl" >/dev/null; check
@@ -2423,20 +2449,25 @@ for expected in failed_retry failed_retry failed; do
     | "$bin/fake-ssh" "$reader_grant" fail | jq -e --arg s "$expected" '.status == $s' >/dev/null; check
 done
 
-# A lease reclaimed while the remote worker runs fences its acknowledgement:
-# the worker exits 4 and the spool keeps no result, as locally.
-printf '%s\n' '{"task_id":"remote-late","capability":"late@1","payload":{}}' \
+# A lease reclaimed while the remote worker runs, whose task is then leased
+# again, fences its acknowledgement: the worker exits 4 and the spool keeps
+# no result, as locally (ADR 0027).
+printf '%s\n' '{"task_id":"remote-late","capability":"late@1","payload":{},"priority":2000}' \
   | "$bin/fake-ssh" "$putter_grant" put >/dev/null
 jq -c --arg late "$bin/wait-for-late-release" \
   '.capabilities["late@1"] = {exec: $late, args: [], timeout_seconds: 10, max_payload_bytes: 1024, max_output_bytes: 4096}' \
   "$work/remote-worker.json" > "$work/remote-worker-late.json"
-rm -f "$late_start" "$late_release"
-set +e
-"$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-late.json" --max-tasks 1 &
-remote_late_worker=$!
-set -e
-wait_for 10 exists "$late_start"; check
-spoolg reclaim --older-than 0 | jq -e '.task_id == "remote-late"' >/dev/null; check
+remote_late_run() {
+  rm -f "$late_start" "$late_release"
+  set +e
+  "$spool_binary" work --via "$bin/fake-ssh $reader_grant" --config "$work/remote-worker-late.json" --max-tasks 1 &
+  remote_late_worker=$!
+  set -e
+  wait_for 10 exists "$late_start"; check
+  spoolg reclaim --older-than 0 | jq -e --arg task "$1" '.task_id == $task' >/dev/null; check
+}
+remote_late_run remote-late
+spoolg lease --worker local-late > "$work/remote-late-lease.jsonl"
 : > "$late_release"
 set +e
 wait "$remote_late_worker"
@@ -2444,9 +2475,18 @@ remote_late_exit=$?
 set -e
 test "$remote_late_exit" -eq 4; check
 spoolg results | jq -s -e 'map(select(.task_id == "remote-late")) | length == 0' >/dev/null; check
-"$bin/fake-ssh" "$reader_grant" lease > "$work/remote-late-lease.jsonl"
 jq -c '{task_id, lease_id, result: {replacement: true}}' "$work/remote-late-lease.jsonl" \
-  | "$bin/fake-ssh" "$reader_grant" ack >/dev/null
+  | spoolg ack >/dev/null
+# One whose task nobody leased since is taken back by the worker's ack, and
+# the result is the grant's worker's.
+printf '%s\n' '{"task_id":"remote-back","capability":"late@1","payload":{},"priority":2000}' \
+  | "$bin/fake-ssh" "$putter_grant" put >/dev/null
+remote_late_run remote-back
+: > "$late_release"
+wait "$remote_late_worker"; check
+spoolg results | jq -s -e 'map(select(.task_id == "remote-back"))
+  | length == 1 and .[0].worker == "reader"' >/dev/null; check
+spoolg failures | jq -s -e 'map(select(.task_id == "remote-back")) | length == 0' >/dev/null; check
 
 # A transport that cannot reach the spool ends the worker with 75; a grant
 # that has been revoked ends it with 5. Either way nothing is leased.
@@ -2920,16 +2960,20 @@ expect_exit 70 sh -c "printf '%s\n' '$(take_line ra-hand "$abc_digest")' | '$spo
 test ! -s "$work/exit.stdout"; check
 
 # A lease that ends without a result takes what it staged with it: fail,
-# fail --no-retry, and reclaim.
+# fail --no-retry, and reclaim, once the task is leased again. A reclaim
+# keeps it while the task waits, for the lease to be taken back (ADR 0027).
 test -f "$work/ra/result-attachments/leases/$ra_pending_lease/$abc_digest"; check
 fail_one ra ra-pending "$ra_pending_lease" | jq -e '.status == "failed_retry"' >/dev/null; check
 test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
 ra_pending_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
 send_file ra ra-pending "$ra_pending_lease" "$work/ra-abc" >/dev/null
 in_spool ra reclaim --older-than 0 | jq -e '.status == "reclaimed"' >/dev/null; check
-test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
+test -f "$work/ra/result-attachments/leases/$ra_pending_lease/$abc_digest"; check
+test "$(staged_in ra)" = 1; check
+ra_reclaimed_lease=$ra_pending_lease
 ra_pending_lease=$(in_spool ra lease --worker ra-hand | jq -r '.lease_id')
 send_file ra ra-pending "$ra_pending_lease" "$work/ra-abc" >/dev/null
+test ! -e "$work/ra/result-attachments/leases/$ra_reclaimed_lease"; check
 fail_one ra ra-pending "$ra_pending_lease" --no-retry | jq -e '.status == "failed"' >/dev/null; check
 test ! -e "$work/ra/result-attachments/leases/$ra_pending_lease"; check
 test "$(staged_in ra)" = 0; check
@@ -2973,7 +3017,11 @@ set -e
 exec 8>&-
 in_spool ra status >/dev/null
 ra_sending_hello; check
+# A reclaim keeps it while the task waits to be taken back (ADR 0027); a
+# withdrawal of the task takes it (ADR 0023).
 in_spool ra reclaim --older-than 0 >/dev/null
+ra_sending_hello; check
+printf '%s\n' '{"task_id":"ra-slow"}' | in_spool ra withdraw | jq -e '.status == "withdrawn"' >/dev/null; check
 test ! -e "$work/ra/result-attachments/leases/$ra_slow_lease"; check
 
 # An ack interrupted after its result was written is finished by the next
@@ -3208,14 +3256,21 @@ test "$(wc -l < "$work/rw-count-fg" | tr -d ' ')" = 1; check
 test "$(staged_in ra-remote)" = 0; check
 rw_drop rw-third
 
-# A lease reclaimed while it waits ends the wait: the worker neither sends
-# nor acknowledges, and the reclaim's record is the task's only failure.
+# A lease reclaimed while it waits, and its task leased again, ends the
+# wait: the worker neither sends nor acknowledges, and the reclaim's record
+# is the task's only failure. The worker is stopped while that happens, so
+# that no renewal takes the lease back first (ADR 0027).
 ra_remote_put rw-fourth leave@1 "$(rw_make jkl)"
-timeout 60 "$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait.json" \
+"$spool_binary" work --via "$bin/fake-ssh-ra $ra_wait" --config "$work/ra-leave-wait.json" \
   --max-tasks 1 2> "$work/rw-fourth.stderr" &
 rw_fourth_pid=$!
 patiently rw_waiting "$work/rw-fourth.stderr"; check
+kill -STOP "$rw_fourth_pid"
 in_spool ra-remote reclaim --older-than 0 | jq -e '.task_id == "rw-fourth"' >/dev/null; check
+rw_fourth_host=$(in_spool ra-remote lease --worker ra-local \
+  | jq -r 'select(.task_id == "rw-fourth") | .lease_id')
+test -n "$rw_fourth_host"; check
+kill -CONT "$rw_fourth_pid"
 rw_started=${EPOCHREALTIME/./}
 set +e
 wait "$rw_fourth_pid"
@@ -3226,7 +3281,7 @@ test $(( ${EPOCHREALTIME/./} - rw_started )) -lt 10000000; check
 test "$(rw_results rw-fourth)" = "[]"; check
 rw_failures rw-fourth | jq -e 'length == 1 and (.[0].reason | startswith("reclaimed"))' >/dev/null; check
 test "$(staged_in ra-remote)" = 0; check
-rw_drop rw-fourth
+fail_one ra-remote rw-fourth "$rw_fourth_host" --no-retry >/dev/null
 
 # SIGTERM ends the wait: the worker exits 143, its working directory is
 # gone, and the lease stands, for reclaim to return.
@@ -3290,6 +3345,313 @@ expect_exit 7 sh -c "{ printf '%s\n' '$(send_line old-leased "$old_lease" "$work
 jq -nc --arg lease "$old_lease" '{task_id:"old-leased",lease_id:$lease,result:{new:true}}' \
   | "$bin/fake-ssh-03" "$old_worker" ack | jq -e '.status == "acked"' >/dev/null; check
 expect_exit 2 sh -c "printf '%s\n' '$(take_line old-done "$abc_digest")' | '$bin/fake-ssh-03' '$old_putter' take"
+
+}
+
+section_scheduling() {
+# Scheduling (0.0.5): withdraw (ADR 0023), status per task (ADR 0024), lease
+# order and priority (ADR 0025), prefetch above a disk floor (ADR 0026), and
+# a worker that survives its link (ADR 0027).
+
+in_spool sched init
+sched_files="$work/sched-files"
+mkdir -p "$sched_files"
+# sched_attach NAME BYTES: a file of so many bytes for attachments, named by
+# its digest; prints the declaration.
+sched_attach() {
+  head -c "$2" /dev/urandom > "$work/sched-$1.bin"
+  local digest
+  digest=$(sha256_of "$work/sched-$1.bin")
+  cp "$work/sched-$1.bin" "$sched_files/$digest"
+  jq -nc --arg sha "$digest" --argjson size "$2" '[{sha256:$sha,size:$size}]'
+}
+# sched_put DIR TASK CAPABILITY [ATTACHMENTS [PRIORITY]]
+sched_put() {
+  jq -nc --arg task "$2" --arg cap "$3" --argjson att "${4:-[]}" --argjson pri "${5:-0}" \
+    '{task_id:$task,capability:$cap,payload:{name:$task},attachments:$att}
+     + (if $pri == 0 then {} else {priority:$pri} end)' \
+    | in_spool "$1" put --attachments "$sched_files"
+}
+sched_tasks() { in_spool "$1" status --json --tasks; }
+withdraw_ids() { local dir=$1; shift; printf '{"task_id":"%s"}\n' "$@" | in_spool "$dir" withdraw; }
+lease_ref() { jq -nc --arg task "$1" --arg lease "$2" '{task_id:$task,lease_id:$lease}'; }
+
+# Leases are handed out in the order tasks were put, whatever their IDs, and
+# a higher priority goes first (ADR 0025). status --json --tasks lists the
+# pending in that order, then the leased (ADR 0024).
+for name in q-c q-a q-b; do sched_put sched "$name" classify@1 >/dev/null; done
+sched_put sched q-hi classify@1 '[]' 5 | jq -e '.status == "inserted"' >/dev/null; check
+sched_tasks sched | jq -s -e 'map([.task_id, .state, .priority]) ==
+  [["q-hi","pending",5],["q-c","pending",0],["q-a","pending",0],["q-b","pending",0]]' >/dev/null; check
+# The same task put again with another priority is the task already there,
+# and keeps its place.
+sched_put sched q-b classify@1 '[]' 9 | jq -e '.status == "existing"' >/dev/null; check
+sched_tasks sched | jq -s -e 'map(.task_id) == ["q-hi","q-c","q-a","q-b"]' >/dev/null; check
+q_hi_lease=$(in_spool sched lease --worker orderly | jq -r 'select(.task_id == "q-hi") | .lease_id')
+test -n "$q_hi_lease"; check
+sched_tasks sched > "$work/sched-tasks.jsonl"
+jq -s -e --arg lease "$q_hi_lease" 'map(.task_id) == ["q-c","q-a","q-b","q-hi"]
+  and .[3].state == "leased" and .[3].lease_id == $lease and .[3].worker == "orderly"
+  and (.[3].leased_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))
+  and .[3].renewed_at == .[3].leased_at' "$work/sched-tasks.jsonl" >/dev/null; check
+# Nothing but the queue's state is listed: no payload.
+jq -s -e 'all(.[]; has("payload") | not)' "$work/sched-tasks.jsonl" >/dev/null; check
+in_spool sched lease --worker orderly --count 3 | jq -s -e 'map(.task_id) == ["q-c","q-a","q-b"]' >/dev/null; check
+# The lease envelope is what a 0.0.4 worker reads: no priority, no place.
+sched_put sched q-env classify@1 '[]' 3 >/dev/null
+in_spool sched lease --worker orderly \
+  | jq -e 'keys == ["attachments","capability","lease_id","leased_at","payload","task_id","worker"]' >/dev/null; check
+expect_exit 2 in_spool sched status --tasks
+# A caller cannot choose a place in the queue.
+expect_exit 2 sh -c "printf '%s\n' '{\"task_id\":\"q-x\",\"capability\":\"c@1\",\"payload\":1,\"put_serial\":0}' | '$spool_binary' --dir '$work/sched' put"
+
+# withdraw takes back a pending task with its attachments and every record
+# of it; a done or finally failed task is finished, and left for collect; an
+# ID the spool does not hold is unknown (ADR 0023).
+in_spool wd init
+put_one wd w-done >/dev/null
+ack_one wd w-done "$(lease_one wd)" >/dev/null
+put_one wd w-failed >/dev/null
+fail_one wd w-failed "$(lease_one wd)" --no-retry >/dev/null
+wd_att=$(sched_attach wd-pend 4096)
+sched_put wd w-pend classify@1 "$wd_att" >/dev/null
+w_pend_lease=$(in_spool wd lease --worker wd | jq -r '.lease_id')
+fail_one wd w-pend "$w_pend_lease" | jq -e '.status == "failed_retry"' >/dev/null; check
+test -d "$work/wd/attachments/task-w-pend"; check
+# A malformed line acts on nothing.
+set +e
+printf '%s\n' '{"task_id":"w-pend"}' '{"task_id":"w-done","why":1}' | in_spool wd withdraw > "$work/wd-bad.out" 2>/dev/null
+wd_bad=$?
+set -e
+test "$wd_bad" -eq 2; check
+test ! -s "$work/wd-bad.out"; check
+withdraw_ids wd w-pend w-done w-failed w-never w-pend > "$work/wd.out"
+jq -s -e '. == [ {task_id:"w-pend", status:"withdrawn"}
+               , {task_id:"w-done", status:"finished"}
+               , {task_id:"w-failed", status:"finished"}
+               , {task_id:"w-never", status:"unknown"}
+               , {task_id:"w-pend", status:"unknown"} ]' "$work/wd.out" >/dev/null; check
+test ! -e "$work/wd/attachments/task-w-pend"; check
+test ! -e "$work/wd/pending/w-pend.json"; check
+in_spool wd failures | jq -s -e 'map(select(.task_id == "w-pend")) | length == 0' >/dev/null; check
+in_spool wd results | jq -s -e 'map(.task_id) == ["w-done"]' >/dev/null; check
+sched_put wd w-pend classify@1 "$wd_att" | jq -e '.status == "inserted"' >/dev/null; check
+
+# A leased task is withdrawn too: its lease ends now, and whatever renews,
+# acknowledges, or fails it is answered withdrawn, exit 4, and acts on
+# nothing. A task put again is new.
+w_lease=$(in_spool wd lease --worker wd | jq -r 'select(.task_id == "w-pend") | .lease_id')
+test -n "$w_lease"; check
+withdraw_ids wd w-pend | jq -e '.status == "withdrawn"' >/dev/null; check
+test ! -e "$work/wd/leased/$w_lease.json"; check
+test ! -e "$work/wd/attachments/task-w-pend"; check
+test -f "$work/wd/withdrawn/$w_lease.json"; check
+expect_exit 4 sh -c "printf '%s\n' '$(lease_ref w-pend "$w_lease")' | '$spool_binary' --dir '$work/wd' renew"
+jq -e '.status == "withdrawn"' "$work/exit.stdout" >/dev/null; check
+expect_exit 4 sh -c "jq -nc --arg l '$w_lease' '{task_id:\"w-pend\",lease_id:\$l,result:1}' | '$spool_binary' --dir '$work/wd' ack"
+jq -e '.status == "withdrawn"' "$work/exit.stdout" >/dev/null; check
+expect_exit 4 sh -c "jq -nc --arg l '$w_lease' '{task_id:\"w-pend\",lease_id:\$l,reason:\"x\"}' | '$spool_binary' --dir '$work/wd' fail"
+jq -e '.status == "withdrawn"' "$work/exit.stdout" >/dev/null; check
+in_spool wd results | jq -s -e 'map(select(.task_id == "w-pend")) | length == 0' >/dev/null; check
+in_spool wd failures | jq -s -e 'map(select(.task_id == "w-pend")) | length == 0' >/dev/null; check
+sched_tasks wd | jq -s -e 'map(select(.task_id == "w-pend")) | length == 0' >/dev/null; check
+# A lease reclaimed while its worker was away, whose task is withdrawn
+# while it waits, is answered withdrawn too.
+put_one wd w-away >/dev/null
+w_away_lease=$(lease_one wd)
+in_spool wd reclaim --older-than 0 | jq -e '.task_id == "w-away"' >/dev/null; check
+withdraw_ids wd w-away | jq -e '.status == "withdrawn"' >/dev/null; check
+expect_exit 4 sh -c "printf '%s\n' '$(lease_ref w-away "$w_away_lease")' | '$spool_binary' --dir '$work/wd' renew"
+jq -e '.status == "withdrawn"' "$work/exit.stdout" >/dev/null; check
+# gc ages out the records of withdrawals as it ages out finished tasks.
+in_spool wd gc --older-than 3600 >/dev/null
+test "$(find "$work/wd/withdrawn" -type f | wc -l | tr -d ' ')" = 2; check
+in_spool wd gc --older-than 0 >/dev/null
+test -z "$(find "$work/wd/withdrawn" -type f)"; check
+
+# Through the forced command, withdraw and status --json --tasks go with
+# putting: a grant that may not put is denied before a line is read.
+printf '%s\n' '{"task_id":"rwd-one","capability":"classify@1","payload":{},"priority":50}' \
+  | "$bin/fake-ssh-ra" "$ra_putter" put >/dev/null
+"$bin/fake-ssh-ra" "$ra_putter" 'status --json --tasks' </dev/null \
+  | jq -s -e 'map(select(.task_id == "rwd-one")) | .[0].state == "pending"' >/dev/null; check
+expect_exit 5 "$bin/fake-ssh-ra" "$ra_worker" 'status --json --tasks' </dev/null
+expect_exit 5 sh -c "printf '%s\n' '{\"task_id\":\"rwd-one\"}' | '$bin/fake-ssh-ra' '$ra_worker' withdraw"
+rwd_lease=$("$bin/fake-ssh-ra" "$ra_worker" lease | jq -r 'select(.task_id == "rwd-one") | .lease_id')
+test -n "$rwd_lease"; check
+printf '%s\n' '{"task_id":"rwd-one"}' | "$bin/fake-ssh-ra" "$ra_putter" withdraw \
+  | jq -e '.status == "withdrawn"' >/dev/null; check
+expect_exit 4 sh -c "printf '%s\n' '$(lease_ref rwd-one "$rwd_lease")' | '$bin/fake-ssh-ra' '$ra_worker' renew"
+jq -e '.status == "withdrawn"' "$work/exit.stdout" >/dev/null; check
+
+# A worker whose task is withdrawn while its program runs stops the program
+# at its next renewal, removes its working directory, records nothing, and
+# carries on: it is no failure.
+cat > "$bin/hold" <<SCRIPT
+#!/bin/sh
+name=\$(jq -r '.name')
+ls attachments 2>/dev/null | grep -v '^\.' | wc -l | tr -d ' ' > "$work/held-files-\$name"
+echo \$\$ > "$work/held-\$name"
+i=0
+while [ ! -f "$work/release-\$name" ] && [ "\$i" -lt 300 ]; do
+  sleep 0.1
+  i=\$((i + 1))
+done
+printf '{"ran":"%s"}\n' "\$name"
+SCRIPT
+chmod +x "$bin/hold"
+hold_config() {
+  # hold_config RENEW_SECONDS [EXTRA_JSON]
+  local extra=${2:-}
+  test -n "$extra" || extra='{}'
+  jq -nc --arg exec "$bin/hold" --arg path "$worker_path" --argjson renew "$1" \
+    --argjson extra "$extra" \
+    '{max_concurrent: 1, renew_seconds: $renew, env: {PATH: $path},
+      capabilities: {"hold@1": {exec: $exec, args: [], timeout_seconds: 60,
+        max_payload_bytes: 4096, max_output_bytes: 4096}}} + $extra'
+}
+held_running() { test -s "$work/held-$1"; }
+hold_config 1 > "$work/hold-renew-1.json"
+in_spool wr init
+sched_put wr wr-run hold@1 "$(sched_attach wr-run 2048)" >/dev/null
+mkdir "$work/wr-tmp"
+TMPDIR="$work/wr-tmp" in_spool wr work --worker wr --config "$work/hold-renew-1.json" \
+  --max-tasks 1 2> "$work/wr.stderr" &
+wr_pid=$!
+eventually held_running wr-run; check
+wr_program=$(cat "$work/held-wr-run")
+test "$(cat "$work/held-files-wr-run")" = 1; check
+wr_started=${EPOCHREALTIME/./}
+withdraw_ids wr wr-run | jq -e '.status == "withdrawn"' >/dev/null; check
+wait "$wr_pid"; check
+test $(( ${EPOCHREALTIME/./} - wr_started )) -lt 10000000; check
+if kill -0 "$wr_program" 2>/dev/null; then echo "the withdrawn task's program still runs" >&2; exit 1; fi
+check
+test -z "$(ls -A "$work/wr-tmp")"; check
+grep -q "task wr-run: withdrawn" "$work/wr.stderr"; check
+in_spool wr results | jq -s -e 'length == 0' >/dev/null; check
+in_spool wr failures | jq -s -e 'length == 0' >/dev/null; check
+in_spool wr status --json | jq -e '.pending == 0 and .leased == 0' >/dev/null; check
+
+# A worker leases ahead and fetches the next task's attachments while the
+# program before it runs, renewing both; with prefetch 0 it does not
+# (ADR 0026).
+in_spool pf init
+pf_run() {
+  # pf_run CONFIG: put two tasks, start the worker, and wait for the first
+  # program to run.
+  local tag=$1
+  rm -rf "$work/pf-tmp"; mkdir "$work/pf-tmp"
+  sched_put pf "$tag-one" hold@1 "$(sched_attach "$tag-one" 300000)" >/dev/null
+  sched_put pf "$tag-two" hold@1 "$(sched_attach "$tag-two" 300000)" >/dev/null
+  TMPDIR="$work/pf-tmp" in_spool pf work --worker pf --config "$work/pf-$tag.json" \
+    --max-tasks 2 2> "$work/pf-$tag.stderr" &
+  pf_pid=$!
+  eventually held_running "$tag-one"; check
+}
+pf_fetched() { test "$(find "$work/pf-tmp" -path '*/attachments/*' -type f ! -name '.*' | wc -l | tr -d ' ')" = 2; }
+pf_finish() {
+  : > "$work/release-$1-one"
+  eventually held_running "$1-two"; check
+  : > "$work/release-$1-two"
+  wait "$pf_pid"; check
+  in_spool pf results | jq -s -e --arg t "$1" 'map(select(.task_id | startswith($t))) | length == 2' >/dev/null; check
+}
+hold_config 30 '{"prefetch": 1}' > "$work/pf-ahead.json"
+pf_run ahead
+eventually pf_fetched; check
+sched_tasks pf | jq -s -e 'map(select(.task_id | startswith("ahead"))) | map(.state) == ["leased","leased"]' >/dev/null; check
+test ! -e "$work/held-ahead-two"; check
+pf_finish ahead
+hold_config 30 > "$work/pf-none.json"
+pf_run none
+sleep 1
+sched_tasks pf | jq -s -e 'map(select(.task_id | startswith("none"))) | map(.state) == ["pending","leased"]' >/dev/null; check
+pf_finish none
+# Below the floor it leases nothing ahead, and says so; the next task is
+# leased once the one before it is done.
+hold_config 30 '{"prefetch": 1, "min_free_bytes": 9223372036854775807}' > "$work/pf-floor.json"
+pf_run floor
+sleep 1
+sched_tasks pf | jq -s -e 'map(select(.task_id | startswith("floor"))) | map(.state) == ["pending","leased"]' >/dev/null; check
+grep -q "leases nothing ahead" "$work/pf-floor.stderr"; check
+pf_finish floor
+in_spool pf work --config "$work/pf-floor.json" --show | jq -e '.prefetch == 1' >/dev/null; check
+
+# A lease reclaimed while its worker was away is taken back by its next
+# renewal, if nobody has leased its task since; the reclaim's record goes
+# with it (ADR 0027).
+in_spool rv init
+put_one rv rv-back >/dev/null
+rv_lease=$(lease_one rv)
+in_spool rv reclaim --older-than 0 | jq -e '.status == "reclaimed"' >/dev/null; check
+in_spool rv failures | jq -s -e 'length == 1' >/dev/null; check
+lease_ref rv-back "$rv_lease" | in_spool rv renew | jq -e '.status == "renewed"' >/dev/null; check
+in_spool rv failures | jq -s -e 'length == 0' >/dev/null; check
+sched_tasks rv | jq -s -e --arg l "$rv_lease" '. == [.[0]] and .[0].lease_id == $l and .[0].worker == "keeper"' >/dev/null; check
+ack_one rv rv-back "$rv_lease" | jq -e '.status == "acked"' >/dev/null; check
+# A worker's own fail is not taken back.
+put_one rv rv-failed >/dev/null
+rv_failed_lease=$(lease_one rv)
+fail_one rv rv-failed "$rv_failed_lease" >/dev/null
+expect_exit 4 sh -c "printf '%s\n' '$(lease_ref rv-failed "$rv_failed_lease")' | '$spool_binary' --dir '$work/rv' renew"
+
+# fetch may start from an offset, for a worker that holds the first bytes.
+printf '0123456789' > "$work/fo.bin"
+fo_digest=$(sha256_of "$work/fo.bin")
+cp "$work/fo.bin" "$sched_files/$fo_digest"
+in_spool fo init
+sched_put fo fo-one classify@1 "[{\"sha256\":\"$fo_digest\",\"size\":10}]" >/dev/null
+fo_lease=$(in_spool fo lease --worker fo | jq -r '.lease_id')
+fo_request() { jq -nc --arg l "$fo_lease" --arg s "$fo_digest" --argjson o "$1" '{task_id:"fo-one",lease_id:$l,sha256:$s,offset:$o}'; }
+test "$(fo_request 4 | in_spool fo fetch)" = "456789"; check
+test -z "$(fo_request 10 | in_spool fo fetch)"; check
+expect_exit 2 sh -c "printf '%s\n' '$(fo_request 11)' | '$spool_binary' --dir '$work/fo' fetch"
+
+# A remote worker whose fetch is cut off asks again from where its copy
+# ends, and one whose renewal cannot reach the spool tries again at the next
+# interval; the task is done either way (ADR 0027).
+cat > "$bin/cut-ssh" <<SCRIPT
+#!/bin/sh
+# The first fetch carries 5 bytes and the link drops; the first renewal
+# does not arrive at all.
+if [ "\$2" = fetch ] && [ ! -e "$work/cut-fetch" ]; then
+  : > "$work/cut-fetch"
+  "$bin/fake-ssh-ra" "\$@" | head -c 5
+  echo "client_loop: send disconnect: Broken pipe" >&2
+  exit 255
+fi
+if [ "\$2" = renew ] && [ ! -e "$work/cut-renew" ]; then
+  : > "$work/cut-renew"
+  echo "ssh: connect to host spool-host: Operation timed out" >&2
+  exit 255
+fi
+exec "$bin/fake-ssh-ra" "\$@"
+SCRIPT
+chmod +x "$bin/cut-ssh"
+cat > "$bin/count-attached" <<'SCRIPT'
+#!/bin/sh
+cat >/dev/null
+sleep 3
+printf '{"bytes":%s}\n' "$(cat attachments/* | wc -c | tr -d ' ')"
+SCRIPT
+chmod +x "$bin/count-attached"
+jq -nc --arg exec "$bin/count-attached" --arg path "$worker_path" \
+  '{max_concurrent: 1, renew_seconds: 1, env: {PATH: $path},
+    capabilities: {"count@1": {exec: $exec, args: [], timeout_seconds: 30,
+      max_payload_bytes: 4096, max_output_bytes: 4096}}}' > "$work/count.json"
+cut_att=$(sched_attach cut 200000)
+sched_put ra-remote cut-one count@1 "$cut_att" 100 >/dev/null
+"$spool_binary" work --via "$bin/cut-ssh $ra_worker" --config "$work/count.json" \
+  --max-tasks 1 2> "$work/cut.stderr"
+check
+in_spool ra-remote results | jq -s -e 'map(select(.task_id == "cut-one"))
+  | length == 1 and .[0].result == {bytes: 200000}' >/dev/null; check
+grep -q "fetch of attachment .* could not reach the spool" "$work/cut.stderr"; check
+grep -q "fetch of attachment .* reached the spool again" "$work/cut.stderr"; check
+grep -q "renewal could not reach the spool" "$work/cut.stderr"; check
+grep -q "renewal reached the spool again" "$work/cut.stderr"; check
+in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "cut-one")) | length == 0' >/dev/null; check
 
 }
 

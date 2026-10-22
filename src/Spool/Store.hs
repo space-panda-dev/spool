@@ -17,10 +17,14 @@ module Spool.Store
   , readResultRecordFile
   , readWorkerSidecar
   , liveLeaseOwned
+  , leaseStands
+  , revive
+  , withdrawnLease
   , removeSidecars
   , leaseIdOfFile
   , leaseTasks
   , leaseUpTo
+  , leaseOrder
   , answerEach
   , ackTasks
   , ackStep
@@ -49,13 +53,15 @@ module Spool.Store
   , takeCommand
   , reclaimTasks
   , collectTasks
+  , withdrawTasks
   , gcTasks
   , statusTasks
+  , isReclaimReason
   ) where
 
 import Control.Exception (IOException, displayException, finally, onException,
                           throwIO, try)
-import Control.Monad (foldM, forM, forM_, unless, when)
+import Control.Monad (foldM, forM, forM_, unless, void, when)
 import qualified Data.Aeson as A
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
@@ -64,11 +70,13 @@ import Data.Char (isDigit)
 import Data.Int (Int64)
 import Data.List (isSuffixOf, sortOn, stripPrefix)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, isNothing, listToMaybe)
+import Data.Ord (Down (..))
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import System.Directory (createDirectory, listDirectory, removeFile)
 import System.FilePath (takeBaseName, (</>))
 import System.IO (Handle, IOMode (ReadMode), SeekMode (AbsoluteSeek), hClose,
@@ -88,6 +96,8 @@ import Spool.Error
   , report
   , retryable
   , stale
+  , withdrawn
+  , isWithdrawn
   )
 import Spool.Files
   ( Created (..)
@@ -129,6 +139,8 @@ import Spool.Files
   , syncedRename
   , syncedRenameDirectory
   , withLock
+  , withdrawnDir
+  , withdrawnPath
   , workerSidecarPath
   )
 import Spool.Input
@@ -143,8 +155,8 @@ import Spool.Types
   ( LeaseId
   , Retry (..)
   , StatusFormat (..)
-  , leaseSerialAndTask
   , TaskId
+  , Timestamp
   , WorkerName
   , leaseIdText
   , leaseSerialAndTask
@@ -173,6 +185,9 @@ import Spool.Wire
   , PutStatus (..)
   , ResultRecord (..)
   , Task (..)
+  , TaskLine (..)
+  , WithdrawalRecord (..)
+  , WithdrawStatus (..)
   , encode
   , encodeAckResult
   , encodeCollectResult
@@ -183,13 +198,17 @@ import Spool.Wire
   , encodeRenewResult
   , encodeSendResult
   , encodeStaleResult
+  , encodeWithdrawnResult
+  , encodeWithdrawResult
   , parseFailureRecord
   , parseFetchRequest
   , parseResultRecord
   , parseSendRequest
   , parseTakeRequest
-  , parseTask
+  , parseStoredTask
+  , parseWithdrawalRecord
   , readInteger
+  , sameTask
   )
 
 withStore :: FilePath -> (Paths -> IO ()) -> IO ()
@@ -205,6 +224,7 @@ recover :: Paths -> IO ()
 recover paths = do
   migrateLayout paths
   finishCommitted paths
+  finishWithdrawn paths
   finishTaskCleanup paths
   recoverAttachmentState paths
   recoverResultAttachments paths
@@ -230,7 +250,25 @@ finishCommitted paths = do
           completeAck paths task leaseIdent (resultAttachments record)
         else do
           record <- readFailureRecordFile (failedPath paths leaseIdent)
-          completeFail paths task leaseIdent (failureRetried record)
+          completeFail paths task leaseIdent (failureRetried record) (failureReason record)
+
+-- | Finish ending every lease whose task was withdrawn while it was held:
+-- the withdrawal's record is its commit (ADR 0023).
+finishWithdrawn :: Paths -> IO ()
+finishWithdrawn paths = do
+  files <- jsonFiles (leasedDir paths)
+  forM_ files $ \path -> do
+    leaseIdent <- leaseIdOfFile path
+    recorded <- fileExists (withdrawnPath paths leaseIdent)
+    when recorded (endWithdrawnLease paths leaseIdent)
+
+-- | The steps after a withdrawal's record: what the lease staged goes, then
+-- the lease, then its sidecars. Its task's attachments go with the task.
+endWithdrawnLease :: Paths -> LeaseId -> IO ()
+endWithdrawnLease paths leaseIdent = do
+  removeResultLease paths leaseIdent
+  ignoreMissing (syncedRemove (leasedPath paths leaseIdent))
+  removeSidecars paths leaseIdent
 
 -- | Finish interrupted attachment deletion and remove spool-owned copies for
 -- tasks which no longer have a pending or leased state.
@@ -276,7 +314,9 @@ putOne paths sourceDirectory task = do
     Just OtherTask -> throwIO different
     Nothing -> do
       stageTaskAttachments paths sourceDirectory task
-      created <- atomicCreate (pendingPath paths (taskId task)) (encode task)
+      serial <- nextSerial paths ".put-sequence" "put sequence"
+      created <- atomicCreate (pendingPath paths (taskId task))
+        (encode task { taskPutSerial = Just serial })
       case created of
         Created -> pure PutInserted
         AlreadyThere -> do
@@ -330,15 +370,15 @@ compareFiles directory wanted = do
   pure (listToMaybe [found | Just found <- results])
 
 compareTask :: Task -> Task -> Found
-compareTask wanted held = if held == wanted then SameTask else OtherTask
+compareTask wanted held = if sameTask held wanted then SameTask else OtherTask
 
 equalTaskFile :: FilePath -> Task -> IO Bool
-equalTaskFile path wanted = (== wanted) <$> readTaskFile path
+equalTaskFile path wanted = (`sameTask` wanted) <$> readTaskFile path
 
 readTaskFile :: FilePath -> IO Task
 readTaskFile path = do
   bytes <- readWhole path
-  case parseTask bytes of
+  case parseStoredTask bytes of
     Left message -> throwIO (corrupt
       ("corrupt task file " <> path <> ": " <> message))
     Right task -> pure task
@@ -349,6 +389,14 @@ readFailureRecordFile path = do
   case parseFailureRecord bytes of
     Left message -> throwIO (corrupt
       ("corrupt failure record " <> path <> ": " <> message))
+    Right value -> pure value
+
+readWithdrawalRecordFile :: FilePath -> IO WithdrawalRecord
+readWithdrawalRecordFile path = do
+  bytes <- readWhole path
+  case parseWithdrawalRecord bytes of
+    Left message -> throwIO (corrupt
+      ("corrupt withdrawal record " <> path <> ": " <> message))
     Right value -> pure value
 
 readResultRecordFile :: FilePath -> IO ResultRecord
@@ -437,14 +485,13 @@ leaseTasks paths worker count = do
 -- `count` (possibly none) when pending is exhausted.
 leaseUpTo :: Paths -> WorkerName -> Int -> IO [Lease]
 leaseUpTo paths worker count = do
-  pending <- jsonFiles (pendingDir paths)
+  pending <- pendingInOrder paths
   active <- activeTaskIds paths
   leaseMany pending active count []
   where
     leaseMany _ _ 0 output = pure (reverse output)
     leaseMany [] _ _ output = pure (reverse output)
-    leaseMany (path : rest) active remaining output = do
-      task <- readTaskFile path
+    leaseMany ((path, task) : rest) active remaining output =
       if taskId task `elem` active
         then leaseMany rest active remaining output
         else do
@@ -464,6 +511,22 @@ leaseUpTo paths worker count = do
               writeWorkerSidecar paths leaseIdent worker
               leaseMany rest (taskId task : active) (remaining - 1) (lease : output)
 
+-- | Every pending task, with its file, in the order they are leased in
+-- (ADR 0025).
+pendingInOrder :: Paths -> IO [(FilePath, Task)]
+pendingInOrder paths = do
+  files <- jsonFiles (pendingDir paths)
+  tasks <- forM files $ \path -> (,) path <$> readTaskFile path
+  pure (sortOn (leaseOrder . snd) tasks)
+
+-- | Where a pending task stands in the queue: the highest priority first,
+-- and within a priority the first put first. A task put before put order
+-- was kept has no serial, and goes before every task that has one; ties
+-- fall to the task ID, as every lease did before (ADR 0025).
+leaseOrder :: Task -> (Down Int64, Integer, TaskId)
+leaseOrder task =
+  (Down (taskPriority task), fromMaybe 0 (taskPutSerial task), taskId task)
+
 activeTaskIds :: Paths -> IO [TaskId]
 activeTaskIds paths = do
   files <- jsonFiles (leasedDir paths)
@@ -471,16 +534,17 @@ activeTaskIds paths = do
 
 uniqueLeaseId :: Paths -> Integer -> TaskId -> IO LeaseId
 uniqueLeaseId paths micros ident = do
-  serial <- nextLeaseSerial paths
+  serial <- nextSerial paths ".lease-sequence" "lease sequence"
   pure (newLeaseId micros serial ident)
 
-nextLeaseSerial :: Paths -> IO Integer
-nextLeaseSerial paths = do
-  let path = rootDir paths </> ".lease-sequence"
+-- | The next number of a sequence the spool keeps in a file of its root.
+nextSerial :: Paths -> FilePath -> String -> IO Integer
+nextSerial paths name what = do
+  let path = rootDir paths </> name
   present <- fileExists path
   current <- if present then readNumber path else pure (Just 0)
   case current of
-    Nothing -> throwIO (corrupt "corrupt lease sequence")
+    Nothing -> throwIO (corrupt ("corrupt " <> what))
     Just value -> do
       let next = value + 1
       atomicReplace path (BLC.pack (show next <> "\n"))
@@ -501,7 +565,9 @@ answerEach reference step items = do
       case result of
         Left failure -> do
           report failure
-          BLC.putStrLn (encodeStaleResult (reference item))
+          BLC.putStrLn $ if isWithdrawn failure
+            then encodeWithdrawnResult (reference item)
+            else encodeStaleResult (reference item)
           pure True
         Right reply -> BLC.putStrLn reply >> pure hadRefusal
 
@@ -518,9 +584,10 @@ ackStep :: Paths -> Ack -> IO (Either SpoolError BL.ByteString)
 ackStep paths ack = fmap (encodeAckResult (ackRef ack)) <$> ackOne paths ack
 
 ackOne :: Paths -> Ack -> IO (Either SpoolError AckStatus)
-ackOne paths ack@(Ack (LeaseRef ident leaseIdent) output attachments) = do
+ackOne paths ack@(Ack reference@(LeaseRef ident leaseIdent) output attachments) = do
   let source = leasedPath paths leaseIdent
-  sourceExists <- fileExists source
+  inFlight <- fileExists source
+  sourceExists <- if inFlight then pure True else revive paths Nothing reference
   if sourceExists
     then do
       task <- readTaskFile source
@@ -533,7 +600,9 @@ ackOne paths ack@(Ack (LeaseRef ident leaseIdent) output attachments) = do
           case stored of
             Left failure -> pure (Left failure)
             Right () -> Right Acked <$ completeAck paths task leaseIdent attachments
-    else repeatedAck paths ident leaseIdent output attachments
+    else do
+      gone <- withdrawnLease paths reference
+      maybe (repeatedAck paths ident leaseIdent output attachments) (pure . Left) gone
 
 -- | An ack whose lease is in flight may name only result attachments sent
 -- under that lease, each whole; otherwise it is malformed input, refused
@@ -601,20 +670,17 @@ renewStep :: Paths -> LeaseRef -> IO (Either SpoolError BL.ByteString)
 renewStep paths reference =
   fmap (const (encodeRenewResult reference)) <$> renewOne paths reference
 
+-- | Renew a lease: one in flight, or one reclaimed whose task has waited
+-- since, which takes it back (ADR 0027).
 renewOne :: Paths -> LeaseRef -> IO (Either SpoolError ())
-renewOne paths (LeaseRef ident leaseIdent) = do
-  let source = leasedPath paths leaseIdent
-  exists <- fileExists source
-  if not exists
-    then pure (Left (stale "lease is unknown or stale"))
-    else do
-      task <- readTaskFile source
-      if taskId task /= ident
-        then pure (Left (stale "lease does not belong to task_id"))
-        else do
-          micros <- epochMicros
-          writeRenewedSidecar paths leaseIdent micros
-          pure (Right ())
+renewOne paths reference@(LeaseRef _ leaseIdent) = do
+  standing <- leaseStands paths Nothing reference
+  case standing of
+    Left refusal -> pure (Left refusal)
+    Right () -> do
+      micros <- epochMicros
+      writeRenewedSidecar paths leaseIdent micros
+      pure (Right ())
 
 failTasks :: Retry -> Paths -> IO ()
 failTasks retry paths =
@@ -635,11 +701,11 @@ failLease paths reference reason retry =
 -- the task has retries left) put an identical task back in pending/.
 -- Answers whether it went back.
 failOne :: Paths -> LeaseRef -> T.Text -> Retry -> IO (Either SpoolError Retry)
-failOne paths (LeaseRef ident leaseIdent) reason retry = do
+failOne paths reference@(LeaseRef ident leaseIdent) reason retry = do
   let source = leasedPath paths leaseIdent
   exists <- fileExists source
   if not exists
-    then pure (Left (stale "lease is unknown or stale"))
+    then notInFlight paths reference
     else do
       task <- readTaskFile source
       if taskId task /= ident
@@ -650,7 +716,7 @@ failOne paths (LeaseRef ident leaseIdent) reason retry = do
           stored <- writeFailureRecord paths task leaseIdent worker recorded effective
           case stored of
             Left failure -> pure (Left failure)
-            Right () -> Right effective <$ completeFail paths task leaseIdent effective
+            Right () -> Right effective <$ completeFail paths task leaseIdent effective recorded
 
 -- | How many times a task goes back to pending after failing, under
 -- ADR 0017: three attempts in all.
@@ -700,11 +766,13 @@ failureHistory paths ident leaseIdent = do
 -- | The steps after a fail's commit: the task goes back to pending if it is
 -- to be retried, the lease and its sidecars go, and for a task left failed
 -- its attachments go. Whatever result attachments the lease sent go with
--- it, since no result will name them.
-completeFail :: Paths -> Task -> LeaseId -> Retry -> IO ()
-completeFail paths task leaseIdent retry = do
+-- it, since no result will name them, unless it was reclaimed and its task
+-- goes back to pending: its worker may yet take it back, and send on
+-- (ADR 0027).
+completeFail :: Paths -> Task -> LeaseId -> Retry -> T.Text -> IO ()
+completeFail paths task leaseIdent retry reason = do
   when (retry == Retry) (returnToPending paths task)
-  removeResultLease paths leaseIdent
+  unless (retry == Retry && isReclaimReason reason) (removeResultLease paths leaseIdent)
   syncedRemove (leasedPath paths leaseIdent)
   removeSidecars paths leaseIdent
   when (retry == NoRetry) (tombstoneAndDelete paths (taskId task))
@@ -778,7 +846,7 @@ fetchAttachment paths guard worker = do
   request <- BL.getContents >>= orThrow malformed . parseFetchRequest
   (attachment, handle) <- withLock paths $ do
     guard
-    either throwIO pure =<< liveLeaseOwned paths worker (fetchRef request)
+    either throwIO pure =<< leaseStands paths worker (fetchRef request)
     openFetched paths request
   (`finally` hClose handle) $ do
     verified <- SA.verifyHandle attachment handle
@@ -787,7 +855,7 @@ fetchAttachment paths guard worker = do
         ("corrupt attachment for " <> showTask (refTask (fetchRef request))
           <> ": " <> message))
       Right () -> do
-        hSeek handle AbsoluteSeek 0
+        hSeek handle AbsoluteSeek (toInteger (fetchOffset request))
         copyToOutput handle
 
 -- | Write what is left of a file to stdout.
@@ -798,13 +866,16 @@ copyToOutput handle = do
 
 -- | The declared attachment a current lease asks for, opened for reading.
 openFetched :: Paths -> FetchRequest -> IO (SA.Attachment, Handle)
-openFetched paths (FetchRequest (LeaseRef ident leaseIdent) digest) = do
+openFetched paths (FetchRequest (LeaseRef ident leaseIdent) digest offset) = do
   task <- readTaskFile (leasedPath paths leaseIdent)
   attachment <- case
       [declaration | declaration <- taskAttachments task,
         SA.attachmentSha256 declaration == digest] of
     declaration : _ -> pure declaration
     [] -> throwIO (malformed "attachment is not declared by the task")
+  when (offset > SA.attachmentSize attachment) (throwIO (malformed
+    ("offset " <> show offset <> " is past the end of a "
+      <> show (SA.attachmentSize attachment) <> "-byte attachment")))
   let path = SA.attachmentPath (attachmentsDir paths) ident attachment
   present <- fileExists path
   unless present (throwIO (corrupt
@@ -894,7 +965,7 @@ sendFrom paths guard sender (SendRequest reference attachment) already source = 
       directory = resultLeaseDir paths leaseIdent
   (temporary, handle) <- withLock paths $ do
     guard
-    either throwIO pure =<< liveLeaseOwned paths (senderWorker sender) reference
+    either throwIO pure =<< leaseStands paths (senderWorker sender) reference
     withinLimit paths sender leaseIdent attachment
     present <- fileExists directory
     unless present $ do
@@ -914,7 +985,7 @@ sendFrom paths guard sender (SendRequest reference attachment) already source = 
     Right () -> pure ()
   withLock paths $ do
     guard
-    allowed <- liveLeaseOwned paths (senderWorker sender) reference
+    allowed <- leaseStands paths (senderWorker sender) reference
     case allowed of
       Left refusal -> discard temporary >> throwIO refusal
       Right () -> syncedRename temporary (stagedPath paths leaseIdent attachment)
@@ -970,17 +1041,28 @@ withinLimit paths (GrantedWorker worker limit) leaseIdent attachment = do
 -- filed with tasks not yet collected or expired.
 heldBytes :: Paths -> WorkerName -> IO Integer
 heldBytes paths worker = do
-  leases <- jsonFiles (leasedDir paths)
-  staged <- forM leases $ \path -> do
-    leaseIdent <- leaseIdOfFile path
-    handedOut <- fileExists (workerSidecarPath paths leaseIdent)
-    owner <- if handedOut then Just <$> readWorkerSidecar paths leaseIdent else pure Nothing
+  leases <- listDirectory (resultLeasesDir paths)
+  staged <- forM leases $ \name -> do
+    leaseIdent <- orThrow (corrupt . (("unexpected entry in result attachments: "
+      <> name <> ": ") <>)) (mkLeaseId (T.pack name))
+    owner <- stagingOwner paths leaseIdent
     if owner == Just worker then stagedBytes paths leaseIdent else pure 0
   records <- jsonFiles (resultsDir paths) >>= mapM readResultRecordFile
   pure (sum staged + sum
     [ toInteger (SA.attachmentSize attachment)
     | record <- records, resultWorker record == worker
     , attachment <- resultAttachments record ])
+
+-- | Whose the files staged under a lease are: the worker it was handed to,
+-- while it is in flight or reclaimed and waiting to be taken back.
+stagingOwner :: Paths -> LeaseId -> IO (Maybe WorkerName)
+stagingOwner paths leaseIdent = do
+  live <- fileExists (leasedPath paths leaseIdent)
+  if live
+    then do
+      handedOut <- fileExists (workerSidecarPath paths leaseIdent)
+      if handedOut then Just <$> readWorkerSidecar paths leaseIdent else pure Nothing
+    else fmap failureWorker <$> waitingReclaim paths leaseIdent
 
 -- | The bytes staged under one lease, each file being sent counted at the
 -- size it declared.
@@ -1053,7 +1135,9 @@ recoverResultAttachments paths = do
     leaseIdent <- orThrow (corrupt . (("unexpected entry in result attachments: "
       <> name <> ": ") <>)) (mkLeaseId (T.pack name))
     live <- fileExists (leasedPath paths leaseIdent)
-    unless live (syncedRemoveDirectory (resultLeasesDir paths </> name))
+    waiting <- if live then pure Nothing else waitingReclaim paths leaseIdent
+    unless (live || not (isNothing waiting))
+      (syncedRemoveDirectory (resultLeasesDir paths </> name))
   tasks <- listDirectory (resultTasksDir paths)
   forM_ tasks $ \name -> do
     ident <- orThrow (corrupt . (("unexpected entry in result attachments: "
@@ -1108,11 +1192,11 @@ resultRecordsOf paths ident = do
 -- | Whether a live lease is on this task and, when a worker is named, is
 -- that worker's to act on.
 liveLeaseOwned :: Paths -> Maybe WorkerName -> LeaseRef -> IO (Either SpoolError ())
-liveLeaseOwned paths worker (LeaseRef ident leaseIdent) = do
+liveLeaseOwned paths worker reference@(LeaseRef ident leaseIdent) = do
   let path = leasedPath paths leaseIdent
   present <- fileExists path
   if not present
-    then pure (Left (stale "lease is unknown or stale"))
+    then notInFlight paths reference
     else do
       task <- readTaskFile path
       if taskId task /= ident
@@ -1124,6 +1208,78 @@ liveLeaseOwned paths worker (LeaseRef ident leaseIdent) = do
             pure $ if owner == name
               then Right ()
               else Left (stale "lease belongs to a different worker")
+
+-- | What a lease not in flight is answered: withdrawn, if its task was
+-- withdrawn while it was held (ADR 0023), and otherwise stale.
+notInFlight :: Paths -> LeaseRef -> IO (Either SpoolError a)
+notInFlight paths reference =
+  Left . fromMaybe (stale "lease is unknown or stale") <$> withdrawnLease paths reference
+
+-- | The refusal for a lease whose task was withdrawn while it was held, if
+-- it was.
+withdrawnLease :: Paths -> LeaseRef -> IO (Maybe SpoolError)
+withdrawnLease paths (LeaseRef ident leaseIdent) = do
+  let path = withdrawnPath paths leaseIdent
+  present <- fileExists path
+  if not present
+    then pure Nothing
+    else do
+      record <- readWithdrawalRecordFile path
+      pure $ if withdrawalTask record == ident
+        then Just (withdrawn ("task " <> showTask ident <> " was withdrawn"))
+        else Nothing
+
+-- | Whether a lease stands for a request that carries on with it: as
+-- 'liveLeaseOwned', but a lease reclaimed for want of renewal, whose task
+-- no lease has been taken on since, is first taken back (ADR 0027).
+leaseStands :: Paths -> Maybe WorkerName -> LeaseRef -> IO (Either SpoolError ())
+leaseStands paths worker reference = do
+  live <- fileExists (leasedPath paths (refLease reference))
+  unless live (void (revive paths worker reference))
+  liveLeaseOwned paths worker reference
+
+-- | The reason a reclaim records for a lease that was not renewed.
+isReclaimReason :: T.Text -> Bool
+isReclaimReason = T.isPrefixOf "reclaimed: not renewed within "
+
+-- | The record of a lease reclaimed for want of renewal whose task has
+-- waited in pending since: no lease of the task has ended after it, so none
+-- has been taken (ADR 0027).
+waitingReclaim :: Paths -> LeaseId -> IO (Maybe FailureRecord)
+waitingReclaim paths leaseIdent = case leaseSerialAndTask leaseIdent of
+  Nothing -> pure Nothing
+  Just (serial, ident) -> do
+    let recordPath = failedPath paths leaseIdent
+    recorded <- fileExists recordPath
+    pending <- fileExists (pendingPath paths ident)
+    if not (recorded && pending)
+      then pure Nothing
+      else do
+        record <- readFailureRecordFile recordPath
+        later <- any ((> serial) . fst) <$> failureHistory paths ident leaseIdent
+        pure $ if failureTask record == ident && failureRetried record == Retry
+            && isReclaimReason (failureReason record) && not later
+          then Just record
+          else Nothing
+
+-- | Take back a lease reclaimed for want of renewal, for its own worker,
+-- when its task has waited in pending since (ADR 0027). The task moves back
+-- under the lease, the lease's worker and a renewal are written, and the
+-- reclaim's record goes last: it is the commit, and until it goes, recovery
+-- finishes the reclaim again. Answers whether it was taken back.
+revive :: Paths -> Maybe WorkerName -> LeaseRef -> IO Bool
+revive paths worker (LeaseRef ident leaseIdent) = do
+  waiting <- waitingReclaim paths leaseIdent
+  case waiting of
+    Just record | failureTask record == ident
+                , maybe True (== failureWorker record) worker -> do
+      syncedRename (pendingPath paths ident) (leasedPath paths leaseIdent)
+      writeWorkerSidecar paths leaseIdent (failureWorker record)
+      micros <- epochMicros
+      writeRenewedSidecar paths leaseIdent micros
+      syncedRemove (failedPath paths leaseIdent)
+      pure True
+    _ -> pure False
 
 reclaimTasks :: Paths -> Integer -> IO ()
 reclaimTasks paths age = do
@@ -1163,7 +1319,7 @@ abandonLease paths reason leasedFile leaseIdent = do
       (retry, recorded) <- capped paths task leaseIdent reason Retry
       stored <- writeFailureRecord paths task leaseIdent worker recorded retry
       either throwIO pure stored
-      completeFail paths task leaseIdent retry
+      completeFail paths task leaseIdent retry recorded
       pure (taskId task, retry)
 
 -- Retention (ADR 0018). A finished task is a done task, or one whose latest
@@ -1282,11 +1438,82 @@ collectOne paths ident = do
     named path held = unless (held == ident) (throwIO (corrupt
       ("record filed under " <> showTask ident <> " is another task's: " <> path)))
 
+withdrawTasks :: Paths -> IO ()
+withdrawTasks paths = do
+  idents <- inputLines >>= mapM parseCollectLine
+  forM_ idents $ \ident -> do
+    status <- withdrawOne paths ident
+    BLC.putStrLn (encodeWithdrawResult ident status)
+
+-- | Take a task back from the spool because whoever put it no longer wants
+-- it (ADR 0023). A pending task goes, with its attachments and its records.
+-- A leased one goes too: its lease ends now, under a withdrawal record that
+-- answers its worker @withdrawn@, so that the worker stops the run. A task
+-- that is done or failed for good is left for collect.
+withdrawOne :: Paths -> TaskId -> IO WithdrawStatus
+withdrawOne paths ident = do
+  pending <- fileExists (pendingPath paths ident)
+  leases <- leasesOfTask paths ident
+  failures <- (`filedUnder` ident) <$> filedUnderTasks (failedDir paths)
+  records <- forM failures $ \path -> do
+    record <- readFailureRecordFile path
+    unless (failureTask record == ident) (throwIO (corrupt
+      ("record filed under " <> showTask ident <> " is another task's: " <> path)))
+    pure record
+  if pending || not (null leases)
+    then do
+      now <- getCurrentTime
+      forM_ leases $ \leaseIdent -> do
+        recordWithdrawal paths ident leaseIdent now
+        endWithdrawnLease paths leaseIdent
+      when pending $ do
+        -- A lease reclaimed while its worker was away, which it could take
+        -- back, is answered withdrawn too.
+        forM_ (map failureLease records) $ \leaseIdent -> do
+          waiting <- waitingReclaim paths leaseIdent
+          unless (isNothing waiting) $ do
+            recordWithdrawal paths ident leaseIdent now
+            removeResultLease paths leaseIdent
+        syncedRemove (pendingPath paths ident)
+      tombstoneAndDelete paths ident
+      unless (null failures) (retire paths ident failures)
+      pure WithdrawnNow
+    else do
+      done <- fileExists (donePath paths ident)
+      if done || any ((== NoRetry) . failureRetried) records
+        then pure Finished
+        else do
+          -- Records alone are what a withdrawal a crash interrupted left.
+          unless (null failures) (retire paths ident failures)
+          pure NotHeld
+
+-- | The leases in flight on a task.
+leasesOfTask :: Paths -> TaskId -> IO [LeaseId]
+leasesOfTask paths ident = do
+  files <- jsonFiles (leasedDir paths)
+  held <- forM files $ \path -> do
+    task <- readTaskFile path
+    if taskId task == ident then Just <$> leaseIdOfFile path else pure Nothing
+  pure [leaseIdent | Just leaseIdent <- held]
+
+-- | Write that a lease's task was withdrawn, once.
+recordWithdrawal :: Paths -> TaskId -> LeaseId -> UTCTime -> IO ()
+recordWithdrawal paths ident leaseIdent now = void $
+  atomicCreate (withdrawnPath paths leaseIdent)
+    (encode (WithdrawalRecord ident leaseIdent (timestamp now)))
+
 -- | Delete every finished task that finished at least this many seconds
--- ago, oldest first. A caller runs it; nothing in Spool does.
+-- ago, oldest first, and every withdrawal record that old. A caller runs
+-- it; nothing in Spool does.
 gcTasks :: Paths -> Integer -> IO ()
 gcTasks paths age = do
   now <- getCurrentTime
+  withdrawals <- jsonFiles (withdrawnDir paths)
+  forM_ withdrawals $ \path -> do
+    record <- readWithdrawalRecordFile path
+    at <- maybe (throwIO (corrupt ("unreadable time in withdrawal record " <> path))) pure
+      (timestampTime (withdrawalAt record))
+    when (diffUTCTime now at >= fromInteger age) (syncedRemove path)
   finished <- finishedTasks paths
   let expired = sortOn (\(ident, at) -> (at, ident))
         [entry | entry@(_, at) <- finished, diffUTCTime now at >= fromInteger age]
@@ -1329,6 +1556,21 @@ taskOfFileName path = case mkTaskId (T.pack (takeBaseName path)) of
   Left _ -> throwIO (corrupt ("corrupt task filename: " <> path))
 
 statusTasks :: Paths -> StatusFormat -> IO ()
+statusTasks paths StatusTasks = do
+  pending <- pendingInOrder paths
+  forM_ pending $ \(_, task) ->
+    BLC.putStrLn (encode (PendingLine (taskId task) (taskPriority task)))
+  leased <- jsonFiles (leasedDir paths)
+  forM_ leased $ \path -> do
+    leaseIdent <- leaseIdOfFile path
+    task <- readTaskFile path
+    handedOut <- fileExists (workerSidecarPath paths leaseIdent)
+    worker <- if handedOut then Just <$> readWorkerSidecar paths leaseIdent else pure Nothing
+    started <- maybe (throwIO (corrupt ("corrupt lease filename: " <> path))) pure
+      (leaseStarted leaseIdent)
+    renewed <- readRenewedSidecar paths leaseIdent
+    BLC.putStrLn (encode (LeasedLine (taskId task) (taskPriority task) leaseIdent worker
+      (microsTimestamp started) (microsTimestamp (maybe started (max started) renewed))))
 statusTasks paths format = do
   counts <- Counts
     <$> count (pendingDir paths)
@@ -1344,6 +1586,10 @@ statusTasks paths format = do
         <> " failed=" <> show (countFailed counts))
   where
     count directory = length <$> jsonFiles directory
+
+-- | A time in microseconds since the epoch, as a record writes a time.
+microsTimestamp :: Integer -> Timestamp
+microsTimestamp micros = timestamp (posixSecondsToUTCTime (fromInteger micros / 1000000))
 
 showTask :: TaskId -> String
 showTask = T.unpack . taskIdText

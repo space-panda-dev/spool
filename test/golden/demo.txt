@@ -2,7 +2,7 @@ $ scripts/demo.sh
 [exit 0]
 --- stdout
 $ spool --version
-spool 0.0.4 <commit>
+spool 0.0.5 <commit>
 
 $ spool init
 

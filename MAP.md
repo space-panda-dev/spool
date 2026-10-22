@@ -15,6 +15,7 @@ changing, then those sections and records; the
 | the worker | `Worker/Run`, `Worker/Config`, `Worker/Connection` | `WorkerConfig` | `work`, `remote` | [Workers](spec/protocol.md#workers), [Remote worker](spec/protocol.md#remote-worker) | 0017 |
 | following a spool | `Worker/Follow` | `Follow` | `follow`, `lifecycle` | [Following a spool](spec/protocol.md#following-a-spool) | 0019 |
 | result attachments | `Worker/Outputs`, `Worker/Room`, `Store` | `Outputs`, `Room` | `outputs` | [Result attachments](spec/protocol.md#result-attachments), [`send`](spec/protocol.md#send), [`take`](spec/protocol.md#take) | 0020, 0021 |
+| scheduling: withdraw, each task's status, lease order, leasing ahead, a worker's link | `Store`, `Wire`, `Grants`, `Worker/Run`, `Worker/Disk` | `Store`, `Wire`, `Disk`, `WorkerConfig` | `scheduling`, `work`, `remote` | [A withdrawn task](spec/protocol.md#a-withdrawn-task), [Each task](spec/protocol.md#each-task), [Leasing ahead](spec/protocol.md#leasing-ahead), [The link](spec/protocol.md#the-link) | 0023, 0024, 0025, 0026, 0027 |
 | commands, errors, exit codes, `--version` | `Cli`, `Error`, `../Spool.hs` | `Cli`, `Error` | every section | [Commands](spec/protocol.md#commands), [Exit codes](spec/protocol.md#exit-codes) | 0012, 0022 |
 
 Records are in [docs/decisions](docs/decisions/README.md); what is not yet
@@ -23,14 +24,14 @@ decided is in [docs/open-questions.md](docs/open-questions.md).
 ## Entry points
 
 <!-- wf:gen anchors src/Spool.hs#run src/Spool/Cli.hs#parseCommand src/Spool/Store.hs#putTasks src/Spool/Store.hs#leaseTasks src/Spool/Store.hs#ackTasks src/Spool/Store.hs#recover src/Spool/Grants.hs#runRemote src/Spool/Worker/Run.hs#runWork src/Spool/Worker/Outputs.hs#judgeOutputs -->
-- `src/Spool.hs#run`: line 74
-- `src/Spool/Cli.hs#parseCommand`: line 70
-- `src/Spool/Store.hs#putTasks`: line 264
-- `src/Spool/Store.hs#leaseTasks`: line 429
-- `src/Spool/Store.hs#ackTasks`: line 511
-- `src/Spool/Store.hs#recover`: line 204
-- `src/Spool/Grants.hs#runRemote`: line 260
-- `src/Spool/Worker/Run.hs#runWork`: line 143
+- `src/Spool.hs#run`: line 75
+- `src/Spool/Cli.hs#parseCommand`: line 71
+- `src/Spool/Store.hs#putTasks`: line 302
+- `src/Spool/Store.hs#leaseTasks`: line 477
+- `src/Spool/Store.hs#ackTasks`: line 577
+- `src/Spool/Store.hs#recover`: line 223
+- `src/Spool/Grants.hs#runRemote`: line 264
+- `src/Spool/Worker/Run.hs#runWork`: line 191
 - `src/Spool/Worker/Outputs.hs#judgeOutputs`: line 60
 <!-- /wf:gen -->
 

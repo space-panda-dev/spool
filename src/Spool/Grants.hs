@@ -72,12 +72,16 @@ import Spool.Store
   , resultsCommand
   , failuresCommand
   , collectTasks
+  , withdrawTasks
   , statusTasks
   , answerEach
   , ackStep
   , renewStep
   , failStep
   , abandonLease
+  , leaseStands
+  , revive
+  , withdrawnLease
   , fetchAttachment
   , checkStaged
   , liveLeaseOwned
@@ -318,6 +322,10 @@ dispatchRemote paths grant operation = case operation of
   Access.RemoteCollect
     | Access.grantPut grant -> collectTasks paths
     | otherwise -> throwIO (grantRefused "grant does not permit collect")
+  -- Taking a task back goes with having put it (ADR 0023).
+  Access.RemoteWithdraw
+    | Access.grantPut grant -> withdrawTasks paths
+    | otherwise -> throwIO (grantRefused "grant does not permit withdraw")
   Access.RemoteLease count -> do
     let requested = fromMaybe 1 count
     when (requested > toInteger (maxBound :: Int))
@@ -331,7 +339,7 @@ dispatchRemote paths grant operation = case operation of
     answerEach ackRef (ownedAck `before` ackStep paths) acks
   Access.RemoteRenew -> do
     references <- mapM parseLeaseRefLine =<< inputLines
-    answerEach id (ownedLive `before` renewStep paths) references
+    answerEach id (standing `before` renewStep paths) references
   Access.RemoteFail retry -> do
     requests <- mapM parseFailLine =<< inputLines
     answerEach failRef ((ownedLive . failRef) `before` failStep retry paths) requests
@@ -345,6 +353,9 @@ dispatchRemote paths grant operation = case operation of
       | Access.grantPut grant = command
       | otherwise = throwIO (grantRefused "grant does not permit reading the spool")
     ownedLive = liveLeaseOwned paths (Just worker)
+    -- A renewal takes back the worker's own lease reclaimed while it was
+    -- away, if its task has waited since (ADR 0027).
+    standing = leaseStands paths (Just worker)
     ownedAck ack = ackOwned paths worker (ackRef ack)
     -- Act on an item only if its lease is the grant's worker's.
     before owned step item = do
@@ -357,14 +368,18 @@ dispatchRemote paths grant operation = case operation of
 -- already done by it, so that repeating an acknowledgement is allowed.
 ackOwned :: Paths -> WorkerName -> LeaseRef -> IO (Either SpoolError ())
 ackOwned paths worker reference@(LeaseRef ident leaseIdent) = do
-  live <- fileExists (leasedPath paths leaseIdent)
+  inFlight <- fileExists (leasedPath paths leaseIdent)
+  -- An ack takes back the worker's own lease reclaimed while it was away,
+  -- if its task has waited since (ADR 0027).
+  live <- if inFlight then pure True else revive paths (Just worker) reference
   if live
     then liveLeaseOwned paths (Just worker) reference
     else do
       let path = resultPath paths leaseIdent
       present <- fileExists path
+      gone <- withdrawnLease paths reference
       if not present
-        then pure (Left (stale "lease is unknown or stale"))
+        then pure (Left (fromMaybe (stale "lease is unknown or stale") gone))
         else do
           record <- readResultRecordFile path
           pure $ if resultTask record == ident && resultWorker record == worker

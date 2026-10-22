@@ -153,7 +153,7 @@ failing failed (LeaseRef ident _) _ retry = do
   pure (Right ())
 
 noCapabilities :: WorkConfig
-noCapabilities = WorkConfig 1 30 [] Map.empty
+noCapabilities = WorkConfig 1 0 Nothing 30 [] Map.empty
 
 leaseOf :: String -> Lease
 leaseOf task = either error id $ parseLease $ BLC.pack $

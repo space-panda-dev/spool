@@ -44,6 +44,13 @@ data CapabilityConfig = CapabilityConfig
 
 data WorkConfig = WorkConfig
   { wcMaxConcurrent :: Int
+  , wcPrefetch :: Int
+    -- ^ How many tasks the worker leases and fetches ahead of those its
+    -- programs run (ADR 0026). 0, the default, leases none ahead.
+  , wcMinFreeBytes :: Maybe Int64
+    -- ^ The free space a fetch must leave where working directories are
+    -- made, while another task of the worker holds one (ADR 0026). No
+    -- floor when it is not given.
   , wcRenewSeconds :: Int
   , wcEnv :: [(String, String)]
   , wcCapabilities :: Map.Map Capability CapabilityConfig
@@ -68,14 +75,23 @@ parseWorkConfig bytes = do
   value <- A.eitherDecode bytes
   case value of
     A.Object object -> do
-      rejectUnknown ["max_concurrent", "renew_seconds", "env", "capabilities"] object
+      rejectUnknown
+        [ "max_concurrent", "prefetch", "min_free_bytes", "renew_seconds", "env"
+        , "capabilities" ] object
       maxConcurrent <- positiveField maxBound "max_concurrent" (Just 1) object
+      prefetch <- nonNegativeField "prefetch" object
+      minFree <- optionalPositiveField maxBound "min_free_bytes" object
+      -- The tasks held at once, running and ahead, must be countable.
+      unless (toInteger maxConcurrent + toInteger prefetch <= toInteger (maxBound :: Int))
+        (Left "max_concurrent and prefetch together must fit an integer of this host")
       renewSeconds <- positiveField maxDelaySeconds "renew_seconds" (Just 30) object
       envPairs <- optionalEnvMap object
       capsObject <- requiredObject "capabilities" object
       caps <- traverse (uncurry parseCapabilityEntry) (KM.toList capsObject)
       pure WorkConfig
         { wcMaxConcurrent = maxConcurrent
+        , wcPrefetch = prefetch
+        , wcMinFreeBytes = minFree
         , wcRenewSeconds = renewSeconds
         , wcEnv = envPairs
         , wcCapabilities = Map.fromList caps
@@ -104,6 +120,18 @@ positiveField limit key def object = case KM.lookup (K.fromText key) object of
   where
     outOfRange = T.unpack key <> " must be a positive integer no greater than "
       <> show limit
+
+-- | A whole number from 0 up, 0 when it is left out.
+nonNegativeField :: T.Text -> Object -> Either String Int
+nonNegativeField key object = case KM.lookup (K.fromText key) object of
+  Nothing -> Right 0
+  Just value@(A.Number _) -> case A.fromJSON value of
+    A.Success number | number >= 0 -> Right number
+    _ -> Left outOfRange
+  Just _ -> Left outOfRange
+  where
+    outOfRange = T.unpack key <> " must be a non-negative integer no greater than "
+      <> show (maxBound :: Int)
 
 -- | A whole number from 1 through `limit`, or nothing when it is left out.
 optionalPositiveField
@@ -190,12 +218,13 @@ checkOneExecutable capText capConfig
             else pure (Left (T.unpack capText <> ": exec is not executable: " <> capExec capConfig))
 
 encodeWorkConfig :: WorkConfig -> BL.ByteString
-encodeWorkConfig config = canonical (A.object
+encodeWorkConfig config = canonical (A.object $
   [ "max_concurrent" .= wcMaxConcurrent config
   , "renew_seconds" .= wcRenewSeconds config
   , "env" .= KM.fromList [ (K.fromText (T.pack k), A.toJSON v) | (k, v) <- wcEnv config ]
   , "capabilities" .= Map.map encodeCapabilityConfig (wcCapabilities config)
-  ])
+  ] <> [ "prefetch" .= wcPrefetch config | wcPrefetch config /= 0 ]
+    <> maybe [] (\floor' -> ["min_free_bytes" .= floor']) (wcMinFreeBytes config))
 
 encodeCapabilityConfig :: CapabilityConfig -> A.Value
 encodeCapabilityConfig capConfig = A.object $

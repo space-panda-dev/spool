@@ -156,6 +156,7 @@ data RemoteCommand
   | RemoteResults
   | RemoteFailures
   | RemoteCollect
+  | RemoteWithdraw
   | RemoteStatus StatusFormat
   deriving (Eq, Show)
 
@@ -344,8 +345,10 @@ parseRemoteCommand bytes
   | bytes == "results" = Right RemoteResults
   | bytes == "failures" = Right RemoteFailures
   | bytes == "collect" = Right RemoteCollect
+  | bytes == "withdraw" = Right RemoteWithdraw
   | bytes == "status" = Right (RemoteStatus StatusText)
   | bytes == "status --json" = Right (RemoteStatus StatusJson)
+  | bytes == "status --json --tasks" = Right (RemoteStatus StatusTasks)
   | Just suffix <- BS.stripPrefix "lease --count " bytes = do
       count <- parseCount suffix
       pure (RemoteLease (Just count))

@@ -14,6 +14,8 @@ module Spool.Error
   , neverFits
   , corrupt
   , retryable
+  , withdrawn
+  , isWithdrawn
   , orThrow
   , withContext
   , exitStatus
@@ -47,6 +49,10 @@ data SpoolError
   | Usage String
   -- | @lease@ found no pending task.  Exit 1, and nothing to say.
   | NothingPending
+  -- | A lease whose task was withdrawn (ADR 0023). Exit 4, as for any lease
+  -- that acts on nothing, but answered @withdrawn@, so that its worker
+  -- stops the run and says nothing has failed.
+  | Withdrawn String
   deriving (Eq, Show)
 
 instance Exception SpoolError
@@ -62,6 +68,14 @@ neverFits = SpoolError NeverFits
 corrupt = SpoolError Corrupt
 retryable = SpoolError Retryable
 
+-- | A lease whose task was withdrawn while it was held.
+withdrawn :: String -> SpoolError
+withdrawn = Withdrawn
+
+isWithdrawn :: SpoolError -> Bool
+isWithdrawn (Withdrawn _) = True
+isWithdrawn _ = False
+
 -- | Take the value, or throw what the refusal means here.  The same refusal
 -- is malformed input when it comes from a caller and corrupt state when it
 -- comes from the spool's own files, so the place that knows the source says
@@ -75,11 +89,13 @@ withContext context failure = case failure of
   SpoolError kind message -> SpoolError kind (context <> message)
   Usage message -> Usage (context <> message)
   NothingPending -> NothingPending
+  Withdrawn message -> Withdrawn (context <> message)
 
 exitStatus :: SpoolError -> Int
 exitStatus failure = case failure of
   NothingPending -> 1
   Usage _ -> 2
+  Withdrawn _ -> 4
   SpoolError Malformed _ -> 2
   SpoolError Conflict _ -> 3
   SpoolError Stale _ -> 4
@@ -110,6 +126,7 @@ render failure = case failure of
   SpoolError _ message -> Just ("spool: " <> message)
   Usage message -> Just message
   NothingPending -> Nothing
+  Withdrawn message -> Just ("spool: " <> message)
 
 -- | Write a failure to stderr, as UTF-8 whatever the locale.
 report :: SpoolError -> IO ()
