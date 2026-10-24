@@ -3664,7 +3664,7 @@ metric() {
   [[ $(grep -cF "$1{$2} " "$3") -eq 1 ]] || return 1
   printf '%s\n' "$found"
 }
-tree_digest() { (cd "$1" && find . -type f ! -name .spool.lock -exec shasum {} + | sort); }
+tree_digest() { (cd "$1" && find . -type f ! -name .spool.lock -exec cksum {} + | sort); }
 section_metrics() {
 local lease m=$work/metrics.prom
 in_spool m-a init; in_spool m-b init
@@ -3675,8 +3675,10 @@ put_one m-a t2 >/dev/null; lease=$(lease_one m-a); fail_one m-a t2 "$lease" --no
 put_one m-a t3 >/dev/null; lease=$(lease_one m-a); fail_one m-a t3 "$lease" >/dev/null
 put_one m-a t4 >/dev/null; lease=$(lease_one m-a)
 in_spool m-a status --json --tasks | jq -s -e 'map(.task_id) == ["t4", "t3"]' >/dev/null; check
-# t4 has waited 500 s.
-perl -e '$t = time - 500; utime $t, $t, @ARGV' "$work/m-a/pending/"*.json
+# t4 has waited 500 s. touch and date as both GNU and BSD take them.
+waited=$(( $(date +%s) - 500 ))
+stamp=$(date -u -d "@$waited" +%Y%m%d%H%M.%S 2>/dev/null || date -u -r "$waited" +%Y%m%d%H%M.%S)
+TZ=UTC touch -t "$stamp" "$work/m-a/pending/"*.json
 before=$(tree_digest "$work/m-a")
 "$spool_binary" metrics --window 3600 --dir "$work/m-a" --dir "$work/m-b" > "$m"; check
 test "$(tree_digest "$work/m-a")" = "$before"; check
