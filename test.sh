@@ -3707,6 +3707,18 @@ age_record "$(find "$work/m-a/results" -name '*.json')" finished_at 7200
 ! grep -q '^spool_recent_results' "$m"; check
 test "$(metric spool_tasks 'spool="m-a",state="done"' "$m")" = 1; check
 
+# A reclaim's reason, as reclaim itself writes it, is the class reclaimed,
+# and its task is pending again, with no lease left.
+in_spool m-d init
+put_one m-d t5 >/dev/null; lease_one m-d >/dev/null
+in_spool m-d reclaim --older-than 0 >/dev/null
+"$spool_binary" metrics --window 3600 --dir "$work/m-d" > "$m"; check
+test "$(metric spool_recent_failures 'spool="m-d",capability="keep@1",worker="keeper",reason="reclaimed",retried="true"' "$m")" = 1; check
+test "$(metric spool_tasks 'spool="m-d",state="pending"' "$m")" = 1; check
+test "$(metric spool_tasks 'spool="m-d",state="leased"' "$m")" = 0; check
+test "$(metric spool_tasks 'spool="m-d",state="failed"' "$m")" = 0; check
+! grep -q '^spool_leases{' "$m"; check
+
 # Refusals: no window, a directory that is not a spool (and is not made
 # one), two spools of one name, and a spool that cannot be read, which
 # writes nothing for the spool that could.
