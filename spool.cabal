@@ -45,6 +45,7 @@ library
     , Spool.Files
     , Spool.Grants
     , Spool.Input
+    , Spool.Metrics
     , Spool.Store
     , Spool.Types
     , Spool.Wire
@@ -93,6 +94,7 @@ test-suite spool-test
     , Test.Error
     , Test.Files
     , Test.Follow
+    , Test.Metrics
     , Test.Outputs
     , Test.Room
     , Test.Store

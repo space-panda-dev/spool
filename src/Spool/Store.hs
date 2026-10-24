@@ -56,6 +56,7 @@ module Spool.Store
   , withdrawTasks
   , gcTasks
   , statusTasks
+  , metricsCommand
   , isReclaimReason
   ) where
 
@@ -83,7 +84,10 @@ import System.IO (Handle, IOMode (ReadMode), SeekMode (AbsoluteSeek), hClose,
                   hSeek, hSetBinaryMode, openBinaryFile, openBinaryTempFile,
                   stdin)
 import System.IO.Error (isDoesNotExistError)
-import System.Posix.Files (fileSize, getFileStatus)
+import System.Posix.Files (fileSize, getFileStatus, isDirectory, modificationTime)
+import Foreign.C.Types (CTime (..))
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import Spool.Metrics (Reading (..), TaskState (..), ageSeconds, recent, render, spoolLabels)
 import qualified Spool.Attachments as SA
 import Spool.Error
   ( SpoolError (..)
@@ -165,6 +169,7 @@ import Spool.Types
   , mkTaskId
   , mkWorkerName
   , newLeaseId
+  , capabilityText
   , taskIdText
   , timestamp
   , timestampTime
@@ -1586,6 +1591,87 @@ statusTasks paths format = do
         <> " failed=" <> show (countFailed counts))
   where
     count directory = length <$> jsonFiles directory
+
+-- | Write the state of these spools as metrics (ADR 0028). Every
+-- directory is checked to be a spool before any is read, and every spool is
+-- read before anything is written, so that a spool that cannot be read
+-- leaves stdout empty and the timer's last good reading in place.
+metricsCommand :: Integer -> [FilePath] -> IO ()
+metricsCommand window directories = do
+  labels <- either (throwIO . malformed . dropSpoolPrefix) pure (spoolLabels directories)
+  forM_ directories $ \directory -> do
+    spool <- isSpool directory
+    unless spool (throwIO (malformed ("metrics: not a spool: " <> directory)))
+  now <- floor . utcTimeToPOSIXSeconds <$> getCurrentTime
+  readings <- forM (zip labels directories) $ \(label, directory) -> do
+    paths <- openSpool directory
+    initialise paths
+    withLock paths (recover paths >> readMetrics paths label window now)
+  BS.putStr (TE.encodeUtf8 (render readings))
+  where
+    dropSpoolPrefix message = fromMaybe message (stripPrefix "spool: " message)
+    -- A spool has a pending directory from its first command on; anything
+    -- else is not one, and is not made one here.
+    isSpool directory = do
+      let pending = directory </> "pending"
+      present <- fileExists pending
+      if present then isDirectory <$> getFileStatus pending else pure False
+
+-- | What one spool holds, read under its lock after recovery: nothing is
+-- written. Times are whole seconds since the epoch.
+readMetrics :: Paths -> T.Text -> Integer -> Integer -> IO Reading
+readMetrics paths label window now = do
+  pending <- jsonFiles (pendingDir paths) >>= mapM (\path -> do
+    task <- readTaskFile path
+    -- Every write of a pending file is an atomic create of a new one, so
+    -- its time is when its task last became pending.
+    CTime since <- modificationTime <$> getFileStatus path
+    pure (task, toInteger since))
+  leased <- jsonFiles (leasedDir paths) >>= mapM (\path -> do
+    leaseIdent <- leaseIdOfFile path
+    task <- readTaskFile path
+    handedOut <- fileExists (workerSidecarPath paths leaseIdent)
+    worker <- if handedOut
+      then workerNameText <$> readWorkerSidecar paths leaseIdent
+      else pure ""
+    started <- maybe (throwIO (corrupt ("corrupt lease filename: " <> path))) pure
+      (leaseStarted leaseIdent)
+    renewed <- readRenewedSidecar paths leaseIdent
+    pure (task, worker, maybe started (max started) renewed `div` 1000000))
+  done <- jsonFiles (doneDir paths) >>= mapM readTaskFile
+  results <- jsonFiles (resultsDir paths) >>= mapM readResultRecordFile
+    >>= mapM (\record -> (,) <$> seconds (resultTask record) (resultFinishedAt record) <*> pure record)
+  failures <- jsonFiles (failedDir paths) >>= mapM readFailureRecordFile
+    >>= mapM (\record -> (,) <$> seconds (failureTask record) (failureFailedAt record) <*> pure record)
+  let standing = Set.fromList (map (taskId . fst) pending
+        <> [taskId task | (task, _, _) <- leased] <> map taskId done)
+      failedForGood = Map.fromListWith max
+        [ (failureTask record, (at, capabilityText (failureCapability record)))
+        | (at, record) <- failures, failureRetried record == NoRetry
+        , failureTask record `Set.notMember` standing ]
+      capability = capabilityText . taskCapability
+  pure Reading
+    { readingSpool = label
+    , readingWindow = window
+    , readingTasks = [(Pending, capability task) | (task, _) <- pending]
+        <> [(Leased, capability task) | (task, _, _) <- leased]
+        <> [(Done, capability task) | task <- done]
+        <> [(Failed, c) | (_, c) <- Map.elems failedForGood]
+    , readingLeases = [worker | (_, worker, _) <- leased]
+    , readingOldestPending = maximum (0 : [ageSeconds now since | (_, since) <- pending])
+    , readingOldestRenewal = maximum (0 : [ageSeconds now at | (_, _, at) <- leased])
+    , readingResults = recent now window
+        [ (at, (capabilityText (resultCapability r), workerNameText (resultWorker r)))
+        | (at, r) <- results ]
+    , readingFailures = recent now window
+        [ (at, ( capabilityText (failureCapability r), workerNameText (failureWorker r)
+               , failureReason r, failureRetried r == Retry ))
+        | (at, r) <- failures ]
+    }
+  where
+    seconds ident at = case timestampTime at of
+      Just time -> pure (floor (utcTimeToPOSIXSeconds time) :: Integer)
+      Nothing -> throwIO (corrupt ("unreadable time in a record of " <> showTask ident))
 
 -- | A time in microseconds since the epoch, as a record writes a time.
 microsTimestamp :: Integer -> Timestamp
