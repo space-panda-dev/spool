@@ -36,3 +36,4 @@ document and the implementation say nothing of it until it is accepted.
 | [0025](0025-leases-follow-put-order-and-priority.md) | Leases follow put order, and a task may be put above others |
 | [0026](0026-a-worker-may-fetch-ahead.md) | A worker may fetch ahead, above a floor of free disk |
 | [0027](0027-a-worker-survives-its-link.md) | A worker survives its link |
+| [0028](0028-a-host-may-read-its-spools-as-metrics.md) | A host may read its spools as metrics (proposed) |
