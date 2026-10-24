@@ -17,6 +17,7 @@ import Spool.Cli
   , StoreCommand (..)
   , Transfer (..)
   , parseCommand
+  , parseMetrics
   , parseWorkShow
   , parseWorkVia
   )
@@ -32,6 +33,7 @@ import Spool.Store
   , fetchAttachment
   , gcTasks
   , leaseTasks
+  , metricsCommand
   , putTasks
   , reclaimTasks
   , recover
@@ -76,6 +78,8 @@ run :: [String] -> IO ()
 run args = case args of
   ["--version"] -> putStrLn ("spool " <> showVersion version <> " " <> buildCommit)
   ["remote", "--grant", identifier] -> runRemote (T.pack identifier)
+  ("metrics" : rest) ->
+    either (throwIO . Usage) (uncurry metricsCommand) (parseMetrics rest)
   ("work" : rest) | "--show" `elem` rest && "--dir" `notElem` args ->
     either (throwIO . Usage) runWorkShow (parseWorkShow rest)
   ("work" : rest) | "--via" `elem` rest && "--dir" `notElem` args -> do

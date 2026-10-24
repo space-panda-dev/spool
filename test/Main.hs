@@ -12,6 +12,7 @@ import qualified Test.Disk
 import qualified Test.Error
 import qualified Test.Files
 import qualified Test.Follow
+import qualified Test.Metrics
 import qualified Test.Outputs
 import qualified Test.Room
 import qualified Test.Store
@@ -32,6 +33,7 @@ main = do
     , Test.Error.tests
     , Test.Files.tests
     , Test.Follow.tests
+    , Test.Metrics.tests
     , Test.Outputs.tests
     , Test.Room.tests
     , Test.Store.tests

@@ -11,6 +11,7 @@ import Spool.Cli
   , StoreCommand (..)
   , Transfer (..)
   , parseCommand
+  , parseMetrics
   , parseWorkShow
   , parseWorkVia
   )
@@ -27,6 +28,19 @@ tests :: TestTree
 tests = testGroup "command line"
   [ testGroup "accepts" (map accepted acceptedForms)
   , testGroup "rejects" (map rejected rejectedForms)
+  , testGroup "metrics (ADR 0028)"
+      [ testCase "takes a window and one or more spools, in any order" $ do
+          parseMetrics ["--window", "60", "--dir", "a"] @?= Right (60, ["a"])
+          parseMetrics ["--dir", "a", "--window", "3600", "--dir", "b"] @?= Right (3600, ["a", "b"])
+      , testCase "refuses a form without both, or with anything else" $
+          mapM_ (\args -> assertBool (unwords args) (isLeft (parseMetrics args)))
+            [ [], ["--window", "60"], ["--dir", "a"]
+            , ["--window", "60", "--window", "60", "--dir", "a"]
+            , ["--window", "0", "--dir", "a"], ["--window", "-1", "--dir", "a"]
+            , ["--window", "6x", "--dir", "a"], ["--window", "60", "--dir", ""]
+            , ["--window", "60", "--dir"], ["--window", "60", "--dir", "a", "--json"]
+            ]
+      ]
   , testCase "work --show needs no spool directory" $
       parseWorkShow ["--config", "c.json", "--show"] @?= Right "c.json"
   , testGroup "work --via"

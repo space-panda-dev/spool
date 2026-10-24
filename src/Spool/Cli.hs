@@ -6,6 +6,7 @@ module Spool.Cli
   , Transfer (..)
   , GrantOptions (..)
   , parseCommand
+  , parseMetrics
   , parseWorkShow
   , parseWorkVia
   , usageText
@@ -139,6 +140,22 @@ parseWorkVia args = do
       _ -> Left "spool: --max-tasks requires a positive integer"
     go _ _ _ _ _ = Left usageText
 
+-- | The form that reads a host's spools as metrics (ADR 0028): a window in
+-- whole seconds, given once, and one or more spool directories, in any
+-- order.
+parseMetrics :: [String] -> Either String (Integer, [FilePath])
+parseMetrics = go Nothing []
+  where
+    go (Just window) directories@(_ : _) [] = Right (window, reverse directories)
+    go _ _ [] = Left "spool: metrics requires --window SECONDS and at least one --dir DIR"
+    go Nothing directories ("--window" : value : rest) = case reads value of
+      [(seconds, "")] | seconds > 0 -> go (Just seconds) directories rest
+      _ -> Left "spool: --window requires a positive integer"
+    go window directories ("--dir" : directory : rest)
+      | null directory = Left "spool: --dir requires a non-empty directory"
+      | otherwise = go window (directory : directories) rest
+    go _ _ _ = Left usageText
+
 -- | Take the words that make a worker follow its spool out of a work
 -- command line, and leave the rest: the longest wait between two leases, or
 -- nothing for a worker that stops once nothing is pending. A word that is
@@ -244,4 +261,4 @@ parseWorkArgs = go Nothing Nothing Nothing
     go _ _ _ _ = Left usageText
 
 usageText :: String
-usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|send|take|reclaim --older-than SECONDS|collect|withdraw|gc --older-than SECONDS|status [--json [--tasks]]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH] [--max-result-bytes N]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\nFOLLOW: --follow [--idle-seconds N]"
+usageText = "usage: spool --dir DIR init|put [--attachments DIR]|lease --worker WORKER [--count N]|ack|renew|fail [--no-retry]|failures|results|fetch|send|take|reclaim --older-than SECONDS|collect|withdraw|gc --older-than SECONDS|status [--json [--tasks]]|work --worker WORKER --config FILE [--max-tasks N] [FOLLOW]|grant --peer PEER --worker WORKER --key FILE [--put] [--expires-at RFC3339] [--executable PATH] [--max-result-bytes N]|revoke --grant GRANT_ID\n       spool remote --grant GRANT_ID\n       spool work --via COMMAND --config FILE [--max-tasks N] [FOLLOW]\n       spool work --config FILE --show\n       spool metrics --window SECONDS --dir DIR [--dir DIR]...\nFOLLOW: --follow [--idle-seconds N]"

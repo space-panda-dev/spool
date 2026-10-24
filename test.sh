@@ -20,7 +20,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 # Sections run in this order. Each starts from the programs and helpers
 # below and nothing else, except for the sections it needs, which run first.
-sections=(queue retention work attachments grants remote follow lifecycle outputs scheduling)
+sections=(queue retention work attachments grants remote follow lifecycle outputs scheduling metrics)
 about() {
   case $1 in
     queue) echo "put, lease, renew, fail, ack: idempotency, fencing, attempts, recovery" ;;
@@ -33,6 +33,7 @@ about() {
     lifecycle) echo "attempts, retention and following together (ADRs 0017-0019)" ;;
     outputs) echo "result attachments: send, take, limits, waiting for room, 0.0.3 records" ;;
     scheduling) echo "withdraw, status per task, put order and priority, prefetch, a worker's link (ADRs 0023-0027)" ;;
+    metrics) echo "spool metrics: counts, ages, the window, refusals, nothing written (ADR 0028)" ;;
   esac
 }
 needs() {
@@ -3653,6 +3654,83 @@ grep -q "renewal could not reach the spool" "$work/cut.stderr"; check
 grep -q "renewal reached the spool again" "$work/cut.stderr"; check
 in_spool ra-remote failures | jq -s -e 'map(select(.task_id == "cut-one")) | length == 0' >/dev/null; check
 
+}
+
+# ADR 0028: spool metrics reads a host's spools as Prometheus text.
+# metric NAME LABELS FILE: the value of the one series NAME{LABELS} in FILE.
+metric() {
+  local found
+  found=$(grep -F "$1{$2} " "$3" | awk '{print $NF}')
+  [[ $(grep -cF "$1{$2} " "$3") -eq 1 ]] || return 1
+  printf '%s\n' "$found"
+}
+tree_digest() { (cd "$1" && find . -type f ! -name .spool.lock -exec cksum {} + | sort); }
+section_metrics() {
+local lease m=$work/metrics.prom
+in_spool m-a init; in_spool m-b init
+# One task in each state, each from its real writer: t1 done, t2 failed for
+# good, t3 failed once and leased again, t4 pending.
+put_one m-a t1 >/dev/null; lease=$(lease_one m-a); ack_one m-a t1 "$lease" >/dev/null
+put_one m-a t2 >/dev/null; lease=$(lease_one m-a); fail_one m-a t2 "$lease" --no-retry >/dev/null
+put_one m-a t3 >/dev/null; lease=$(lease_one m-a); fail_one m-a t3 "$lease" >/dev/null
+put_one m-a t4 >/dev/null; lease=$(lease_one m-a)
+in_spool m-a status --json --tasks | jq -s -e 'map(.task_id) == ["t4", "t3"]' >/dev/null; check
+# t4 has waited 500 s. touch and date as both GNU and BSD take them.
+waited=$(( $(date +%s) - 500 ))
+stamp=$(date -u -d "@$waited" +%Y%m%d%H%M.%S 2>/dev/null || date -u -r "$waited" +%Y%m%d%H%M.%S)
+TZ=UTC touch -t "$stamp" "$work/m-a/pending/"*.json
+before=$(tree_digest "$work/m-a")
+"$spool_binary" metrics --window 3600 --dir "$work/m-a" --dir "$work/m-b" > "$m"; check
+test "$(tree_digest "$work/m-a")" = "$before"; check
+for state in pending leased done failed; do
+  test "$(metric spool_tasks "spool=\"m-a\",state=\"$state\"" "$m")" = 1; check
+  test "$(metric spool_tasks "spool=\"m-b\",state=\"$state\"" "$m")" = 0; check
+done
+test "$(metric spool_capability_tasks 'spool="m-a",state="failed",capability="keep@1"' "$m")" = 1; check
+test "$(metric spool_leases 'spool="m-a",actor="keeper"' "$m")" = 1; check
+age=$(metric spool_oldest_pending_age_seconds 'spool="m-a"' "$m")
+(( age >= 500 && age < 600 )); check
+(( $(metric spool_oldest_lease_renewal_age_seconds 'spool="m-a"' "$m") < 60 )); check
+test "$(metric spool_oldest_pending_age_seconds 'spool="m-b"' "$m")" = 0; check
+test "$(metric spool_recent_window_seconds 'spool="m-b"' "$m")" = 3600; check
+test "$(metric spool_recent_results 'spool="m-a",capability="keep@1",actor="keeper"' "$m")" = 1; check
+test "$(metric spool_recent_failures 'spool="m-a",capability="keep@1",actor="keeper",reason="other",retried="false"' "$m")" = 1; check
+test "$(metric spool_recent_failures 'spool="m-a",capability="keep@1",actor="keeper",reason="other",retried="true"' "$m")" = 1; check
+# Each series is described once, whatever the number of spools.
+test "$(grep -c '^# TYPE ' "$m")" = 8; check
+test "$(grep -c '^# TYPE spool_tasks gauge$' "$m")" = 1; check
+! grep -q 'host=' "$m"; check
+
+# A result older than the window is no longer counted; its task still is.
+age_record "$(find "$work/m-a/results" -name '*.json')" finished_at 7200
+"$spool_binary" metrics --window 3600 --dir "$work/m-a" > "$m"; check
+! grep -q '^spool_recent_results' "$m"; check
+test "$(metric spool_tasks 'spool="m-a",state="done"' "$m")" = 1; check
+
+# A reclaim's reason, as reclaim itself writes it, is the class reclaimed,
+# and its task is pending again, with no lease left.
+in_spool m-d init
+put_one m-d t5 >/dev/null; lease_one m-d >/dev/null
+in_spool m-d reclaim --older-than 0 >/dev/null
+"$spool_binary" metrics --window 3600 --dir "$work/m-d" > "$m"; check
+test "$(metric spool_recent_failures 'spool="m-d",capability="keep@1",actor="keeper",reason="reclaimed",retried="true"' "$m")" = 1; check
+test "$(metric spool_tasks 'spool="m-d",state="pending"' "$m")" = 1; check
+test "$(metric spool_tasks 'spool="m-d",state="leased"' "$m")" = 0; check
+test "$(metric spool_tasks 'spool="m-d",state="failed"' "$m")" = 0; check
+! grep -q '^spool_leases{' "$m"; check
+
+# Refusals: no window, a directory that is not a spool (and is not made
+# one), two spools of one name, and a spool that cannot be read, which
+# writes nothing for the spool that could.
+expect_exit 2 "$spool_binary" metrics --dir "$work/m-a"
+expect_exit 2 "$spool_binary" metrics --window 60 --dir "$work/m-none"
+test ! -e "$work/m-none"; check
+mkdir -p "$work/m-other"; in_spool m-other/m-a init
+expect_exit 2 "$spool_binary" metrics --window 60 --dir "$work/m-a" --dir "$work/m-other/m-a"
+in_spool m-c init
+printf 'not json\n' > "$work/m-c/pending/broken.json"
+expect_exit 70 "$spool_binary" metrics --window 60 --dir "$work/m-b" --dir "$work/m-c"
+test ! -s "$work/exit.stdout"; check
 }
 
 # The section loop's names are ones no section uses: sections share globals.
