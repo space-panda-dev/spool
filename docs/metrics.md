@@ -32,12 +32,12 @@ Every series has the label `spool`, the base name of its directory, and no
 |---|---|---|
 | `spool_tasks` | `spool`, `state` | tasks pending, leased, done, and failed for good; all four always written |
 | `spool_capability_tasks` | `spool`, `state`, `capability` | the same, by capability; only counts above 0 |
-| `spool_leases` | `spool`, `worker` | leased tasks, by the worker holding each; `""` for a lease never handed to one |
+| `spool_leases` | `spool`, `actor` | leased tasks, by the worker holding each; `""` for a lease never handed to one |
 | `spool_oldest_pending_age_seconds` | `spool` | seconds since the longest-waiting pending task became pending (put, or returned by `fail` or reclaim); 0 with none |
 | `spool_oldest_lease_renewal_age_seconds` | `spool` | seconds since the stalest lease was taken or last renewed; 0 with none |
 | `spool_recent_window_seconds` | `spool` | the `--window` the two below count over |
-| `spool_recent_results` | `spool`, `capability`, `worker` | results whose `finished_at` is within the window |
-| `spool_recent_failures` | `spool`, `capability`, `worker`, `reason`, `retried` | failure records whose `failed_at` is within the window |
+| `spool_recent_results` | `spool`, `capability`, `actor` | results whose `finished_at` is within the window |
+| `spool_recent_failures` | `spool`, `capability`, `actor`, `reason`, `retried` | failure records whose `failed_at` is within the window |
 
 `spool_tasks` partitions tasks: `failed` is a task failed for good and not
 yet collected or aged out, where `status` counts failure records

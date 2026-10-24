@@ -3687,15 +3687,15 @@ for state in pending leased done failed; do
   test "$(metric spool_tasks "spool=\"m-b\",state=\"$state\"" "$m")" = 0; check
 done
 test "$(metric spool_capability_tasks 'spool="m-a",state="failed",capability="keep@1"' "$m")" = 1; check
-test "$(metric spool_leases 'spool="m-a",worker="keeper"' "$m")" = 1; check
+test "$(metric spool_leases 'spool="m-a",actor="keeper"' "$m")" = 1; check
 age=$(metric spool_oldest_pending_age_seconds 'spool="m-a"' "$m")
 (( age >= 500 && age < 600 )); check
 (( $(metric spool_oldest_lease_renewal_age_seconds 'spool="m-a"' "$m") < 60 )); check
 test "$(metric spool_oldest_pending_age_seconds 'spool="m-b"' "$m")" = 0; check
 test "$(metric spool_recent_window_seconds 'spool="m-b"' "$m")" = 3600; check
-test "$(metric spool_recent_results 'spool="m-a",capability="keep@1",worker="keeper"' "$m")" = 1; check
-test "$(metric spool_recent_failures 'spool="m-a",capability="keep@1",worker="keeper",reason="other",retried="false"' "$m")" = 1; check
-test "$(metric spool_recent_failures 'spool="m-a",capability="keep@1",worker="keeper",reason="other",retried="true"' "$m")" = 1; check
+test "$(metric spool_recent_results 'spool="m-a",capability="keep@1",actor="keeper"' "$m")" = 1; check
+test "$(metric spool_recent_failures 'spool="m-a",capability="keep@1",actor="keeper",reason="other",retried="false"' "$m")" = 1; check
+test "$(metric spool_recent_failures 'spool="m-a",capability="keep@1",actor="keeper",reason="other",retried="true"' "$m")" = 1; check
 # Each series is described once, whatever the number of spools.
 test "$(grep -c '^# TYPE ' "$m")" = 8; check
 test "$(grep -c '^# TYPE spool_tasks gauge$' "$m")" = 1; check
@@ -3713,7 +3713,7 @@ in_spool m-d init
 put_one m-d t5 >/dev/null; lease_one m-d >/dev/null
 in_spool m-d reclaim --older-than 0 >/dev/null
 "$spool_binary" metrics --window 3600 --dir "$work/m-d" > "$m"; check
-test "$(metric spool_recent_failures 'spool="m-d",capability="keep@1",worker="keeper",reason="reclaimed",retried="true"' "$m")" = 1; check
+test "$(metric spool_recent_failures 'spool="m-d",capability="keep@1",actor="keeper",reason="reclaimed",retried="true"' "$m")" = 1; check
 test "$(metric spool_tasks 'spool="m-d",state="pending"' "$m")" = 1; check
 test "$(metric spool_tasks 'spool="m-d",state="leased"' "$m")" = 0; check
 test "$(metric spool_tasks 'spool="m-d",state="failed"' "$m")" = 0; check

@@ -105,7 +105,7 @@ families =
       (\r -> [ ([("state", stateText s), ("capability", c)], n)
              | ((s, c), n) <- tally (readingTasks r) ])
   , Family "spool_leases" "Leased tasks, by the worker holding each."
-      (\r -> [ ([("worker", w)], n) | (w, n) <- tally (readingLeases r) ])
+      (\r -> [ ([("actor", w)], n) | (w, n) <- tally (readingLeases r) ])
   , Family "spool_oldest_pending_age_seconds"
       "Seconds since the longest-waiting pending task became pending; 0 with none."
       (\r -> [([], readingOldestPending r)])
@@ -116,10 +116,10 @@ families =
       "The window spool_recent_results and spool_recent_failures count over."
       (\r -> [([], readingWindow r)])
   , Family "spool_recent_results" "Results finished within the window."
-      (\r -> [ ([("capability", c), ("worker", w)], n)
+      (\r -> [ ([("capability", c), ("actor", w)], n)
              | ((c, w), n) <- tally (readingResults r) ])
   , Family "spool_recent_failures" "Failure records within the window, by reason class."
-      (\r -> [ ([("capability", c), ("worker", w), ("reason", k), ("retried", flag t)], n)
+      (\r -> [ ([("capability", c), ("actor", w), ("reason", k), ("retried", flag t)], n)
              | ((c, w, k, t), n) <- tally
                  [ (c', w', reasonClass reason, t') | (c', w', reason, t') <- readingFailures r ] ])
   ]

@@ -1,6 +1,6 @@
 # 0028. A host may read its spools as metrics
 
-Status: proposed
+Status: accepted
 
 The fleet's Agents pane is to show every spool on every host without
 naming one (the fleet's ADR 0015: every series names its subject, and a
@@ -43,8 +43,10 @@ callers:
 3. **Each series names its spool** by the label `spool`, the base name of
    its directory. Two directories with one base name are malformed input.
    No `host` label is written: the collector adds it.
-4. **Every other label is a bounded dimension**: `state` (four values),
-   `capability` and `worker` (as many as the spool's callers and grants),
+4. **The worker holding or finishing a task is labelled `actor`**, the
+   fleet's word for whoever acts (its ADR 0015); a spool's workers are
+   actors there. **Every other label is a bounded dimension**: `state`
+   (four values), `capability` (as many as the spool's callers and grants),
    `reason` (the classes below), `retried` (`true`, `false`). No task ID,
    lease ID, payload or result is ever a label.
 5. **Counts by state are a partition of tasks**, unlike `status`
@@ -76,18 +78,18 @@ The series:
 |---|---|---|
 | `spool_tasks` | `spool`, `state` | tasks in each state; all four always written |
 | `spool_capability_tasks` | `spool`, `state`, `capability` | the same, by capability; only counts above 0 |
-| `spool_leases` | `spool`, `worker` | leased tasks, by the worker holding each |
+| `spool_leases` | `spool`, `actor` | leased tasks, by the worker holding each |
 | `spool_oldest_pending_age_seconds` | `spool` | how long the longest-waiting pending task has waited; 0 with none |
 | `spool_oldest_lease_renewal_age_seconds` | `spool` | the longest any lease has gone unrenewed; 0 with none. Under `reclaim --older-than S`, a lease past S is reclaimed at the next run |
 | `spool_recent_window_seconds` | `spool` | the window the two below count over |
-| `spool_recent_results` | `spool`, `capability`, `worker` | results finished within the window |
-| `spool_recent_failures` | `spool`, `capability`, `worker`, `reason`, `retried` | failure records within the window: a `fail`, a reclaim, a revoke |
+| `spool_recent_results` | `spool`, `capability`, `actor` | results finished within the window |
+| `spool_recent_failures` | `spool`, `capability`, `actor`, `reason`, `retried` | failure records within the window: a `fail`, a reclaim, a revoke |
 
-### Details the implementer decided, for the operator to confirm
+### Details the implementer decided, confirmed by the operator
 
 1. `--window` is required, as `--older-than` is for `reclaim` and `gc`:
    the timer that runs the command says what "recent" means.
-2. A lease never handed to a worker (ADR 0024) is counted under `worker=""`.
+2. A lease never handed to a worker (ADR 0024) is counted under `actor=""`.
 3. `exit` is one class whatever the status, so that 254 exit statuses are
    not 254 series; exit 65 is visible as `retried="false"`.
 

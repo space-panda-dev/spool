@@ -17,7 +17,7 @@ changing, then those sections and records; the
 | result attachments | `Worker/Outputs`, `Worker/Room`, `Store` | `Outputs`, `Room` | `outputs` | [Result attachments](spec/protocol.md#result-attachments), [`send`](spec/protocol.md#send), [`take`](spec/protocol.md#take) | 0020, 0021 |
 | scheduling: withdraw, each task's status, lease order, leasing ahead, a worker's link | `Store`, `Wire`, `Grants`, `Worker/Run`, `Worker/Disk` | `Store`, `Wire`, `Disk`, `WorkerConfig` | `scheduling`, `work`, `remote` | [A withdrawn task](spec/protocol.md#a-withdrawn-task), [Each task](spec/protocol.md#each-task), [Leasing ahead](spec/protocol.md#leasing-ahead), [The link](spec/protocol.md#the-link) | 0023, 0024, 0025, 0026, 0027 |
 | commands, errors, exit codes, `--version` | `Cli`, `Error`, `../Spool.hs` | `Cli`, `Error` | every section | [Commands](spec/protocol.md#commands), [Exit codes](spec/protocol.md#exit-codes) | 0012, 0022 |
-| metrics for a host's timers (not protocol) | `Metrics`, `Store` (`metricsCommand`) | `Metrics`, `Cli` | `metrics` | none: [docs/metrics.md](docs/metrics.md) | 0028 (proposed) |
+| metrics for a host's timers (not protocol) | `Metrics`, `Store` (`metricsCommand`) | `Metrics`, `Cli` | `metrics` | none: [docs/metrics.md](docs/metrics.md) | 0028 |
 
 Records are in [docs/decisions](docs/decisions/README.md); what is not yet
 decided is in [docs/open-questions.md](docs/open-questions.md).
